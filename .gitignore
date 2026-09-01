@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Environments and local configuration
+.venv/
+venv/
+env/
+conda-env/
+.env
+.env.*
+configs/subject_local.yaml
+local_config.yaml
+
+# Runtime artifacts
+results/
+outputs/
+runs/
+logs/
+checkpoints/
+*.log
+*.pt
+*.pth
+*.ckpt
+
+# Medical images and large arrays
+*.dcm
+*.nii
+*.nii.gz
+*.mha
+*.mhd
+*.nrrd
+*.npy
+*.npz
+*.mat
+*.h5
+*.hdf5
+
+# Temporary and agent scratch
+tmp/
+temp/
+*.tmp
+.superpowers/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+.ipynb_checkpoints/
