@@ -1,0 +1,8 @@
+# Portable defaults. Set the local data path only in ignored subject_local.yaml.
+dicom_root: null
+views:
+  - SAX
+  - 2CH
+  - 4CH
+results_dir: results
+manifest_stem: dicom_manifest

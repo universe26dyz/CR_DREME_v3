@@ -1,0 +1,8 @@
+# Copy to subject_local.yaml and set a local, read-only DICOM root.
+dicom_root: /path/to/read-only/dicom
+views:
+  - SAX
+  - 2CH
+  - 4CH
+results_dir: ../results
+manifest_stem: dicom_manifest
