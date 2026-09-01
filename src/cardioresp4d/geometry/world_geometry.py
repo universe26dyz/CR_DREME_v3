@@ -59,7 +59,7 @@ class DicomPlane:
     spacing_between_slices: float | None = None
 
     def __post_init__(self) -> None:
-        """Validate immutable DICOM geometry and normalize minor stored cosine rounding."""
+        """Validate immutable DICOM geometry while preserving raw stored direction cosines."""
         origin = _as_vector(self.origin, 3, "image_position_patient")
         row_direction = _as_vector(self.row_direction, 3, "image_orientation_patient[:3]")
         column_direction = _as_vector(self.column_direction, 3, "image_orientation_patient[3:]")
@@ -75,8 +75,8 @@ class DicomPlane:
         if int(self.rows) != self.rows or int(self.columns) != self.columns or self.rows <= 0 or self.columns <= 0:
             raise ValueError("rows and columns must be positive integers")
         object.__setattr__(self, "origin", origin)
-        object.__setattr__(self, "row_direction", row_direction / row_norm)
-        object.__setattr__(self, "column_direction", column_direction / column_norm)
+        object.__setattr__(self, "row_direction", row_direction)
+        object.__setattr__(self, "column_direction", column_direction)
         object.__setattr__(self, "pixel_spacing", spacing)
         object.__setattr__(self, "rows", int(self.rows))
         object.__setattr__(self, "columns", int(self.columns))
@@ -108,7 +108,7 @@ class DicomPlane:
 
     @property
     def orientation_matrix(self) -> np.ndarray:
-        """Return columns of the orthonormal in-plane and normal direction basis."""
+        """Return raw DICOM in-plane vectors plus the unit normal as three matrix columns."""
         return np.column_stack((self.row_direction, self.column_direction, self.normal))
 
     @property

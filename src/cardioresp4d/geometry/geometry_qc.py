@@ -23,6 +23,9 @@ from cardioresp4d.geometry.coordinate_normalization import WorldNormalizer
 from cardioresp4d.geometry.world_geometry import DicomPlane
 
 
+_REQUIRED_VIEWS = ("SAX", "2CH", "4CH")
+
+
 def load_manifest_planes(manifest_path: str | Path) -> list[tuple[dict[str, str], DicomPlane]]:
     """Load one representative geometry per view/slice from a Task 1 CSV manifest."""
     path = Path(manifest_path)
@@ -43,7 +46,7 @@ def load_manifest_planes(manifest_path: str | Path) -> list[tuple[dict[str, str]
 
 
 def choose_qc_planes(planes: Iterable[tuple[dict[str, str], DicomPlane]], max_per_view: int = 3) -> list[tuple[dict[str, str], DicomPlane]]:
-    """Select evenly spaced physical planes per view, retaining SAX, 2CH, and 4CH where present."""
+    """Select evenly spaced planes ordered by physical stack position within each view."""
     if max_per_view <= 0:
         raise ValueError("max_per_view must be positive")
     grouped: dict[str, list[tuple[dict[str, str], DicomPlane]]] = defaultdict(list)
@@ -52,6 +55,11 @@ def choose_qc_planes(planes: Iterable[tuple[dict[str, str], DicomPlane]], max_pe
     selected: list[tuple[dict[str, str], DicomPlane]] = []
     for view in sorted(grouped):
         items = sorted(grouped[view], key=lambda item: item[0]["slice_id"])
+        stack_normal = items[0][1].normal
+        items.sort(key=lambda item: (
+            float(np.dot(item[1].pixel_to_world((item[1].columns - 1.0) / 2.0, (item[1].rows - 1.0) / 2.0), stack_normal)),
+            item[0]["slice_id"],
+        ))
         indices = np.linspace(0, len(items) - 1, min(len(items), max_per_view), dtype=int)
         selected.extend(items[index] for index in np.unique(indices))
     return selected
@@ -60,6 +68,13 @@ def choose_qc_planes(planes: Iterable[tuple[dict[str, str], DicomPlane]], max_pe
 def run_geometry_qc(manifest_path: str | Path, output_dir: str | Path, max_per_view: int = 3) -> tuple[Path, Path]:
     """Write JSON/PNG geometry QC using real manifest planes and return both artifact paths."""
     all_records = load_manifest_planes(manifest_path)
+    present_views = {row["view"].upper() for row, _ in all_records}
+    missing_views = [view for view in _REQUIRED_VIEWS if view not in present_views]
+    if missing_views:
+        raise ValueError(
+            "Manifest must contain required views: SAX, 2CH, 4CH; missing "
+            + ", ".join(missing_views)
+        )
     normalizer = WorldNormalizer.from_planes([plane for _, plane in all_records])
     selected = choose_qc_planes(all_records, max_per_view=max_per_view)
     if not selected:

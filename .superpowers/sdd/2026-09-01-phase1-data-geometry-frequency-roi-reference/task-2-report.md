@@ -56,3 +56,26 @@ All commands use `conda run --no-capture-output -n knesvr_torch`; QC also uses `
 ## Concerns
 
 The real 3D plot deliberately labels all nine selected planes, so centre labels are dense in the current viewing angle. The plane polygons, centres and normal arrows remain legible; JSON retains unambiguous per-plane values. Real DICOM IOP values are rounded, hence the Gram-system inverse is necessary to satisfy the sub-micrometre physical round-trip requirement without altering PS3.3 forward mapping.
+
+## Review fix round 1
+
+The reviewer correctly identified that individual normalization of the two
+stored IOP triplets changed the mandated PS3.3 forward mapping and
+serialization. `DicomPlane` now retains those raw vectors exactly: its column
+and row step vectors are respectively `PixelSpacing[1] * IOP[:3]` and
+`PixelSpacing[0] * IOP[3:]`. Only the reported normal is normalized. The
+Gram-system inverse remains, so rounded IOP values still round-trip accurately.
+
+New RED-to-GREEN tests prove all reviewer requirements:
+
+- a hand-derived non-unit IOP has the raw-formula absolute world coordinate and
+  raw IOP serialization;
+- geometry QC refuses a manifest missing any required SAX, 2CH, or 4CH view;
+- representative planes sort by centre projection onto the stack normal rather
+  than lexicographic slice identifier.
+
+The real QC was regenerated and each selected report IOP was compared against
+its matching manifest row: zero mismatches. It contains all three required
+views and reports `8.543149943144392e-14 px` pixel round-trip error plus
+`1.7291900922540942e-13 mm` world round-trip error. The regenerated PNG was
+visually inspected.

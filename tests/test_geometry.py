@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from cardioresp4d.geometry.coordinate_normalization import WorldNormalizer  # noqa: E402
-from cardioresp4d.geometry.geometry_qc import run_geometry_qc  # noqa: E402
+from cardioresp4d.geometry.geometry_qc import choose_qc_planes, run_geometry_qc  # noqa: E402
 from cardioresp4d.geometry.world_geometry import DicomPlane  # noqa: E402
 
 
@@ -69,6 +69,16 @@ class DicomPlaneTest(unittest.TestCase):
         plane = DicomPlane.from_geometry(geometry)
         pixel = np.array([4.25, 2.5])
         np.testing.assert_allclose(plane.world_to_pixel(plane.pixel_to_world(pixel)), pixel, atol=1e-12)
+
+    def test_pixel_to_world_preserves_raw_nonunit_dicom_iop(self) -> None:
+        """Forward coordinates and serialization must use raw stored IOP, not normalized vectors."""
+        geometry = dict(GEOMETRY)
+        raw_iop = [0.999999, 0.0, 0.0, 0.0, 1.000001, 0.0]
+        geometry["image_orientation_patient"] = raw_iop
+        plane = DicomPlane.from_geometry(geometry)
+
+        np.testing.assert_allclose(plane.pixel_to_world(2.0, 3.0), [15.999994, 26.000006, 30.0], atol=1e-12)
+        np.testing.assert_allclose(plane.to_dict()["image_orientation_patient"], raw_iop, atol=0.0)
 
     def test_normal_and_orientation_are_orthonormal(self) -> None:
         """The normal is row-direction cross column-direction with unit orthogonal axes."""
@@ -135,6 +145,34 @@ class GeometryQcTest(unittest.TestCase):
             self.assertLess(report["round_trip_errors"]["pixel_to_world_to_pixel_max_error_pixels"], 1e-9)
             self.assertLess(report["round_trip_errors"]["world_to_pixel_to_world_max_error_mm"], 1e-6)
             self.assertEqual((4, 4), np.asarray(report["world_normalizer"]["forward_matrix"]).shape)
+
+    def test_qc_rejects_manifest_missing_a_required_view(self) -> None:
+        """QC must refuse a partial acquisition instead of silently omitting a mandated view."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "partial_manifest.csv"
+            with manifest.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=("view", "slice_id", "frame_index", *GEOMETRY.keys()))
+                writer.writeheader()
+                for view in ("SAX", "2CH"):
+                    writer.writerow({
+                        "view": view,
+                        "slice_id": f"{view}_s01",
+                        "frame_index": 0,
+                        **{key: json.dumps(value) if isinstance(value, list) else value for key, value in GEOMETRY.items()},
+                    })
+            with self.assertRaisesRegex(ValueError, "SAX, 2CH, 4CH"):
+                run_geometry_qc(manifest, root / "qc")
+
+    def test_qc_sampling_orders_physical_planes_by_stack_normal(self) -> None:
+        """Representative plane sampling follows physical stack position, not slice-id lexicography."""
+        records = []
+        for slice_id, z_position in (("SAX_a", 20.0), ("SAX_b", 0.0), ("SAX_c", 10.0)):
+            geometry = dict(GEOMETRY)
+            geometry["image_position_patient"] = [10.0, 20.0, z_position]
+            records.append(({"view": "SAX", "slice_id": slice_id, "frame_index": "0"}, DicomPlane.from_geometry(geometry)))
+        selected = choose_qc_planes(records, max_per_view=3)
+        self.assertEqual([0.0, 10.0, 20.0], [float(plane.pixel_to_world(0.0, 0.0)[2]) for _, plane in selected])
 
 
 if __name__ == "__main__":
