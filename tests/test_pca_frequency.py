@@ -102,6 +102,21 @@ class PcaFrequencyTest(unittest.TestCase):
         self.assertEqual("insufficient_frequency_resolution", result["respiratory_candidate"]["reason"])
         self.assertIsNone(result["cardiac_candidate"]["frequency_hz"])
 
+    def test_zero_signal_has_no_semantic_frequency_peak(self) -> None:
+        """A flat 50-frame slice reports null peak fields rather than argmax bin zero."""
+        timestamps_s = np.arange(50, dtype=float) * 0.171
+        images = np.zeros((50, 12, 10), dtype=np.float32)
+        result = analyze_image_series(images, timestamps_s)
+
+        for candidate_name in ("respiratory_candidate", "cardiac_candidate"):
+            candidate = result[candidate_name]
+            self.assertIsNone(candidate["frequency_hz"])
+            self.assertIsNone(candidate["selected_pc"])
+            self.assertIsNone(candidate["peak_power"])
+            self.assertIsNone(candidate["dominance"])
+            self.assertFalse(candidate["reliable"])
+            self.assertEqual("no_positive_peak_power", candidate["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

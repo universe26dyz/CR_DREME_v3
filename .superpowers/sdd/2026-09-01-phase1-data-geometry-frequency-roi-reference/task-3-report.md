@@ -29,6 +29,9 @@ constructed tests GREEN:
 - null candidates when frequency resolution is insufficient; and
 - a 50-frame, 8.55-s acquisition reporting a respiratory candidate as
   `limited_duration` and producing no verified global respiratory band.
+- a flat, all-zero 50-frame series returning null frequency, selected-PC,
+  peak-power, and dominance fields with reason `no_positive_peak_power`, rather
+  than exposing the arbitrary first `argmax` frequency bin as a candidate.
 
 Fresh verification ran `python -m unittest discover -s tests -v`: 26 tests
 passed and one pre-existing optional real-loader test was skipped because its

@@ -174,6 +174,9 @@ def _select_band_candidate(
     frequency_index, pc_index = np.unravel_index(best_flat_index, band_powers.shape)
     selected_frequency = float(frequencies_hz[mask][frequency_index])
     peak_power = float(band_powers[frequency_index, pc_index])
+    if not np.isfinite(peak_power) or peak_power <= 0.0:
+        empty["reason"] = "no_positive_peak_power"
+        return empty
     comparison = pc_psd[frequencies_hz > 0.0, pc_index]
     noise_floor = float(np.median(comparison))
     dominance = peak_power / max(noise_floor, np.finfo(float).tiny)
@@ -186,9 +189,7 @@ def _select_band_candidate(
         "reason": "insufficient_peak_dominance",
         "search_band_hz": list(band_hz),
     }
-    if not np.isfinite(peak_power) or peak_power <= 0.0:
-        candidate["reason"] = "no_positive_peak_power"
-    elif dominance < DOMINANCE_THRESHOLD:
+    if dominance < DOMINANCE_THRESHOLD:
         candidate["reason"] = "insufficient_peak_dominance"
     elif kind == "respiratory" and duration_n_dt_s < RELIABLE_RESPIRATORY_DURATION_S:
         candidate["reason"] = "limited_duration"
