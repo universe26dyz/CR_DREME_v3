@@ -27,6 +27,7 @@ class AppConfig:
     views: tuple[str, ...]
     results_dir: Path
     manifest_stem: str = "dicom_manifest"
+    expected_frames_per_slice: int = 50
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -51,7 +52,32 @@ def config_from_mapping(raw: Mapping[str, Any], base_dir: Path) -> AppConfig:
     manifest_stem = str(raw.get("manifest_stem", "dicom_manifest"))
     if not manifest_stem or Path(manifest_stem).name != manifest_stem:
         raise ValueError("manifest_stem must be a filename stem without directories")
-    return AppConfig(dicom_root, tuple(str(view) for view in views_value), results_dir, manifest_stem)
+    try:
+        expected_frames_per_slice = int(raw.get("expected_frames_per_slice", 50))
+    except (TypeError, ValueError) as error:
+        raise ValueError("expected_frames_per_slice must be a positive integer") from error
+    config = AppConfig(
+        dicom_root,
+        tuple(str(view) for view in views_value),
+        results_dir,
+        manifest_stem,
+        expected_frames_per_slice,
+    )
+    validate_config(config)
+    return config
+
+
+def validate_config(config: AppConfig) -> None:
+    """Reject invalid frame expectations and output paths that can touch source data."""
+    if config.expected_frames_per_slice <= 0:
+        raise ValueError("expected_frames_per_slice must be a positive integer")
+    root = config.dicom_root.expanduser().resolve()
+    results = config.results_dir.expanduser().resolve()
+    try:
+        results.relative_to(root)
+    except ValueError:
+        return
+    raise ValueError("results_dir must not equal or be nested under dicom_root")
 
 
 def _resolve_path(value: Any, base_dir: Path) -> Path:
@@ -70,6 +96,7 @@ def main() -> None:
         "views": list(config.views),
         "results_dir": str(config.results_dir),
         "manifest_stem": config.manifest_stem,
+        "expected_frames_per_slice": config.expected_frames_per_slice,
     }, indent=2))
 
 

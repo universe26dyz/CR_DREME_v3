@@ -11,19 +11,21 @@
 from __future__ import annotations
 
 import csv
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
+import pydicom
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from cardioresp4d.config import AppConfig  # noqa: E402
+from cardioresp4d.config import AppConfig, config_from_mapping  # noqa: E402
 from cardioresp4d.data.build_manifest import build_manifest  # noqa: E402
 from cardioresp4d.data.dataset import CardioRespDataset  # noqa: E402
 from cardioresp4d.data.inspect_dataset import scan_dicom_frames  # noqa: E402
@@ -91,23 +93,46 @@ class DataPipelineTest(unittest.TestCase):
                 slope=2.0,
                 intercept=-10.0,
             )
-        write_dicom(self.two_ch / "00000001.dcm", "130000.000", pixels)
+            write_dicom(
+                self.two_ch / f"{50 - index:08d}.dcm",
+                f"1300{index:02d}.000",
+                pixels,
+            )
         write_dicom(self.scout / "00000001.dcm", "140000.000", pixels)
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
     def test_scan_filters_views_and_orders_each_fixed_slice_by_acquisition_time(self) -> None:
+        (self.sax / "00000050.dcm").rename(self.sax / "00000050.DCM")
         frames = scan_dicom_frames(self.root, ["SAX", "2CH"])
 
-        self.assertEqual(51, len(frames))
+        self.assertEqual(100, len(frames))
         self.assertEqual({"SAX", "2CH"}, {frame["view"] for frame in frames})
         sax_frames = [frame for frame in frames if frame["view"] == "SAX"]
+        two_ch_frames = [frame for frame in frames if frame["view"] == "2CH"]
         self.assertEqual(50, len(sax_frames))
+        self.assertEqual(50, len(two_ch_frames))
         self.assertEqual(list(range(50)), [frame["frame_index"] for frame in sax_frames])
         self.assertEqual(sorted(frame["timestamp_s"] for frame in sax_frames), [frame["timestamp_s"] for frame in sax_frames])
         self.assertEqual(43200.0, sax_frames[0]["timestamp_s"])
         self.assertNotIn("ContentTime", sax_frames[0])
+
+    def test_scan_rejects_selected_slice_with_extra_frame(self) -> None:
+        write_dicom(
+            self.two_ch / "00000051.dcm",
+            "130050.000",
+            np.array([[0, 10], [20, 100]], dtype=np.uint16),
+        )
+
+        with self.assertRaisesRegex(ValueError, "expected 50 frames"):
+            scan_dicom_frames(self.root, ["2CH"])
+
+    def test_scan_rejects_selected_slice_with_incomplete_frame_count(self) -> None:
+        (self.two_ch / "00000050.dcm").unlink()
+
+        with self.assertRaisesRegex(ValueError, "expected 50 frames"):
+            scan_dicom_frames(self.root, ["2CH"])
 
     def test_manifest_uses_only_non_phi_columns(self) -> None:
         output_dir = Path(self.tempdir.name) / "results"
@@ -132,6 +157,22 @@ class DataPipelineTest(unittest.TestCase):
             "study_instance_uid",
         }
         self.assertTrue(forbidden.isdisjoint({column.lower() for column in columns}))
+        with json_path.open(encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        self.assertTrue(forbidden.isdisjoint(manifest["frames"][0]))
+
+    def test_config_and_manifest_reject_results_inside_dicom_root(self) -> None:
+        with self.assertRaisesRegex(ValueError, "results_dir"):
+            config_from_mapping(
+                {
+                    "dicom_root": str(self.root),
+                    "views": ["SAX"],
+                    "results_dir": str(self.root / "results"),
+                },
+                self.root,
+            )
+        with self.assertRaisesRegex(ValueError, "results_dir"):
+            build_manifest(AppConfig(self.root, ("SAX",), self.root / "results"))
 
     def test_dataset_applies_rescale_and_percentile_normalization(self) -> None:
         output_dir = Path(self.tempdir.name) / "results"
@@ -149,6 +190,18 @@ class DataPipelineTest(unittest.TestCase):
         self.assertAlmostEqual(0.0, float(sample["image"].min()))
         self.assertAlmostEqual(1.0, float(sample["image"].max()))
         self.assertGreater(float(sample["image"][0, 1]), 0.0)
+
+    def test_dataset_rejects_missing_rescale_metadata(self) -> None:
+        csv_path, _ = build_manifest(
+            AppConfig(self.root, ("SAX",), Path(self.tempdir.name) / "results", "manifest")
+        )
+        dicom_path = self.sax / "00000050.dcm"
+        dataset = pydicom.dcmread(dicom_path)
+        del dataset.RescaleSlope
+        dataset.save_as(dicom_path, write_like_original=False)
+
+        with self.assertRaisesRegex(ValueError, "RescaleSlope"):
+            CardioRespDataset(csv_path)[0]
 
 
 if __name__ == "__main__":

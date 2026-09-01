@@ -42,17 +42,27 @@ def acquisition_time_to_seconds(value: str) -> float:
     return hour * 3600.0 + minute * 60.0 + second
 
 
-def scan_dicom_frames(root: str | Path, views: Iterable[str]) -> list[dict[str, Any]]:
+def scan_dicom_frames(
+    root: str | Path,
+    views: Iterable[str],
+    expected_frames_per_slice: int = 50,
+) -> list[dict[str, Any]]:
     """Return selected DICOM frames ordered by view, fixed slice, and AcquisitionTime."""
     root_path = Path(root).expanduser().resolve()
     requested_views = tuple(_normalise_requested_view(view) for view in views)
     if not requested_views:
         raise ValueError("At least one view must be requested")
+    if expected_frames_per_slice <= 0:
+        raise ValueError("expected_frames_per_slice must be a positive integer")
     if not root_path.is_dir():
         raise FileNotFoundError(f"DICOM root does not exist: {root_path}")
 
     records: list[dict[str, Any]] = []
-    for dicom_path in sorted(root_path.rglob("*.dcm")):
+    dicom_paths = sorted(
+        path for path in root_path.rglob("*")
+        if path.is_file() and path.suffix.lower() == ".dcm"
+    )
+    for dicom_path in dicom_paths:
         slice_id = dicom_path.parent.name
         view = _view_from_slice_id(slice_id)
         if view not in requested_views:
@@ -85,6 +95,16 @@ def scan_dicom_frames(root: str | Path, views: Iterable[str]) -> list[dict[str, 
         record["frame_index"] = per_slice_index[key]
         del record["instance_number"]
         per_slice_index[key] += 1
+    invalid_counts = {
+        f"{view}/{slice_id}": count
+        for (view, slice_id), count in sorted(per_slice_index.items())
+        if count != expected_frames_per_slice
+    }
+    if invalid_counts:
+        details = ", ".join(f"{series}={count}" for series, count in invalid_counts.items())
+        raise ValueError(
+            f"Selected slice frame count mismatch: expected {expected_frames_per_slice} frames; {details}"
+        )
     return records
 
 

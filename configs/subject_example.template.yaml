@@ -6,3 +6,4 @@ views:
   - 4CH
 results_dir: ../results
 manifest_stem: dicom_manifest
+expected_frames_per_slice: 50

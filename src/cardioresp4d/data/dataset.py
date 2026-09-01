@@ -55,8 +55,16 @@ class CardioRespDataset:
 
 
 def _rescaled_pixels(dataset: pydicom.dataset.Dataset) -> np.ndarray:
-    slope = float(getattr(dataset, "RescaleSlope", 1.0))
-    intercept = float(getattr(dataset, "RescaleIntercept", 0.0))
+    missing = [
+        tag for tag in ("RescaleSlope", "RescaleIntercept")
+        if not hasattr(dataset, tag)
+    ]
+    if missing:
+        raise ValueError(
+            "DICOM frame is missing required rescale metadata: " + ", ".join(missing)
+        )
+    slope = float(dataset.RescaleSlope)
+    intercept = float(dataset.RescaleIntercept)
     return dataset.pixel_array.astype(np.float32) * slope + intercept
 
 

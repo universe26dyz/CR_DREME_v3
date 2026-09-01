@@ -17,7 +17,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from cardioresp4d.config import AppConfig, load_config
+from cardioresp4d.config import AppConfig, load_config, validate_config
 from cardioresp4d.data.inspect_dataset import scan_dicom_frames
 
 
@@ -30,7 +30,12 @@ MANIFEST_COLUMNS = (
 
 def build_manifest(config: AppConfig) -> tuple[Path, Path]:
     """Write the canonical CSV and JSON manifests and return their paths."""
-    frames = scan_dicom_frames(config.dicom_root, config.views)
+    validate_config(config)
+    frames = scan_dicom_frames(
+        config.dicom_root,
+        config.views,
+        expected_frames_per_slice=config.expected_frames_per_slice,
+    )
     rows = [_flatten_frame(frame) for frame in frames]
     config.results_dir.mkdir(parents=True, exist_ok=True)
     csv_path = config.results_dir / f"{config.manifest_stem}.csv"
