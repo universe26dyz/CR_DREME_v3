@@ -19,6 +19,9 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 
+EXPECTED_FRAMES_PER_SLICE = 50
+
+
 @dataclass(frozen=True)
 class AppConfig:
     """Paths and view selection required to create a DICOM manifest."""
@@ -69,15 +72,27 @@ def config_from_mapping(raw: Mapping[str, Any], base_dir: Path) -> AppConfig:
 
 def validate_config(config: AppConfig) -> None:
     """Reject invalid frame expectations and output paths that can touch source data."""
-    if config.expected_frames_per_slice <= 0:
-        raise ValueError("expected_frames_per_slice must be a positive integer")
-    root = config.dicom_root.expanduser().resolve()
-    results = config.results_dir.expanduser().resolve()
+    validate_expected_frames_per_slice(config.expected_frames_per_slice)
+    validate_output_path(config.dicom_root, config.results_dir, "results_dir")
+
+
+def validate_expected_frames_per_slice(value: int) -> None:
+    """Enforce the Phase 1 v1 acquisition's fixed 50-frame slice contract."""
+    if value != EXPECTED_FRAMES_PER_SLICE:
+        raise ValueError(
+            f"expected_frames_per_slice must equal exactly {EXPECTED_FRAMES_PER_SLICE} for Phase 1 v1"
+        )
+
+
+def validate_output_path(dicom_root: str | Path, output_path: str | Path, name: str) -> None:
+    """Reject an output location that equals or is nested inside read-only source data."""
+    root = Path(dicom_root).expanduser().resolve()
+    output = Path(output_path).expanduser().resolve()
     try:
-        results.relative_to(root)
+        output.relative_to(root)
     except ValueError:
         return
-    raise ValueError("results_dir must not equal or be nested under dicom_root")
+    raise ValueError(f"{name} must not equal or be nested under dicom_root")
 
 
 def _resolve_path(value: Any, base_dir: Path) -> Path:

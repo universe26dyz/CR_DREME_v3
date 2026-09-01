@@ -18,6 +18,8 @@ from typing import Any, Iterable
 
 import pydicom
 
+from cardioresp4d.config import validate_expected_frames_per_slice, validate_output_path
+
 
 _VIEWS = {"SAX", "2CH", "4CH"}
 _HEADER_TAGS = [
@@ -52,8 +54,7 @@ def scan_dicom_frames(
     requested_views = tuple(_normalise_requested_view(view) for view in views)
     if not requested_views:
         raise ValueError("At least one view must be requested")
-    if expected_frames_per_slice <= 0:
-        raise ValueError("expected_frames_per_slice must be a positive integer")
+    validate_expected_frames_per_slice(expected_frames_per_slice)
     if not root_path.is_dir():
         raise FileNotFoundError(f"DICOM root does not exist: {root_path}")
 
@@ -124,6 +125,18 @@ def inspect_dataset(root: str | Path, views: Iterable[str]) -> dict[str, Any]:
     }
 
 
+def write_inspection(root: str | Path, views: Iterable[str], output_path: str | Path) -> Path:
+    """Write a PHI-free inspection JSON only outside the source DICOM tree."""
+    output = Path(output_path)
+    validate_output_path(root, output, "output")
+    summary = inspect_dataset(root, views)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+        handle.write("\n")
+    return output
+
+
 def _normalise_requested_view(value: str) -> str:
     normalised = str(value).upper()
     if normalised not in _VIEWS:
@@ -152,11 +165,9 @@ def main() -> None:
     parser.add_argument("--views", nargs="+", default=["SAX", "2CH", "4CH"], help="Views to scan")
     parser.add_argument("--output", required=True, type=Path, help="Inspection JSON output path")
     args = parser.parse_args()
-    summary = inspect_dataset(args.root, args.views)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2)
-        handle.write("\n")
+    output_path = write_inspection(args.root, args.views, args.output)
+    with output_path.open(encoding="utf-8") as handle:
+        summary = json.load(handle)
     print(json.dumps(summary, indent=2))
 
 

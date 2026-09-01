@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -27,8 +28,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from cardioresp4d.config import AppConfig, config_from_mapping  # noqa: E402
 from cardioresp4d.data.build_manifest import build_manifest  # noqa: E402
-from cardioresp4d.data.dataset import CardioRespDataset  # noqa: E402
-from cardioresp4d.data.inspect_dataset import scan_dicom_frames  # noqa: E402
+from cardioresp4d.data.dataset import CardioRespDataset, _rescaled_pixels  # noqa: E402
+from cardioresp4d.data.inspect_dataset import scan_dicom_frames, write_inspection  # noqa: E402
 
 
 def write_dicom(
@@ -174,6 +175,24 @@ class DataPipelineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "results_dir"):
             build_manifest(AppConfig(self.root, ("SAX",), self.root / "results"))
 
+    def test_config_requires_exactly_50_frames_per_slice(self) -> None:
+        for expected_frames in (49, 51):
+            with self.subTest(expected_frames=expected_frames):
+                with self.assertRaisesRegex(ValueError, "exactly 50"):
+                    config_from_mapping(
+                        {
+                            "dicom_root": str(self.root),
+                            "views": ["SAX"],
+                            "results_dir": str(Path(self.tempdir.name) / "results"),
+                            "expected_frames_per_slice": expected_frames,
+                        },
+                        self.root,
+                    )
+
+    def test_inspection_rejects_output_inside_dicom_root(self) -> None:
+        with self.assertRaisesRegex(ValueError, "output"):
+            write_inspection(self.root, ["SAX"], self.root / "inspection.json")
+
     def test_dataset_applies_rescale_and_percentile_normalization(self) -> None:
         output_dir = Path(self.tempdir.name) / "results"
         csv_path, _ = build_manifest(
@@ -184,6 +203,7 @@ class DataPipelineTest(unittest.TestCase):
 
         self.assertEqual("SAX", sample["view"])
         self.assertEqual("SAX_s01_1001", sample["slice_id"])
+        self.assertEqual("modality_lut", sample["rescale_status"])
         self.assertEqual(43200.0, sample["timestamp_s"])
         self.assertEqual([1.0, 2.0, 3.0], sample["geometry"]["image_position_patient"])
         self.assertEqual(np.float32, sample["image"].dtype)
@@ -191,7 +211,21 @@ class DataPipelineTest(unittest.TestCase):
         self.assertAlmostEqual(1.0, float(sample["image"].max()))
         self.assertGreater(float(sample["image"][0, 1]), 0.0)
 
-    def test_dataset_rejects_missing_rescale_metadata(self) -> None:
+    def test_dataset_keeps_stored_pixels_when_both_rescale_tags_are_absent(self) -> None:
+        csv_path, _ = build_manifest(
+            AppConfig(self.root, ("SAX",), Path(self.tempdir.name) / "results", "manifest")
+        )
+        dicom_path = self.sax / "00000050.dcm"
+        dataset = pydicom.dcmread(dicom_path)
+        del dataset.RescaleSlope
+        del dataset.RescaleIntercept
+        dataset.save_as(dicom_path, write_like_original=False)
+
+        stored_pixels = pydicom.dcmread(dicom_path).pixel_array.astype(np.float32)
+        np.testing.assert_array_equal(stored_pixels, _rescaled_pixels(pydicom.dcmread(dicom_path)))
+        self.assertEqual("identity_without_rescale_tags", CardioRespDataset(csv_path)[0]["rescale_status"])
+
+    def test_dataset_rejects_partial_rescale_metadata(self) -> None:
         csv_path, _ = build_manifest(
             AppConfig(self.root, ("SAX",), Path(self.tempdir.name) / "results", "manifest")
         )
@@ -200,8 +234,24 @@ class DataPipelineTest(unittest.TestCase):
         del dataset.RescaleSlope
         dataset.save_as(dicom_path, write_like_original=False)
 
-        with self.assertRaisesRegex(ValueError, "RescaleSlope"):
+        with self.assertRaisesRegex(ValueError, "partial rescale"):
             CardioRespDataset(csv_path)[0]
+
+    @unittest.skipUnless(
+        os.environ.get("CARDIORESP4D_REAL_DICOM_ROOT"),
+        "Set CARDIORESP4D_REAL_DICOM_ROOT to run the real first-frame loader test.",
+    )
+    def test_real_first_frame_loader(self) -> None:
+        real_root = Path(os.environ["CARDIORESP4D_REAL_DICOM_ROOT"])
+        with tempfile.TemporaryDirectory() as output_directory:
+            csv_path, _ = build_manifest(
+                AppConfig(real_root, ("SAX", "2CH", "4CH"), Path(output_directory), "manifest")
+            )
+            sample = CardioRespDataset(csv_path)[0]
+
+        self.assertEqual("identity_without_rescale_tags", sample["rescale_status"])
+        self.assertTrue(np.isfinite(sample["image"]).all())
+        self.assertEqual((240, 213), sample["image"].shape)
 
 
 if __name__ == "__main__":

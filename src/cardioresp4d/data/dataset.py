@@ -2,8 +2,8 @@
 功能：以按帧访问的方式读取 CardioResp DICOM manifest 及其重建图像。
 论文来源：Necessary adaptation: image-domain DICOM loader for local free-breathing MRI.
 输入：Task 1 CSV manifest 和其引用的 DICOM 帧。
-输出：归一化 float32 图像、AcquisitionTime 秒数、视图、固定层标识和 DICOM 几何。
-主要步骤：读取 manifest，应用 DICOM rescale slope/intercept，再作每帧 1/99 percentile 归一化。
+输出：归一化 float32 图像、AcquisitionTime 秒数、视图、固定层标识、DICOM 几何及 rescale 状态。
+主要步骤：读取 manifest，按 pydicom modality LUT/rescale 规则变换像素，再作每帧 1/99 percentile 归一化。
 是否属于原论文直接实现 / 必要适配 / 可选实验：Necessary adaptation.
 命令行使用示例：python -m cardioresp4d.data.dataset --manifest results/dicom_manifest.csv --index 0
 """
@@ -18,6 +18,11 @@ from typing import Any
 
 import numpy as np
 import pydicom
+
+try:
+    from pydicom.pixels import apply_modality_lut
+except ImportError:  # pydicom < 3.0 compatibility in the supported runtime.
+    from pydicom.pixel_data_handlers.util import apply_modality_lut
 
 
 class CardioRespDataset:
@@ -36,12 +41,14 @@ class CardioRespDataset:
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self._rows[index]
         dataset = pydicom.dcmread(row["dicom_path"])
+        rescale_status = _rescale_status(dataset)
         image = _normalise_image(_rescaled_pixels(dataset))
         return {
             "image": image,
             "timestamp_s": float(row["timestamp_s"]),
             "view": row["view"],
             "slice_id": row["slice_id"],
+            "rescale_status": rescale_status,
             "geometry": {
                 "image_position_patient": json.loads(row["image_position_patient"]),
                 "image_orientation_patient": json.loads(row["image_orientation_patient"]),
@@ -55,17 +62,19 @@ class CardioRespDataset:
 
 
 def _rescaled_pixels(dataset: pydicom.dataset.Dataset) -> np.ndarray:
-    missing = [
-        tag for tag in ("RescaleSlope", "RescaleIntercept")
-        if not hasattr(dataset, tag)
-    ]
-    if missing:
-        raise ValueError(
-            "DICOM frame is missing required rescale metadata: " + ", ".join(missing)
-        )
-    slope = float(dataset.RescaleSlope)
-    intercept = float(dataset.RescaleIntercept)
-    return dataset.pixel_array.astype(np.float32) * slope + intercept
+    """Apply pydicom's modality LUT only when the rescale pair is complete."""
+    if _rescale_status(dataset) == "identity_without_rescale_tags":
+        return dataset.pixel_array.astype(np.float32)
+    return np.asarray(apply_modality_lut(dataset.pixel_array, dataset), dtype=np.float32)
+
+
+def _rescale_status(dataset: pydicom.dataset.Dataset) -> str:
+    """Classify mandatory pair completeness without inventing a missing tag value."""
+    has_slope = hasattr(dataset, "RescaleSlope")
+    has_intercept = hasattr(dataset, "RescaleIntercept")
+    if has_slope != has_intercept:
+        raise ValueError("DICOM frame has partial rescale metadata: require both RescaleSlope and RescaleIntercept")
+    return "modality_lut" if has_slope else "identity_without_rescale_tags"
 
 
 def _normalise_image(image: np.ndarray) -> np.ndarray:
