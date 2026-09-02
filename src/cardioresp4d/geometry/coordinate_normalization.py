@@ -112,6 +112,8 @@ def _transform_points(matrix: np.ndarray, points: Any, name: str) -> np.ndarray:
     """Apply a homogeneous affine matrix while preserving input leading batch dimensions."""
     values = np.asarray(points, dtype=np.float64)
     if values.shape == (3,):
+        if not np.isfinite(values).all():
+            raise ValueError(f"{name} must have final dimension 3 and contain only finite values")
         return (matrix @ np.append(values, 1.0))[:3]
     if values.ndim < 1 or values.shape[-1] != 3 or not np.isfinite(values).all():
         raise ValueError(f"{name} must have final dimension 3 and contain only finite values")

@@ -90,8 +90,8 @@ class PcaFrequencyTest(unittest.TestCase):
         selected_pc = respiratory["selected_pc"] - 1
         self.assertGreater(float(np.abs(result["temporal_pcs"][:, selected_pc]).max()), 0.0)
         self.assertGreater(float(result["pc_psd"][:, selected_pc].max()), 0.0)
-        self.assertIsNotNone(bands["respiratory"]["verified_band_hz"])
-        self.assertEqual("reliable_candidates_present", bands["respiratory"]["reason"])
+        self.assertIsNone(bands["respiratory"]["verified_band_hz"])
+        self.assertEqual("no_cross_slice_consensus", bands["respiratory"]["reason"])
         self.assertIn("observation_duration_caveat", bands["respiratory"]["limitations"])
         per_slice = bands["respiratory"]["per_slice_candidates"][0]
         self.assertAlmostEqual(8.379, per_slice["duration_span_s"], places=8)
@@ -123,6 +123,43 @@ class PcaFrequencyTest(unittest.TestCase):
             self.assertIsNone(candidate["dominance"])
             self.assertFalse(candidate["reliable"])
             self.assertEqual("no_positive_peak_power", candidate["reason"])
+
+    def test_verified_band_requires_majority_of_all_eligible_slices(self) -> None:
+        """One reliable slice cannot label an aggregate band verified when one peer is null."""
+        reliable = analyze_image_series(
+            synthetic_series(np.arange(50, dtype=float) * 0.171),
+            np.arange(50, dtype=float) * 0.171,
+        )
+        null = analyze_image_series(
+            np.zeros((50, 12, 10), dtype=np.float32),
+            np.arange(50, dtype=float) * 0.171,
+        )
+
+        aggregate = aggregate_frequency_bands([reliable, null], consensus_min_slice_fraction=0.5)
+
+        respiratory = aggregate["respiratory"]
+        self.assertIsNone(respiratory["verified_band_hz"])
+        self.assertEqual("no_cross_slice_consensus", respiratory["reason"])
+        self.assertEqual(2, respiratory["consensus"]["eligible_slice_count"])
+        self.assertEqual(1, max(item["support_count"] for item in respiratory["resolution_bin_support"]))
+
+    def test_verified_band_records_resolution_bin_majority_support(self) -> None:
+        """Only a recurrent resolution bin is verified and its support is auditable."""
+        timestamps_s = np.arange(50, dtype=float) * 0.171
+        first = analyze_image_series(synthetic_series(timestamps_s), timestamps_s)
+        second = analyze_image_series(synthetic_series(timestamps_s), timestamps_s)
+        off_frequency = analyze_image_series(
+            synthetic_series(timestamps_s, respiratory_hz=0.47), timestamps_s
+        )
+
+        respiratory = aggregate_frequency_bands(
+            [first, second, off_frequency], consensus_min_slice_fraction=0.5
+        )["respiratory"]
+
+        self.assertIsNotNone(respiratory["verified_band_hz"])
+        self.assertEqual("cross_slice_consensus", respiratory["reason"])
+        self.assertEqual(3, respiratory["consensus"]["eligible_slice_count"])
+        self.assertTrue(any(item["support_count"] == 2 for item in respiratory["resolution_bin_support"]))
 
 
 if __name__ == "__main__":

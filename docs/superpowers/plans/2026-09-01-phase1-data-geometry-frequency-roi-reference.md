@@ -8,12 +8,12 @@
 
 **Tech Stack:** Python 3.9, NumPy, SciPy, pydicom, PyYAML, Matplotlib, nibabel, standard-library `csv` and `unittest`.
 
-**Spec:** `/home/universe/Documents/ChatGPT/4dsvr_CR_DREME/CardioResp_4D_Method_and_Codex_Prompt.md`
+**Spec:** external workspace document `CardioResp_4D_Method_and_Codex_Prompt.md`
 
 ## Global Constraints
 
 - Implement Phase 1 only; do not create `models/`, `rendering/`, `losses/`, or training code.
-- Treat `/home/universe/SVR/data/DYL0709/DYL_20260709_dicom` as read-only.
+- Treat the DICOM root configured only in ignored `configs/subject_local.yaml` as read-only.
 - Current acquisition has 50 temporal positions per fixed slice, not 25.
 - Use DICOM patient coordinates and an explicit `(column, row)` pixel API.
 - Do not fabricate missing DICOM fields or frequency candidates.
@@ -110,4 +110,3 @@
 - [ ] Run `git status`, `git diff --stat`, `git diff`, and `git diff --check`; ensure no data/results/secrets are tracked.
 - [ ] Write `PHASE1_REPORT.md` with real structure, provenance, inputs/outputs, tests, Geometry/PCA/ROI/reference findings, limitations, and Phase 2 plan.
 - [ ] Commit `phase(1): implement data geometry frequency ROI and reference` and create annotated tag `phase-01-data-geometry` only after all verification succeeds.
-

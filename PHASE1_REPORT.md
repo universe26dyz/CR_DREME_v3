@@ -5,7 +5,7 @@ loss, training, or inference code is included.
 
 ## Outcome and real acquisition
 
-The local read-only acquisition completed the ordered pipeline
+The local read-only acquisition completed the original ordered pipeline
 `inspect -> manifest -> geometry -> frequency -> roi -> reference` without a
 mock or fallback. The ignored subject config contains the machine-specific input
 path and empirical cardiac box; neither is tracked.
@@ -35,12 +35,16 @@ path and empirical cardiac box; neither is tracked.
   timestamp, view/slice identity, geometry, and explicit rescale status.
 - `src/cardioresp4d/config.py`, `configs/default.yaml`, and
   `configs/subject_example.template.yaml`: the only YAML contract is now grouped
-  into `project`, `data`, `geometry`, `frequency`, `roi`, and `reference`.
+  into `project`, `data`, `geometry`, `frequency`, `roi`, `reference`, and
+  `outlier_qc`.
   Scientific v1 constants (three views, exact 50 frames, frequency bands,
   dominance threshold, full PCA rank, SAX reference) cannot be silently changed.
 
-This image-domain DICOM boundary is a necessary adaptation. Absolute paths and
-patient-specific values remain only in ignored `configs/subject_local.yaml`.
+This image-domain DICOM boundary is a necessary adaptation. Canonical schema-v2
+CSV/JSON contains only opaque `source_file_token` and opaque view/slice IDs: it
+contains no DICOM path, original filename, or source directory name. Runtime
+path resolution is isolated in an explicitly sensitive sidecar under ignored
+results; patient-specific configuration also remains ignored.
 
 ### Patient-world geometry
 
@@ -95,6 +99,14 @@ explained variance remain in JSON. The implementation follows the supplied
 image-domain PCA paper for mean-centred PCA/FFT and adapts its evidence into
 DREME-style frequency bands.
 
+Final-review clarification: `verified_band_hz` now requires at least two slices
+and support from at least 50% of **all eligible analyzed slices**. Re-aggregation
+of the already saved 144 per-slice results (no PCA rerun) gave one respiratory
+resolution component `[0.05848,0.64327]` Hz with count/total/fraction
+`144/144/1.0`. Cardiac support remained distributed across sequential-time bins
+(18/144, 58/144, and 68/144); per-slice cardiac candidates remain the primary
+evidence and no global point heart rate is manufactured.
+
 ### Shared cardiac coordinate box
 
 The initial DREME-style empirical patient-world box is centred at
@@ -137,7 +149,10 @@ multi-view fusion was introduced.
 
 `scripts/run_pipeline.py` calls module public APIs only and supports inclusive
 `--from-stage` / `--to-stage` ranges. Starting after manifest requires the
-existing manifest artifact and fails clearly if it is absent. The complete real
+matching CSV/JSON schema, hashes, current-root fingerprint, configuration hash,
+complete 50 x (50+52+42) contract, sensitive runtime map, and acquisition-QC
+table. Successful runs write `pipeline_run_summary.json` with project name,
+status, stages, Git commit, non-sensitive hashes, and artifacts. The earlier complete real
 run used a new ignored output root and regenerated all stages. Audit counts were:
 6 JSON, 289 CSV, 144 NPZ, 149 PNG, and one NIfTI; all numerical arrays were
 finite and all PNG files were non-empty. Representative geometry, three ROI,
@@ -156,7 +171,7 @@ python -m <each Phase-1 module> --help
 python scripts/run_pipeline.py --config configs/subject_local.yaml
 ```
 
-Final result: 45/45 tests passed including the environment-gated real first-frame
+Final result: 57/57 tests passed including the environment-gated real first-frame
 loader; compileall passed; all eleven CLI help boundaries passed; the complete
 real run passed. Synthetic tests cover DICOM ordering/rescale, anisotropic
 geometry and round trips, known respiratory/cardiac signals, irregular-time
@@ -173,11 +188,41 @@ Branch: `dev/cardioresp4d`. Stage-0 tag: `stage-00-baseline`.
   normal extraction of short-window respiratory candidates with precision caveat.
 - `fcf4ed7`, `0404d11`: cardiac box QC and exact-50 API enforcement.
 - `38e045f`: SAX temporal-average reference.
-- Task-6 integration commit and verified annotated tag are pending independent
-  final review; the controller creates `phase-01-data-geometry` only after that review.
+- `ab8d65c`: Phase-1 runner, nested config, and initial report integration.
+- The current provenance/outlier-QC fix commit and supplemental tag remain
+  pending controller verification. No existing commit or tag is rewritten.
 
 No DICOM, NIfTI, NPZ, runtime result, ignored local config, secret, or local
 absolute path is tracked.
+
+## Final-review hardening and acquisition QC increment
+
+The acquisition contract now validates exactly SAX/2CH/4CH = 50/52/42 fixed
+slice groups, exactly 50 frames per group, unique InstanceNumber and
+TemporalPositionIdentifier 1..50, and invariant IPP/IOP/spacing/matrix/thickness
+metadata across every frame before manifest writing. Canonical artifacts are
+bound to the current root and complete nested configuration by hashes. Unknown
+keys are rejected at every YAML level.
+
+The new order is `manifest -> acquisition QC -> downstream`. Within each
+50-frame block, QC first records actual modality-rescale status, then uses a
+temporal median reference, NCC, robust global intensity scale, and
+scale-corrected normalized residual. Median/MAD rules are conservative: a scale
+flag also requires a large absolute excursion, avoiding ordinary first-frame,
+cardiac, and respiratory changes. The independent table supplies
+`qc_valid/qc_reason/qc_ncc/qc_intensity_scale/qc_residual`; no DICOM is deleted.
+Dataset consumers filter invalid observations. Reference construction retains
+the S2V-DREME arithmetic mean over valid frames and clearly rejects an entirely
+invalid slice rather than filling zeros. PCA excludes incomplete post-QC blocks
+because ordinary FFT requires its complete uniform temporal grid, recording the
+exclusion instead of resampling silently.
+
+Minimal real QC intentionally did not rerun full Geometry/ROI/PCA. Nine opaque
+representative blocks (450 frames) were examined: 450 remained valid and no
+obvious acquisition corruption was confirmed. The most extreme transient scale
+candidate was retained after conservative absolute-scale gating. Synthetic tests
+independently prove global intensity-drop and local-bright corruption detection.
+Threshold approval and an optional all-slice QC pass remain a user decision.
 
 ## Known limitations and Phase 2 plan
 

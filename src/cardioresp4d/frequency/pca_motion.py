@@ -245,6 +245,7 @@ def analyze_manifest(
     output_dir: str | Path,
     *,
     relative_tolerance: float = UNIFORM_RTOL,
+    consensus_min_slice_fraction: float = 0.5,
 ) -> dict[str, Any]:
     """Analyze all complete 50-frame manifest slices and write aggregate frequency JSON."""
     dataset = CardioRespDataset(manifest_path)
@@ -253,10 +254,13 @@ def analyze_manifest(
         row = dataset._rows[index]
         grouped_indices.setdefault((row["view"], row["slice_id"]), []).append(index)
     results: list[dict[str, Any]] = []
+    excluded_slices: list[dict[str, Any]] = []
     root = Path(output_dir)
     for (view, slice_id), indices in sorted(grouped_indices.items()):
         if len(indices) != 50:
-            raise ValueError(f"{view}/{slice_id} has {len(indices)} frames; fixed-slice analysis requires exactly 50")
+            excluded_slices.append({"slice_key": f"{view}/{slice_id}", "valid_frame_count": len(indices),
+                                    "reason": "acquisition_qc_removed_frames; ordinary FFT requires the complete uniform grid"})
+            continue
         indices.sort(key=lambda index: float(dataset._rows[index]["timestamp_s"]))
         samples = [dataset[index] for index in indices]
         result = analyze_image_series(
@@ -269,7 +273,8 @@ def analyze_manifest(
         result["slice_key"] = f"{view}/{slice_id}"
         write_slice_outputs(result, root / _safe_path_component(view) / _safe_path_component(slice_id))
         results.append(result)
-    aggregate = aggregate_frequency_bands(results)
+    aggregate = aggregate_frequency_bands(results, consensus_min_slice_fraction=consensus_min_slice_fraction)
+    aggregate["excluded_slices"] = excluded_slices
     root.mkdir(parents=True, exist_ok=True)
     with (root / "frequency_bands.json").open("w", encoding="utf-8") as handle:
         json.dump(aggregate, handle, indent=2)

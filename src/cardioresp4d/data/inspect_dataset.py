@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import pydicom
+import numpy as np
 
 from cardioresp4d.config import validate_expected_frames_per_slice, validate_output_path
 
@@ -25,6 +26,7 @@ _VIEWS = {"SAX", "2CH", "4CH"}
 _HEADER_TAGS = [
     "AcquisitionTime", "InstanceNumber", "ImagePositionPatient", "ImageOrientationPatient",
     "PixelSpacing", "SliceThickness", "SpacingBetweenSlices", "Rows", "Columns",
+    "TemporalPositionIdentifier",
 ]
 
 
@@ -48,6 +50,7 @@ def scan_dicom_frames(
     root: str | Path,
     views: Iterable[str],
     expected_frames_per_slice: int = 50,
+    expected_series_per_view: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Return selected DICOM frames ordered by view, fixed slice, and AcquisitionTime."""
     root_path = Path(root).expanduser().resolve()
@@ -77,6 +80,7 @@ def scan_dicom_frames(
             "slice_id": slice_id,
             "timestamp_s": timestamp_s,
             "instance_number": int(dataset.InstanceNumber),
+            "temporal_position_identifier": int(dataset.TemporalPositionIdentifier),
             "geometry": {
                 "image_position_patient": [float(value) for value in dataset.ImagePositionPatient],
                 "image_orientation_patient": [float(value) for value in dataset.ImageOrientationPatient],
@@ -94,7 +98,6 @@ def scan_dicom_frames(
     for record in records:
         key = (record["view"], record["slice_id"])
         record["frame_index"] = per_slice_index[key]
-        del record["instance_number"]
         per_slice_index[key] += 1
     invalid_counts = {
         f"{view}/{slice_id}": count
@@ -106,6 +109,33 @@ def scan_dicom_frames(
         raise ValueError(
             f"Selected slice frame count mismatch: expected {expected_frames_per_slice} frames; {details}"
         )
+    grouped: defaultdict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        grouped[(record["view"], record["slice_id"])].append(record)
+    if expected_series_per_view is not None:
+        actual = Counter(view for view, _ in grouped)
+        mismatch = {view: (actual.get(view, 0), int(expected)) for view, expected in expected_series_per_view.items()
+                    if actual.get(view, 0) != int(expected)}
+        if mismatch:
+            raise ValueError(f"Selected fixed-slice series count mismatch (actual,expected): {mismatch}")
+    for (view, slice_id), frames in grouped.items():
+        instances = {int(frame["instance_number"]) for frame in frames}
+        temporal = {int(frame["temporal_position_identifier"]) for frame in frames}
+        expected_ids = set(range(1, expected_frames_per_slice + 1))
+        if instances != expected_ids or temporal != expected_ids:
+            raise ValueError(f"{view}/{slice_id} must contain unique InstanceNumber and TemporalPositionIdentifier 1..{expected_frames_per_slice}")
+        reference = frames[0]["geometry"]
+        for frame in frames[1:]:
+            geometry = frame["geometry"]
+            for field in ("rows", "columns"):
+                if geometry[field] != reference[field]:
+                    raise ValueError(f"{view}/{slice_id} geometry changes across 50 frames: {field}")
+            for field in ("image_position_patient", "image_orientation_patient", "pixel_spacing", "slice_thickness", "spacing_between_slices"):
+                if not np.allclose(geometry[field], reference[field], atol=1e-6, rtol=0.0):
+                    raise ValueError(f"{view}/{slice_id} geometry changes across 50 frames: {field}")
+    for record in records:
+        del record["instance_number"]
+        del record["temporal_position_identifier"]
     return records
 
 
@@ -113,8 +143,10 @@ def inspect_dataset(root: str | Path, views: Iterable[str]) -> dict[str, Any]:
     """Build a serializable, PHI-free structural summary of selected DICOM frames."""
     frames = scan_dicom_frames(root, views)
     counts = Counter((frame["view"], frame["slice_id"]) for frame in frames)
+    opaque = {key: f"{key[0]}_s{index + 1:03d}" for view in _VIEWS
+              for index, key in enumerate(sorted(k for k in counts if k[0] == view))}
     series = [
-        {"view": view, "slice_id": slice_id, "frame_count": frame_count}
+        {"view": view, "slice_id": opaque[(view, slice_id)], "frame_count": frame_count}
         for (view, slice_id), frame_count in sorted(counts.items())
     ]
     return {

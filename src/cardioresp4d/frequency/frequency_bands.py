@@ -1,12 +1,26 @@
-"""Aggregate per-slice frequency candidates without inventing a global heart rate."""
+"""Aggregate auditable cross-slice frequency evidence without inventing a global rate.
+
+功能：汇总 fixed-slice PCA/PSD 候选，同时把逐 slice 候选与跨 slice
+resolution-bin 支持度分开报告。
+论文来源：image-domain PCA 的频率发现；DREME-MR 的频率先验使用方式。
+输入：逐 slice 的 PCA 结果字典以及最低跨 slice 支持比例。
+输出：逐 slice 候选、resolution-bin support table，及仅在重复支持时的呼吸
+``verified_band_hz``；不产生一个全局心率点估计。
+主要步骤：每个可靠候选转换为半个 ``df`` 的 bin，合并重叠 bin，并按全部
+eligible slices 计算支持比例。
+是否属于原论文直接实现 / 必要适配 / 可选实验：Necessary adaptation.
+命令行：内部 library；由 ``pca_motion`` 的 pipeline API 调用。
+"""
 
 from __future__ import annotations
 
 from typing import Any, Iterable
 
 
-def aggregate_frequency_bands(slice_results: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    """Build transparent per-slice and union-bin frequency evidence for all slices.
+def aggregate_frequency_bands(
+    slice_results: Iterable[dict[str, Any]], *, consensus_min_slice_fraction: float = 0.5
+) -> dict[str, Any]:
+    """Build per-slice candidates and recurrent-bin consensus evidence.
 
     Respiratory and cardiac verification use the same positive-peak and
     dominance evidence.  Both retain per-slice candidates and merged
@@ -14,15 +28,29 @@ def aggregate_frequency_bands(slice_results: Iterable[dict[str, Any]]) -> dict[s
     across the sequential scan.  Observation span and ``df`` remain explicit
     limitations on the precision of every reported band.
     """
+    if not 0.0 < consensus_min_slice_fraction <= 1.0:
+        raise ValueError("consensus_min_slice_fraction must lie in (0, 1]")
     results = list(slice_results)
-    respiratory = _aggregate_kind(results, "respiratory_candidate", is_respiratory=True)
-    cardiac = _aggregate_kind(results, "cardiac_candidate", is_respiratory=False)
+    respiratory = _aggregate_kind(
+        results,
+        "respiratory_candidate",
+        is_respiratory=True,
+        consensus_min_slice_fraction=consensus_min_slice_fraction,
+    )
+    cardiac = _aggregate_kind(
+        results,
+        "cardiac_candidate",
+        is_respiratory=False,
+        consensus_min_slice_fraction=consensus_min_slice_fraction,
+    )
     return {
         "schema_version": 1,
         "method": {
             "pca": "mean-centred time-by-pixels NumPy SVD; temporal PCs = U*S",
             "psd": "one-sided SciPy periodogram; only uniform AcquisitionTime sampling accepted",
             "dominance_threshold": 2.2,
+            "consensus_min_slice_fraction": consensus_min_slice_fraction,
+            "consensus_requires_at_least_two_slices": True,
         },
         "slice_count": len(results),
         "respiratory": respiratory,
@@ -35,12 +63,14 @@ def aggregate_frequency_bands(slice_results: Iterable[dict[str, Any]]) -> dict[s
 
 
 def _aggregate_kind(
-    results: list[dict[str, Any]], candidate_key: str, *, is_respiratory: bool) -> dict[str, Any]:
+    results: list[dict[str, Any]], candidate_key: str, *, is_respiratory: bool,
+    consensus_min_slice_fraction: float,
+) -> dict[str, Any]:
     """Collect candidates, summary distribution, and merged resolution bins for one signal kind."""
     per_slice = []
     reliable_frequencies: list[float] = []
-    bins: list[tuple[float, float]] = []
-    for result in results:
+    bins: list[tuple[float, float, int]] = []
+    for slice_index, result in enumerate(results):
         candidate = dict(result[candidate_key])
         candidate["slice_key"] = result.get("slice_key", result.get("slice_id", "unknown"))
         candidate["median_dt_s"] = float(result["median_dt_s"])
@@ -55,26 +85,45 @@ def _aggregate_kind(
             frequency_float = float(frequency)
             reliable_frequencies.append(frequency_float)
             half_bin = float(result["df_hz"]) / 2.0
-            bins.append((frequency_float - half_bin, frequency_float + half_bin))
+            bins.append((frequency_float - half_bin, frequency_float + half_bin, slice_index))
     distribution = None if not reliable_frequencies else {
         "count": len(reliable_frequencies),
         "min_hz": min(reliable_frequencies),
         "max_hz": max(reliable_frequencies),
         "median_hz": _median(reliable_frequencies),
     }
-    union_bins = _merge_bins(bins)
+    support = _resolution_bin_support(bins, eligible_slice_count=len(results))
+    union_bins = [[item["lower_hz"], item["upper_hz"]] for item in support]
+    consensus_bins = [
+        [item["lower_hz"], item["upper_hz"]]
+        for item in support
+        if item["support_count"] >= 2
+        and item["support_fraction"] >= consensus_min_slice_fraction
+    ]
+    consensus = {
+        "eligible_slice_count": len(results),
+        "min_slice_fraction": consensus_min_slice_fraction,
+        "minimum_support_count": 2,
+    }
     if is_respiratory:
         return {
-            "verified_band_hz": union_bins or None,
-            "reason": "reliable_candidates_present" if reliable_frequencies else "no_reliable_respiratory_candidate",
+            "verified_band_hz": consensus_bins or None,
+            "reason": (
+                "cross_slice_consensus" if consensus_bins
+                else "no_cross_slice_consensus" if reliable_frequencies
+                else "no_reliable_respiratory_candidate"
+            ),
             "per_slice_candidates": per_slice,
             "reliable_frequency_distribution_hz": distribution,
             "union_resolution_bins_hz": union_bins,
+            "resolution_bin_support": support,
+            "consensus": consensus,
             "limitations": {
                 "observation_duration_caveat": (
                     "Candidate reliability is based on positive peak power and dominance; "
-                    "duration and df limit frequency precision. Interpret verified_band_hz as "
-                    "merged periodogram-resolution bins, not exact frequencies."
+                    "duration and df limit frequency precision. verified_band_hz requires "
+                    "at least two slices and the documented all-slice support fraction; it is "
+                    "a merged periodogram-resolution bin, not an exact frequency."
                 ),
                 "duration_span_s_range": _range_or_none(
                     [float(result["duration_span_s"]) for result in results]
@@ -86,20 +135,37 @@ def _aggregate_kind(
         "per_slice_candidates": per_slice,
         "reliable_frequency_distribution_hz": distribution,
         "union_resolution_bins_hz": union_bins,
+        "resolution_bin_support": support,
+        "consensus": consensus,
     }
 
 
-def _merge_bins(bins: list[tuple[float, float]]) -> list[list[float]]:
-    """Merge overlapping spectral-resolution bins in ascending frequency order."""
+def _resolution_bin_support(
+    bins: list[tuple[float, float, int]], *, eligible_slice_count: int
+) -> list[dict[str, float | int]]:
+    """Merge overlapping bins and retain distinct-slice support counts."""
     if not bins:
         return []
-    merged: list[list[float]] = []
-    for lower, upper in sorted(bins):
-        if not merged or lower > merged[-1][1]:
-            merged.append([lower, upper])
+    merged: list[dict[str, Any]] = []
+    for lower, upper, slice_index in sorted(bins):
+        if not merged or lower > merged[-1]["upper_hz"]:
+            merged.append({"lower_hz": lower, "upper_hz": upper, "slice_indices": {slice_index}})
         else:
-            merged[-1][1] = max(merged[-1][1], upper)
-    return merged
+            merged[-1]["upper_hz"] = max(merged[-1]["upper_hz"], upper)
+            merged[-1]["slice_indices"].add(slice_index)
+    return [
+        {
+            "lower_hz": float(item["lower_hz"]),
+            "upper_hz": float(item["upper_hz"]),
+            "support_count": len(item["slice_indices"]),
+            "support_fraction": len(item["slice_indices"]) / eligible_slice_count,
+            "interval_hz": [float(item["lower_hz"]), float(item["upper_hz"])],
+            "count": len(item["slice_indices"]),
+            "total": eligible_slice_count,
+            "fraction": len(item["slice_indices"]) / eligible_slice_count,
+        }
+        for item in merged
+    ]
 
 
 def _median(values: list[float]) -> float:

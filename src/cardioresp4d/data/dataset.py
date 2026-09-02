@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 import pydicom
+from cardioresp4d.data.build_manifest import runtime_sidecar_path
 
 try:
     from pydicom.pixels import apply_modality_lut
@@ -28,27 +29,67 @@ except ImportError:  # pydicom < 3.0 compatibility in the supported runtime.
 class CardioRespDataset:
     """A lightweight manifest-backed DICOM dataset with no framework dependency."""
 
-    def __init__(self, manifest_path: str | Path) -> None:
+    def __init__(self, manifest_path: str | Path, *, valid_only: bool = True,
+                 qc_table_path: str | Path | None = None) -> None:
         self.manifest_path = Path(manifest_path)
         with self.manifest_path.open(newline="", encoding="utf-8") as handle:
             self._rows = list(csv.DictReader(handle))
         if not self._rows:
             raise ValueError(f"Manifest contains no frames: {self.manifest_path}")
+        self._token_to_path: dict[str, str] = {}
+        if "source_file_token" in self._rows[0]:
+            sidecar = runtime_sidecar_path(self.manifest_path)
+            if not sidecar.is_file():
+                raise FileNotFoundError(f"Sensitive runtime path sidecar is missing: {sidecar}")
+            with sidecar.open(encoding="utf-8") as handle:
+                self._token_to_path = json.load(handle)["token_to_absolute_path"]
+        qc_path = Path(qc_table_path) if qc_table_path else self.manifest_path.parent / "acquisition_qc" / "acquisition_qc.csv"
+        qc_by_token: dict[str, dict[str, str]] = {}
+        qc_by_key: dict[tuple[str, str, str], dict[str, str]] = {}
+        if qc_path.is_file() and "source_file_token" in self._rows[0]:
+            with qc_path.open(newline="", encoding="utf-8") as handle:
+                qc_rows = list(csv.DictReader(handle))
+                qc_by_token = {row["source_file_token"]: row for row in qc_rows if row.get("source_file_token")}
+                qc_by_key = {(row["view"], row["slice_id"], row["frame_index"]): row for row in qc_rows}
+        elif qc_path.is_file():
+            with qc_path.open(newline="", encoding="utf-8") as handle:
+                qc_rows = list(csv.DictReader(handle))
+                qc_by_key = {(row["view"], row["slice_id"], row["frame_index"]): row for row in qc_rows}
+        for row in self._rows:
+            qc = qc_by_token.get(row.get("source_file_token", ""), qc_by_key.get((row["view"], row["slice_id"], row["frame_index"]), {}))
+            row.update({"qc_valid": qc.get("qc_valid", "1"), "qc_reason": qc.get("qc_reason", "not_evaluated"),
+                        "qc_ncc": qc.get("qc_ncc", ""), "qc_intensity_scale": qc.get("qc_intensity_scale", ""),
+                        "qc_residual": qc.get("qc_residual", "")})
+        if valid_only:
+            self._rows = [row for row in self._rows if row["qc_valid"] not in ("0", "false", "False")]
+            if not self._rows:
+                raise ValueError("Acquisition QC leaves no valid observations")
 
     def __len__(self) -> int:
         return len(self._rows)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self._rows[index]
-        dataset = pydicom.dcmread(row["dicom_path"])
+        path = self._token_to_path.get(row.get("source_file_token", ""), row.get("dicom_path", ""))
+        if not path:
+            raise ValueError("Manifest row cannot be resolved to a runtime DICOM path")
+        dataset = pydicom.dcmread(path)
         rescale_status = _rescale_status(dataset)
-        image = _normalise_image(_rescaled_pixels(dataset))
+        rescaled = _rescaled_pixels(dataset)
+        image = _normalise_image(rescaled)
         return {
             "image": image,
             "timestamp_s": float(row["timestamp_s"]),
             "view": row["view"],
             "slice_id": row["slice_id"],
             "rescale_status": rescale_status,
+            "rescaled_image": rescaled,
+            "source_file_token": row.get("source_file_token"),
+            "qc_valid": row["qc_valid"] not in ("0", "false", "False"),
+            "qc_reason": row["qc_reason"],
+            "qc_ncc": _optional_metric(row["qc_ncc"]),
+            "qc_intensity_scale": _optional_metric(row["qc_intensity_scale"]),
+            "qc_residual": _optional_metric(row["qc_residual"]),
             "geometry": {
                 "image_position_patient": json.loads(row["image_position_patient"]),
                 "image_orientation_patient": json.loads(row["image_orientation_patient"]),
@@ -84,6 +125,10 @@ def _normalise_image(image: np.ndarray) -> np.ndarray:
     if upper <= lower:
         return np.zeros(image.shape, dtype=np.float32)
     return np.clip((image - lower) / (upper - lower), 0.0, 1.0).astype(np.float32)
+
+
+def _optional_metric(value: str) -> float | None:
+    return None if value in (None, "") else float(value)
 
 
 def main() -> None:

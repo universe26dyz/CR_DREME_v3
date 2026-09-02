@@ -133,6 +133,8 @@ class DicomPlane:
         project a shared 3D cardiac box through every DICOM plane.
         """
         points = np.asarray(world, dtype=np.float64)
+        if points.shape == (3,) and not np.isfinite(points).all():
+            raise ValueError("world must have final dimension 3 and contain only finite values")
         basis = np.column_stack((self.column_step, self.row_step))
         gram_inverse = np.linalg.inv(basis.T @ basis)
         if points.shape == (3,):

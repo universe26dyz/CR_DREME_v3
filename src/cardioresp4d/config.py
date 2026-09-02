@@ -1,6 +1,6 @@
 """功能：加载按 Phase-1 模块分组的 CardioResp 4D MRI 配置。
 论文来源：图像域本地 DICOM pipeline 的 necessary adaptation。
-输入：含 project/data/geometry/frequency/roi/reference 的 YAML。
+输入：含 project/data/geometry/frequency/roi/reference/outlier_qc 的 YAML。
 输出：不可变 AppConfig 及各模块配置对象。
 主要步骤：解析相对路径、校验 v1 科学常量与数值范围、保护只读 DICOM 树。
 是否属于原论文直接实现 / 必要适配 / 可选实验：necessary adaptation。
@@ -23,6 +23,7 @@ RESPIRATORY_BAND_HZ = (0.10, 0.60)
 CARDIAC_BAND_HZ = (0.80, 2.00)
 DOMINANCE_THRESHOLD = 2.2
 UNIFORM_ATOL_S = 1.1e-3
+EXPECTED_SERIES_PER_VIEW = {"SAX": 50, "2CH": 52, "4CH": 42}
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class DataConfig:
     expected_frames_per_slice: int = EXPECTED_FRAMES_PER_SLICE
     manifest_stem: str = "dicom_manifest"
     inspection_filename: str = "inspection.json"
+    expected_series_per_view: Mapping[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,16 @@ class FrequencyConfig:
     uniform_absolute_tolerance_s: float = UNIFORM_ATOL_S
     pca_components: int = EXPECTED_FRAMES_PER_SLICE
     output_subdir: str = "frequency"
+    consensus_min_slice_fraction: float = 0.5
+
+
+@dataclass(frozen=True)
+class AcquisitionQcConfig:
+    ncc_mad_threshold: float = 6.0
+    scale_mad_threshold: float = 6.0
+    residual_mad_threshold: float = 6.0
+    mad_floor: float = 1e-6
+    output_subdir: str = "acquisition_qc"
 
 
 @dataclass(frozen=True)
@@ -90,6 +102,7 @@ class AppConfig:
     frequency: FrequencyConfig
     roi: RoiConfig
     reference: ReferenceConfig
+    outlier_qc: AcquisitionQcConfig
 
     def __init__(self, dicom_root: str | Path | None = None,
                  views: Sequence[str] = REQUIRED_VIEWS,
@@ -98,19 +111,22 @@ class AppConfig:
                  expected_frames_per_slice: int = EXPECTED_FRAMES_PER_SLICE, *,
                  project: ProjectConfig | None = None, data: DataConfig | None = None,
                  geometry: GeometryConfig | None = None, frequency: FrequencyConfig | None = None,
-                 roi: RoiConfig | None = None, reference: ReferenceConfig | None = None) -> None:
+                 roi: RoiConfig | None = None, reference: ReferenceConfig | None = None,
+                 outlier_qc: AcquisitionQcConfig | None = None) -> None:
         if project is None or data is None:
             if dicom_root is None or results_dir is None:
                 raise ValueError("AppConfig requires project/data sections or dicom_root/results_dir")
             project = ProjectConfig(Path(results_dir))
             data = DataConfig(Path(dicom_root), tuple(str(v).upper() for v in views),
-                              expected_frames_per_slice, manifest_stem)
+                              expected_frames_per_slice, manifest_stem, "inspection.json",
+                              {str(v).upper(): 1 for v in views})
         object.__setattr__(self, "project", project)
         object.__setattr__(self, "data", data)
         object.__setattr__(self, "geometry", geometry or GeometryConfig())
         object.__setattr__(self, "frequency", frequency or FrequencyConfig())
         object.__setattr__(self, "roi", roi or RoiConfig())
         object.__setattr__(self, "reference", reference or ReferenceConfig())
+        object.__setattr__(self, "outlier_qc", outlier_qc or AcquisitionQcConfig())
 
     @property
     def dicom_root(self) -> Path: return self.data.dicom_root
@@ -139,20 +155,29 @@ def load_config(path: str | Path) -> AppConfig:
 
 def config_from_mapping(raw: Mapping[str, Any], base_dir: Path) -> AppConfig:
     """Build nested configuration; deliberately reject old flat YAML."""
-    sections = ("project", "data", "geometry", "frequency", "roi", "reference")
+    sections = ("project", "data", "geometry", "frequency", "roi", "reference", "outlier_qc")
     if any(k in raw for k in ("dicom_root", "views", "results_dir", "manifest_stem")):
-        raise ValueError("Configuration must use the module-scoped project/data/geometry/frequency/roi/reference contract")
+        raise ValueError("Configuration must use the module-scoped project/data/geometry/frequency/roi/reference/outlier_qc contract")
     missing = [k for k in sections if not isinstance(raw.get(k), Mapping)]
     if missing:
         raise ValueError(f"Missing required module-scoped configuration section(s): {', '.join(missing)}")
-    p, d, g, f, r, ref = (raw[k] for k in sections)
+    p, d, g, f, r, ref, qc = (raw[k] for k in sections)
+    _reject_unknown(raw, set(sections), "root")
+    _reject_unknown(p, {"results_dir", "name"}, "project")
+    _reject_unknown(d, {"dicom_root", "views", "expected_frames_per_slice", "manifest_stem", "inspection_filename", "expected_series_per_view"}, "data")
+    _reject_unknown(g, {"required_views", "max_qc_planes_per_view", "pixel_round_trip_tolerance", "world_round_trip_tolerance_mm", "output_subdir"}, "geometry")
+    _reject_unknown(f, {"respiratory_band_hz", "cardiac_band_hz", "dominance_threshold", "uniform_relative_tolerance", "uniform_absolute_tolerance_s", "pca_components", "output_subdir", "consensus_min_slice_fraction"}, "frequency")
+    _reject_unknown(r, {"cardiac_box_center_mm", "cardiac_box_size_mm", "required_views", "output_subdir"}, "roi")
+    _reject_unknown(ref, {"source_view", "orientation_tolerance", "spacing_tolerance_mm", "duplicate_tolerance_mm", "origin_affine_tolerance_mm", "output_subdir"}, "reference")
+    _reject_unknown(qc, {"ncc_mad_threshold", "scale_mad_threshold", "residual_mad_threshold", "mad_floor", "output_subdir"}, "outlier_qc")
     if not p.get("results_dir") or not d.get("dicom_root"):
         raise ValueError("project.results_dir and data.dicom_root are required")
     config = AppConfig(
         project=ProjectConfig(_resolve_path(p["results_dir"], base_dir), str(p.get("name", "cardioresp4d"))),
         data=DataConfig(_resolve_path(d["dicom_root"], base_dir), _strings(d.get("views", REQUIRED_VIEWS), "data.views"),
                         int(d.get("expected_frames_per_slice", 50)), str(d.get("manifest_stem", "dicom_manifest")),
-                        str(d.get("inspection_filename", "inspection.json"))),
+                        str(d.get("inspection_filename", "inspection.json")),
+                        _series_mapping(d.get("expected_series_per_view", EXPECTED_SERIES_PER_VIEW))),
         geometry=GeometryConfig(_strings(g.get("required_views", REQUIRED_VIEWS), "geometry.required_views"),
                                 int(g.get("max_qc_planes_per_view", 3)), float(g.get("pixel_round_trip_tolerance", 1e-6)),
                                 float(g.get("world_round_trip_tolerance_mm", 1e-6)), str(g.get("output_subdir", "geometry_qc"))),
@@ -160,17 +185,22 @@ def config_from_mapping(raw: Mapping[str, Any], base_dir: Path) -> AppConfig:
                                   _pair(f.get("cardiac_band_hz", CARDIAC_BAND_HZ), "frequency.cardiac_band_hz"),
                                   float(f.get("dominance_threshold", 2.2)), float(f.get("uniform_relative_tolerance", 1e-3)),
                                   float(f.get("uniform_absolute_tolerance_s", UNIFORM_ATOL_S)), int(f.get("pca_components", 50)),
-                                  str(f.get("output_subdir", "frequency"))),
+                                  str(f.get("output_subdir", "frequency")), float(f.get("consensus_min_slice_fraction", 0.5))),
         roi=RoiConfig(_triple(r.get("cardiac_box_center_mm"), "roi.cardiac_box_center_mm"),
                       _triple(r.get("cardiac_box_size_mm"), "roi.cardiac_box_size_mm"),
                       _strings(r.get("required_views", REQUIRED_VIEWS), "roi.required_views"), str(r.get("output_subdir", "roi_qc"))),
         reference=ReferenceConfig(str(ref.get("source_view", "SAX")).upper(), float(ref.get("orientation_tolerance", 1e-5)),
                                   float(ref.get("spacing_tolerance_mm", 1e-6)), float(ref.get("duplicate_tolerance_mm", 1e-3)),
                                   float(ref.get("origin_affine_tolerance_mm", 0.5)), str(ref.get("output_subdir", "reference"))),
+        outlier_qc=AcquisitionQcConfig(float(qc.get("ncc_mad_threshold", 6.0)), float(qc.get("scale_mad_threshold", 6.0)),
+                                       float(qc.get("residual_mad_threshold", 6.0)), float(qc.get("mad_floor", 1e-6)),
+                                       str(qc.get("output_subdir", "acquisition_qc"))),
     )
     validate_config(config)
     if config.views != REQUIRED_VIEWS or config.geometry.required_views != REQUIRED_VIEWS or config.roi.required_views != REQUIRED_VIEWS:
         raise ValueError("Phase 1 v1 nested configuration requires views exactly SAX, 2CH, 4CH in that order")
+    if dict(config.data.expected_series_per_view or {}) != EXPECTED_SERIES_PER_VIEW:
+        raise ValueError("Phase 1 v1 nested config requires expected series SAX:50, 2CH:52, 4CH:42")
     return config
 
 
@@ -189,18 +219,25 @@ def validate_config(config: AppConfig) -> None:
         (config.geometry.pixel_round_trip_tolerance, "geometry.pixel_round_trip_tolerance"),
         (config.geometry.world_round_trip_tolerance_mm, "geometry.world_round_trip_tolerance_mm"),
         (config.frequency.uniform_relative_tolerance, "frequency.uniform_relative_tolerance"),
+        (config.frequency.consensus_min_slice_fraction, "frequency.consensus_min_slice_fraction"),
         (config.reference.orientation_tolerance, "reference.orientation_tolerance"),
         (config.reference.spacing_tolerance_mm, "reference.spacing_tolerance_mm"),
         (config.reference.duplicate_tolerance_mm, "reference.duplicate_tolerance_mm"),
         (config.reference.origin_affine_tolerance_mm, "reference.origin_affine_tolerance_mm"),
+        (config.outlier_qc.ncc_mad_threshold, "outlier_qc.ncc_mad_threshold"),
+        (config.outlier_qc.scale_mad_threshold, "outlier_qc.scale_mad_threshold"),
+        (config.outlier_qc.residual_mad_threshold, "outlier_qc.residual_mad_threshold"),
+        (config.outlier_qc.mad_floor, "outlier_qc.mad_floor"),
     )
     for value, name in positive_values:
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError(f"{name} must be finite and positive")
+    if config.frequency.consensus_min_slice_fraction > 1.0:
+        raise ValueError("frequency.consensus_min_slice_fraction must be in (0, 1]")
     if not config.manifest_stem or Path(config.manifest_stem).name != config.manifest_stem:
         raise ValueError("data.manifest_stem must be a filename stem")
     components = (config.data.inspection_filename, config.geometry.output_subdir, config.frequency.output_subdir,
-                  config.roi.output_subdir, config.reference.output_subdir)
+                  config.roi.output_subdir, config.reference.output_subdir, config.outlier_qc.output_subdir)
     if any(not x or Path(x).name != x for x in components):
         raise ValueError("output filenames/subdirectories must be single path components")
     if (config.roi.cardiac_box_center_mm is None) != (config.roi.cardiac_box_size_mm is None):
@@ -245,6 +282,21 @@ def _triple(value: Any, name: str) -> tuple[float, float, float] | None:
     result = tuple(float(x) for x in value) if isinstance(value, Sequence) and not isinstance(value, str) else ()
     if len(result) != 3: raise ValueError(f"{name} must contain three numbers")
     return result  # type: ignore[return-value]
+
+
+def _series_mapping(value: Any) -> Mapping[str, int]:
+    if not isinstance(value, Mapping):
+        raise ValueError("data.expected_series_per_view must be a mapping")
+    result = {str(key).upper(): int(count) for key, count in value.items()}
+    if any(count <= 0 for count in result.values()):
+        raise ValueError("data.expected_series_per_view counts must be positive")
+    return result
+
+
+def _reject_unknown(mapping: Mapping[str, Any], allowed: set[str], section: str) -> None:
+    unknown = sorted(set(mapping) - allowed)
+    if unknown:
+        raise ValueError(f"{section} contains unknown key(s): {', '.join(unknown)}")
 
 
 def main() -> None:

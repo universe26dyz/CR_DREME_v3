@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""功能：按依赖顺序运行仅 Phase 1 的六个公开 API 阶段。
+"""功能：按依赖顺序运行仅 Phase 1 的七个公开 API 阶段。
 论文来源：方法设计文档的工程编排，属于 necessary adaptation。
 输入：模块化 YAML，以及可选 from-stage/to-stage。
-输出：inspection/manifest/geometry/frequency/ROI/reference 工件摘要。
+输出：inspection/manifest/QC/geometry/frequency/ROI/reference 工件摘要。
 主要步骤：验证阶段范围与依赖，再调用既有模块公开 API；不复制科学逻辑。
 是否属于原论文直接实现 / 必要适配 / 可选实验：necessary adaptation。
 命令行：python scripts/run_pipeline.py --config configs/subject_local.yaml
@@ -19,16 +19,18 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from cardioresp4d.config import AppConfig, load_config  # noqa: E402
-from cardioresp4d.data.build_manifest import build_manifest  # noqa: E402
+from cardioresp4d.config import AppConfig, load_config, validate_config  # noqa: E402
+from cardioresp4d.data.build_manifest import (build_manifest, config_relevant_hash,
+    dicom_root_fingerprint, file_sha256, validate_manifest_artifacts)  # noqa: E402
 from cardioresp4d.data.inspect_dataset import write_inspection  # noqa: E402
 from cardioresp4d.frequency.pca_motion import analyze_manifest  # noqa: E402
 from cardioresp4d.geometry.geometry_qc import run_geometry_qc  # noqa: E402
 from cardioresp4d.reference.build_initial_reference import build_initial_reference  # noqa: E402
 from cardioresp4d.roi.cardiac_box import CardiacBox  # noqa: E402
 from cardioresp4d.roi.roi_qc import run_roi_qc  # noqa: E402
+from cardioresp4d.outlier_qc.acquisition_qc import run_acquisition_qc  # noqa: E402
 
-STAGES = ("inspect", "manifest", "geometry", "frequency", "roi", "reference")
+STAGES = ("inspect", "manifest", "qc", "geometry", "frequency", "roi", "reference")
 
 
 def selected_stages(from_stage: str | None = None, to_stage: str | None = None) -> tuple[str, ...]:
@@ -43,10 +45,11 @@ def selected_stages(from_stage: str | None = None, to_stage: str | None = None) 
 def run_pipeline(config: AppConfig, from_stage: str | None = None,
                  to_stage: str | None = None) -> dict[str, Any]:
     """Execute an inclusive Phase-1 interval and return artifact summaries."""
+    validate_config(config)
     stages = selected_stages(from_stage, to_stage)
     manifest = config.manifest_csv_path
-    if stages[0] not in ("inspect", "manifest") and not manifest.is_file():
-        raise FileNotFoundError(f"Required manifest artifact is missing: {manifest}; run from stage 'manifest' or earlier")
+    if stages[0] not in ("inspect", "manifest"):
+        validate_manifest_artifacts(config)
     results: dict[str, Any] = {}
     if "inspect" in stages:
         path = write_inspection(config.dicom_root, config.views, config.inspection_path)
@@ -55,8 +58,19 @@ def run_pipeline(config: AppConfig, from_stage: str | None = None,
         csv_path, json_path = build_manifest(config)
         manifest = csv_path
         results["manifest"] = {"csv": str(csv_path), "json": str(json_path)}
-    if any(stage in stages for stage in STAGES[2:]) and not manifest.is_file():
-        raise FileNotFoundError(f"Manifest stage did not produce required artifact: {manifest}")
+        validate_manifest_artifacts(config)
+    if "qc" in stages:
+        table, summary, image = run_acquisition_qc(
+            manifest, config.results_dir / config.outlier_qc.output_subdir,
+            ncc_mad_threshold=config.outlier_qc.ncc_mad_threshold,
+            scale_mad_threshold=config.outlier_qc.scale_mad_threshold,
+            residual_mad_threshold=config.outlier_qc.residual_mad_threshold,
+            mad_floor=config.outlier_qc.mad_floor)
+        results["qc"] = {"table": str(table), "summary": str(summary), "image": str(image)}
+    if any(stage in stages for stage in STAGES[3:]):
+        qc_table = config.results_dir / config.outlier_qc.output_subdir / "acquisition_qc.csv"
+        if not qc_table.is_file():
+            raise FileNotFoundError("Acquisition QC table is required before downstream Phase-1 stages")
     if "geometry" in stages:
         report, image = run_geometry_qc(manifest, config.results_dir / config.geometry.output_subdir,
                                          max_per_view=config.geometry.max_qc_planes_per_view)
@@ -64,7 +78,8 @@ def run_pipeline(config: AppConfig, from_stage: str | None = None,
         results["geometry"] = {"report": str(report), "image": str(image)}
     if "frequency" in stages:
         bands = analyze_manifest(manifest, config.results_dir / config.frequency.output_subdir,
-                                 relative_tolerance=config.frequency.uniform_relative_tolerance)
+                                 relative_tolerance=config.frequency.uniform_relative_tolerance,
+                                 consensus_min_slice_fraction=config.frequency.consensus_min_slice_fraction)
         results["frequency"] = {"bands": str(config.results_dir / config.frequency.output_subdir / "frequency_bands.json"),
                                 "slice_count": bands.get("slice_count")}
     if "roi" in stages:
@@ -82,7 +97,33 @@ def run_pipeline(config: AppConfig, from_stage: str | None = None,
             duplicate_tolerance_mm=config.reference.duplicate_tolerance_mm,
             origin_tolerance_mm=config.reference.origin_affine_tolerance_mm)
         results["reference"] = {"nifti": str(nifti), "metadata": str(metadata), "qc": str(qc)}
+    _write_run_summary(config, stages, results)
     return results
+
+
+def _write_run_summary(config: AppConfig, stages: tuple[str, ...], results: dict[str, Any]) -> Path:
+    """Write durable non-sensitive provenance for one successful pipeline interval."""
+    import subprocess
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT, check=True,
+                                capture_output=True, text=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        commit = None
+    payload = {"schema_version": 1, "project_name": config.project.name, "status": "success",
+               "stages": list(stages), "git_commit": commit,
+               "config_relevant_hash": config_relevant_hash(config),
+               "dicom_root_fingerprint": dicom_root_fingerprint(config.dicom_root),
+               "manifest": {"csv_sha256": _optional_file_sha256(config.manifest_csv_path),
+                            "json_sha256": _optional_file_sha256(config.manifest_json_path)},
+               "artifacts": results}
+    path = config.results_dir / "pipeline_run_summary.json"
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _optional_file_sha256(path: Path) -> str | None:
+    """Hash an existing artifact while preserving valid pre-manifest run summaries."""
+    return file_sha256(path) if path.is_file() else None
 
 
 def _validate_geometry_tolerances(report_path: str | Path, config: AppConfig) -> None:

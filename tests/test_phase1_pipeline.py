@@ -15,11 +15,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from cardioresp4d.config import config_from_mapping  # noqa: E402
+from cardioresp4d.config import AppConfig  # noqa: E402
+from tests.test_data import write_dicom  # noqa: E402
 
 
 def nested_mapping(root: Path) -> dict:
@@ -32,6 +35,7 @@ def nested_mapping(root: Path) -> dict:
             "expected_frames_per_slice": 50,
             "manifest_stem": "dicom_manifest",
             "inspection_filename": "inspection.json",
+            "expected_series_per_view": {"SAX": 50, "2CH": 52, "4CH": 42},
         },
         "geometry": {"required_views": ["SAX", "2CH", "4CH"], "max_qc_planes_per_view": 3},
         "frequency": {
@@ -41,6 +45,7 @@ def nested_mapping(root: Path) -> dict:
             "uniform_relative_tolerance": 0.001,
             "uniform_absolute_tolerance_s": 0.0011,
             "pca_components": 50,
+            "consensus_min_slice_fraction": 0.5,
         },
         "roi": {
             "cardiac_box_center_mm": [1.0, 2.0, 3.0],
@@ -54,6 +59,9 @@ def nested_mapping(root: Path) -> dict:
             "duplicate_tolerance_mm": 1e-3,
             "origin_affine_tolerance_mm": 0.5,
         },
+        "outlier_qc": {"ncc_mad_threshold": 6.0, "scale_mad_threshold": 6.0,
+                       "residual_mad_threshold": 6.0, "mad_floor": 1e-6,
+                       "output_subdir": "acquisition_qc"},
     }
 
 
@@ -101,6 +109,23 @@ class ModularConfigTest(unittest.TestCase):
 
 
 class Phase1RunnerTest(unittest.TestCase):
+    def test_real_synthetic_dicom_reaches_qc_with_pathless_provenance(self) -> None:
+        """Exercise inspect/manifest/QC without mocking the data or provenance boundary."""
+        runner = load_runner_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); dicom = root / "Patient_Name"; results = root / "results"
+            for view, hour in (("SAX", 12), ("2CH", 13), ("4CH", 14)):
+                block = dicom / f"{view}_private_series"; block.mkdir(parents=True)
+                for index in range(50):
+                    pixels = (np.arange(64).reshape(8, 8) + index % 3).astype(np.uint16)
+                    write_dicom(block / f"{index + 1:08d}.dcm", f"{hour:02d}00{index:02d}.000", pixels)
+            config = AppConfig(dicom, ("SAX", "2CH", "4CH"), results)
+            summary = runner.run_pipeline(config, to_stage="qc")
+            self.assertEqual(["inspect", "manifest", "qc"], list(summary))
+            canonical = config.manifest_csv_path.read_text() + config.manifest_json_path.read_text()
+            self.assertNotIn("Patient_Name", canonical)
+            self.assertTrue((results / "pipeline_run_summary.json").is_file())
+
     def test_full_run_calls_public_apis_in_dependency_order(self) -> None:
         runner = load_runner_module()
         with tempfile.TemporaryDirectory() as directory:
@@ -120,11 +145,15 @@ class Phase1RunnerTest(unittest.TestCase):
 
             with patch.object(runner, "write_inspection", record("inspect", config.inspection_path)), \
                  patch.object(runner, "build_manifest", record("manifest", (manifest, config.manifest_json_path))), \
+                 patch.object(runner, "validate_manifest_artifacts", lambda *args: (manifest, config.manifest_json_path)), \
+                 patch.object(runner, "run_acquisition_qc", record("qc", (Path("q.csv"), Path("q.json"), Path("q.png")))), \
                  patch.object(runner, "run_geometry_qc", record("geometry", (Path("g.json"), Path("g.png")))), \
                  patch.object(runner, "_validate_geometry_tolerances", lambda *args: None), \
                  patch.object(runner, "analyze_manifest", record("frequency", {"slice_count": 3})), \
                  patch.object(runner, "run_roi_qc", record("roi", (Path("r.json"), {}))), \
-                 patch.object(runner, "build_initial_reference", record("reference", (Path("v.nii.gz"), Path("v.json"), Path("v.png")))):
+                 patch.object(runner, "build_initial_reference", record("reference", (Path("v.nii.gz"), Path("v.json"), Path("v.png")))), \
+                 patch.object(runner, "_write_run_summary", lambda *args: Path("summary.json")), \
+                 patch.object(Path, "is_file", lambda self: True):
                 summary = runner.run_pipeline(config)
 
             self.assertEqual(list(runner.STAGES), calls)
@@ -132,7 +161,7 @@ class Phase1RunnerTest(unittest.TestCase):
 
     def test_stage_range_and_missing_manifest_dependency_are_explicit(self) -> None:
         runner = load_runner_module()
-        self.assertEqual(("manifest", "geometry", "frequency"), runner.selected_stages("manifest", "frequency"))
+        self.assertEqual(("manifest", "qc", "geometry", "frequency"), runner.selected_stages("manifest", "frequency"))
         self.assertEqual(("reference",), runner.selected_stages("reference", "reference"))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -142,6 +171,23 @@ class Phase1RunnerTest(unittest.TestCase):
                 runner.run_pipeline(config, from_stage="geometry", to_stage="geometry")
             with self.assertRaisesRegex(ValueError, "stage order"):
                 runner.run_pipeline(config, from_stage="roi", to_stage="manifest")
+            unsafe = config_from_mapping(nested_mapping(root), root)
+            object.__setattr__(unsafe.project, "results_dir", unsafe.dicom_root / "results")
+            with self.assertRaisesRegex(ValueError, "results_dir"):
+                runner.run_pipeline(unsafe, to_stage="inspect")
+
+    def test_inspect_only_range_writes_summary_without_requiring_manifest(self) -> None:
+        runner = load_runner_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = AppConfig(root / "dicom", ("SAX",), root / "results")
+            config.dicom_root.mkdir()
+            config.results_dir.mkdir()
+            with patch.object(runner, "write_inspection", return_value=config.inspection_path):
+                summary = runner.run_pipeline(config, to_stage="inspect")
+            self.assertEqual(["inspect"], list(summary))
+            payload = (config.results_dir / "pipeline_run_summary.json").read_text()
+            self.assertIn('"csv_sha256": null', payload)
 
 
 if __name__ == "__main__":

@@ -26,8 +26,14 @@ from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, ge
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from cardioresp4d.config import AppConfig, config_from_mapping  # noqa: E402
-from cardioresp4d.data.build_manifest import build_manifest  # noqa: E402
+from cardioresp4d.config import (  # noqa: E402
+    EXPECTED_SERIES_PER_VIEW,
+    AppConfig,
+    DataConfig,
+    ProjectConfig,
+    config_from_mapping,
+)
+from cardioresp4d.data.build_manifest import build_manifest, validate_manifest_artifacts  # noqa: E402
 from cardioresp4d.data.dataset import CardioRespDataset, _rescaled_pixels  # noqa: E402
 from cardioresp4d.data.inspect_dataset import scan_dicom_frames, write_inspection  # noqa: E402
 
@@ -37,11 +43,13 @@ def nested_config_mapping(dicom_root: Path, results_dir: Path, expected_frames: 
     return {
         "project": {"results_dir": str(results_dir)},
         "data": {"dicom_root": str(dicom_root), "views": ["SAX", "2CH", "4CH"],
-                 "expected_frames_per_slice": expected_frames},
+                 "expected_frames_per_slice": expected_frames,
+                 "expected_series_per_view": {"SAX": 50, "2CH": 52, "4CH": 42}},
         "geometry": {"required_views": ["SAX", "2CH", "4CH"]},
         "frequency": {},
         "roi": {"required_views": ["SAX", "2CH", "4CH"]},
         "reference": {"source_view": "SAX"},
+        "outlier_qc": {},
     }
 
 
@@ -70,6 +78,7 @@ def write_dicom(
     dataset.AcquisitionTime = acquisition_time
     dataset.ContentTime = "235959.999"  # Scanner must not use this field.
     dataset.InstanceNumber = int(path.stem)
+    dataset.TemporalPositionIdentifier = int(path.stem)
     dataset.Rows, dataset.Columns = pixels.shape
     dataset.ImagePositionPatient = [1.0, 2.0, 3.0]
     dataset.ImageOrientationPatient = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
@@ -91,7 +100,7 @@ def write_dicom(
 class DataPipelineTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
-        self.root = Path(self.tempdir.name) / "dicom"
+        self.root = Path(self.tempdir.name) / "Patient_Name"
         self.sax = self.root / "SAX_s01_1001"
         self.two_ch = self.root / "2ch_s01_2001"
         self.scout = self.root / "scout_sax_001"
@@ -148,6 +157,15 @@ class DataPipelineTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected 50 frames"):
             scan_dicom_frames(self.root, ["2CH"])
 
+    def test_scan_rejects_missing_fixed_slice_and_geometry_change_within_block(self) -> None:
+        with self.assertRaisesRegex(ValueError, "series count mismatch"):
+            scan_dicom_frames(self.root, ["SAX", "2CH"], expected_series_per_view={"SAX": 1, "2CH": 2})
+        path = self.two_ch / "00000025.dcm"
+        dataset = pydicom.dcmread(path); dataset.ImagePositionPatient = [1.0, 2.0, 3.1]
+        dataset.save_as(path, write_like_original=False)
+        with self.assertRaisesRegex(ValueError, "geometry changes"):
+            scan_dicom_frames(self.root, ["2CH"])
+
     def test_manifest_uses_only_non_phi_columns(self) -> None:
         output_dir = Path(self.tempdir.name) / "results"
         config = AppConfig(
@@ -169,11 +187,38 @@ class DataPipelineTest(unittest.TestCase):
             "patient_birth_date",
             "accession_number",
             "study_instance_uid",
+            "dicom_path",
         }
         self.assertTrue(forbidden.isdisjoint({column.lower() for column in columns}))
         with json_path.open(encoding="utf-8") as handle:
             manifest = json.load(handle)
         self.assertTrue(forbidden.isdisjoint(manifest["frames"][0]))
+        canonical_text = csv_path.read_text() + json_path.read_text()
+        self.assertNotIn("Patient_Name", canonical_text)
+        self.assertNotIn(str(self.root), canonical_text)
+        self.assertNotIn(".dcm", canonical_text.lower())
+
+    def test_manifest_validator_rejects_tamper_wrong_root_and_missing_pair(self) -> None:
+        output = Path(self.tempdir.name) / "results"
+        config = AppConfig(self.root, ("SAX", "2CH"), output)
+        csv_path, json_path = build_manifest(config)
+        validate_manifest_artifacts(config)
+        payload = json.loads(json_path.read_text())
+        payload["frames"][0]["view"] = "4CH"
+        json_path.write_text(json.dumps(payload))
+        with self.assertRaisesRegex(ValueError, "CSV/JSON content mismatch"):
+            validate_manifest_artifacts(config)
+        csv_path, json_path = build_manifest(config)
+        csv_path.write_text(csv_path.read_text() + "tamper\n")
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            validate_manifest_artifacts(config)
+        csv_path, json_path = build_manifest(config)
+        other_root = Path(self.tempdir.name) / "other"; other_root.mkdir()
+        with self.assertRaisesRegex(ValueError, "root fingerprint"):
+            validate_manifest_artifacts(AppConfig(other_root, ("SAX", "2CH"), output))
+        json_path.unlink()
+        with self.assertRaisesRegex(FileNotFoundError, "Both canonical"):
+            validate_manifest_artifacts(config)
 
     def test_config_and_manifest_reject_results_inside_dicom_root(self) -> None:
         with self.assertRaisesRegex(ValueError, "results_dir"):
@@ -206,7 +251,7 @@ class DataPipelineTest(unittest.TestCase):
         sample = CardioRespDataset(csv_path)[0]
 
         self.assertEqual("SAX", sample["view"])
-        self.assertEqual("SAX_s01_1001", sample["slice_id"])
+        self.assertEqual("SAX_s001", sample["slice_id"])
         self.assertEqual("modality_lut", sample["rescale_status"])
         self.assertEqual(43200.0, sample["timestamp_s"])
         self.assertEqual([1.0, 2.0, 3.0], sample["geometry"]["image_position_patient"])
@@ -248,8 +293,17 @@ class DataPipelineTest(unittest.TestCase):
     def test_real_first_frame_loader(self) -> None:
         real_root = Path(os.environ["CARDIORESP4D_REAL_DICOM_ROOT"])
         with tempfile.TemporaryDirectory() as output_directory:
+            config = AppConfig(
+                project=ProjectConfig(Path(output_directory)),
+                data=DataConfig(
+                    dicom_root=real_root,
+                    views=("SAX", "2CH", "4CH"),
+                    manifest_stem="manifest",
+                    expected_series_per_view=EXPECTED_SERIES_PER_VIEW,
+                ),
+            )
             csv_path, _ = build_manifest(
-                AppConfig(real_root, ("SAX", "2CH", "4CH"), Path(output_directory), "manifest")
+                config
             )
             sample = CardioRespDataset(csv_path)[0]
 

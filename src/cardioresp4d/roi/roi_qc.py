@@ -119,8 +119,8 @@ def run_roi_qc(
     """Generate one shared-box audit report and three temporal-mean overlays."""
     validate_expected_frames_per_slice(expected_frames_per_slice)
     manifest = Path(manifest_path)
-    with manifest.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
+    dataset = CardioRespDataset(manifest)
+    rows = dataset._rows
     if not rows:
         raise ValueError(f"Manifest contains no rows: {manifest}")
     plane_records = load_manifest_planes(manifest)
@@ -133,7 +133,6 @@ def run_roi_qc(
         key = (row["view"].upper(), row["slice_id"])
         if key in selected_keys:
             grouped_indices[key].append(index)
-    dataset = CardioRespDataset(manifest)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
@@ -151,10 +150,9 @@ def run_roi_qc(
         key = (view, row["slice_id"])
         indices = sorted(grouped_indices[key], key=lambda index: int(rows[index]["frame_index"]))
         frame_indices = [int(rows[index]["frame_index"]) for index in indices]
-        if len(indices) != expected_frames_per_slice or len(set(frame_indices)) != expected_frames_per_slice:
+        if not indices or len(indices) > expected_frames_per_slice or len(set(frame_indices)) != len(frame_indices):
             raise ValueError(
-                f"{view}/{row['slice_id']} has {len(indices)} rows and {len(set(frame_indices))} unique frames; "
-                f"expected exactly {expected_frames_per_slice}"
+                f"{view}/{row['slice_id']} has no usable unique qc_valid frames"
             )
         temporal_mean = np.mean(np.stack([dataset[index]["image"] for index in indices]), axis=0, dtype=np.float64)
         projection = project_box_to_plane(box, plane)

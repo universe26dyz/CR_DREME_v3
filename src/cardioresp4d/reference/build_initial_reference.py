@@ -52,8 +52,16 @@ def build_initial_reference(
     _validate_positive_tolerance(origin_tolerance_mm, "origin_tolerance_mm")
 
     manifest = Path(manifest_path)
+    dataset = CardioRespDataset(manifest)
+    rows = dataset._rows
     with manifest.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
+        original_rows = list(csv.DictReader(handle))
+    original_sax_ids = {row["slice_id"] for row in original_rows if row.get("view", "").upper() == "SAX"}
+    valid_sax_ids = {row["slice_id"] for row in rows if row.get("view", "").upper() == "SAX"}
+    missing_valid_slices = sorted(original_sax_ids - valid_sax_ids)
+    if missing_valid_slices:
+        raise ValueError(f"Acquisition QC leaves no valid frames for SAX slice(s): {', '.join(missing_valid_slices)}")
+    qc_applied = any(row.get("qc_reason", "not_evaluated") != "not_evaluated" for row in rows)
     sax_rows = [(index, row) for index, row in enumerate(rows) if row.get("view", "").upper() == "SAX"]
     if not sax_rows:
         raise ValueError(f"Manifest contains no SAX frames: {manifest}")
@@ -66,10 +74,11 @@ def build_initial_reference(
     for slice_id, indexed_rows in grouped.items():
         ordered = sorted(indexed_rows, key=lambda item: int(item[1]["frame_index"]))
         frame_indices = [int(row["frame_index"]) for _, row in ordered]
-        if len(ordered) != expected_frames_per_slice or frame_indices != list(range(expected_frames_per_slice)):
+        complete = len(ordered) == expected_frames_per_slice and frame_indices == list(range(expected_frames_per_slice))
+        valid_subset = qc_applied and 0 < len(ordered) <= expected_frames_per_slice and len(set(frame_indices)) == len(frame_indices) and all(0 <= index < expected_frames_per_slice for index in frame_indices)
+        if not complete and not valid_subset:
             raise ValueError(
-                f"SAX/{slice_id} must contain exactly {expected_frames_per_slice} unique frame indices 0.."
-                f"{expected_frames_per_slice - 1}; got {len(ordered)} rows and indices {frame_indices[:3]}...{frame_indices[-3:]}"
+                f"SAX/{slice_id} must contain exactly 50 frames unless an explicit QC table supplies a non-empty valid subset; got {len(ordered)}"
             )
         planes = [DicomPlane.from_geometry(row) for _, row in ordered]
         _validate_within_slice_geometry(slice_id, planes, orientation_tolerance, spacing_tolerance_mm)
@@ -77,6 +86,7 @@ def build_initial_reference(
             "slice_id": slice_id,
             "indices": [index for index, _ in ordered],
             "frame_indices": frame_indices,
+            "valid_frame_count": len(ordered),
             "plane": planes[0],
         })
 
@@ -121,7 +131,6 @@ def build_initial_reference(
     dicom_lps_affine[:3, 3] = first_origin
     nifti_ras_affine = LPS_TO_RAS @ dicom_lps_affine
 
-    dataset = CardioRespDataset(manifest)
     temporal_means: list[np.ndarray] = []
     rescale_status_counts: dict[str, int] = defaultdict(int)
     for record in slice_records:
@@ -172,8 +181,8 @@ def build_initial_reference(
         "sorted_slice_ids": [record["slice_id"] for record in slice_records],
         "sorted_slice_positions_along_normal_mm": positions.tolist(),
         "sorted_slice_origins_lps_mm": actual_origins.tolist(),
-        "frames_per_slice": [expected_frames_per_slice] * len(slice_records),
-        "temporal_averaging_frames": expected_frames_per_slice,
+        "frames_per_slice": [record["valid_frame_count"] for record in slice_records],
+        "temporal_averaging_frames": "arithmetic mean over qc_valid frames only",
         "normalization": {
             "input": "existing CardioRespDataset per-frame normalization",
             "modality_transform": "pydicom modality LUT when both rescale tags exist; otherwise stored pixels",

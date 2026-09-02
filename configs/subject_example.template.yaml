@@ -6,6 +6,7 @@ data:
   expected_frames_per_slice: 50
   manifest_stem: dicom_manifest
   inspection_filename: inspection.json
+  expected_series_per_view: {SAX: 50, 2CH: 52, 4CH: 42}
 geometry:
   required_views: [SAX, 2CH, 4CH]
   max_qc_planes_per_view: 3
@@ -20,6 +21,7 @@ frequency:
   uniform_absolute_tolerance_s: 0.0011
   pca_components: 50
   output_subdir: frequency
+  consensus_min_slice_fraction: 0.5
 roi:
   # Empirical patient-world DREME-style support; not segmentation.
   cardiac_box_center_mm: null
@@ -33,3 +35,9 @@ reference:
   duplicate_tolerance_mm: 1.0e-3
   origin_affine_tolerance_mm: 0.5
   output_subdir: reference
+outlier_qc:
+  ncc_mad_threshold: 6.0
+  scale_mad_threshold: 6.0
+  residual_mad_threshold: 6.0
+  mad_floor: 1.0e-6
+  output_subdir: acquisition_qc
