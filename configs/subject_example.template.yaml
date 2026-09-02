@@ -7,3 +7,8 @@ views:
 results_dir: ../results
 manifest_stem: dicom_manifest
 expected_frames_per_slice: 50
+roi:
+  # Required subject-local patient-world values; determine by three-view QC.
+  # This empirical DREME-style local support is not an anatomical segmentation.
+  cardiac_box_center_mm: null
+  cardiac_box_size_mm: null
