@@ -147,11 +147,25 @@ def _resolution_bin_support(
     if not bins:
         return []
     merged: list[dict[str, Any]] = []
-    for lower, upper, slice_index in sorted(bins):
-        if not merged or lower > merged[-1]["upper_hz"]:
-            merged.append({"lower_hz": lower, "upper_hz": upper, "slice_indices": {slice_index}})
+    for lower, upper, slice_index in sorted(bins, key=lambda item: (item[0] + item[1]) / 2.0):
+        center, resolution = (lower + upper) / 2.0, upper - lower
+        if (
+            not merged
+            or abs(center - merged[-1]["center_hz"])
+            > 0.25 * max(resolution, merged[-1]["resolution_hz"])
+        ):
+            merged.append({
+                "lower_hz": lower,
+                "upper_hz": upper,
+                "center_hz": center,
+                "resolution_hz": resolution,
+                "slice_indices": {slice_index},
+            })
         else:
             merged[-1]["upper_hz"] = max(merged[-1]["upper_hz"], upper)
+            merged[-1]["lower_hz"] = min(merged[-1]["lower_hz"], lower)
+            merged[-1]["center_hz"] = (merged[-1]["lower_hz"] + merged[-1]["upper_hz"]) / 2.0
+            merged[-1]["resolution_hz"] = max(merged[-1]["resolution_hz"], resolution)
             merged[-1]["slice_indices"].add(slice_index)
     return [
         {

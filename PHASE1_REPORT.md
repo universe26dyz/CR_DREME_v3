@@ -101,11 +101,13 @@ DREME-style frequency bands.
 
 Final-review clarification: `verified_band_hz` now requires at least two slices
 and support from at least 50% of **all eligible analyzed slices**. Re-aggregation
-of the already saved 144 per-slice results (no PCA rerun) gave one respiratory
-resolution component `[0.05848,0.64327]` Hz with count/total/fraction
-`144/144/1.0`. Cardiac support remained distributed across sequential-time bins
-(18/144, 58/144, and 68/144); per-slice cardiac candidates remain the primary
-evidence and no global point heart rate is manufactured.
+of the already saved 144 per-slice results (no PCA rerun) treats adjacent FFT
+bins as distinct rather than chaining edge-touching intervals. The only
+respiratory consensus interval is `[0.29240,0.40936]` Hz with support
+`78/144/0.54167`; remaining respiratory-bin support is `15`, `47`, `3`, and
+`1` slices. Cardiac support remains distributed (maximum `53/144/0.36806` for
+`[1.57895,1.69591]` Hz), so no global cardiac band or point heart rate is
+manufactured; per-slice cardiac candidates remain the primary evidence.
 
 ### Shared cardiac coordinate box
 

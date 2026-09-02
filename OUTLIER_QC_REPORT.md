@@ -48,8 +48,11 @@ guard. Therefore this limited sample provides no confirmed RF-corruption claim.
 ## Frequency and Git status
 
 The 144 saved per-slice PCA candidates were re-aggregated without rerunning PCA.
-Respiratory verified support was 144/144 (1.0) for the connected coarse-resolution
-component. The 10-second rule remains a caveat, not a hard null gate.
+Adjacent FFT bins are kept distinct, so the respiratory verified interval is
+`[0.29240,0.40936]` Hz with support `78/144 (0.54167)`, rather than a chained
+wide union. The maximum cardiac-bin support is `53/144 (0.36806)`, below the
+0.5 consensus threshold; only its per-slice candidates are retained. The
+10-second rule remains a caveat, not a hard null gate.
 
 The independent commit is intended as
 `feat(qc): add acquisition outlier filtering for corrupted MRI frames`.
@@ -58,7 +61,7 @@ no existing history/tag is rewritten.
 
 ## User decision needed
 
-Choose whether to run acquisition QC over all 144 blocks before Phase 2. The
-current conservative defaults are recommended initially; any threshold tuning
-should be reviewed against QC plots to avoid deleting genuine cardiac or
-respiratory motion.
+No blocking decision is required. Before any later Phase-2 dataset is created,
+the pipeline will run the same conservative QC stage over its selected
+observations; threshold tuning should be reviewed against its QC plots rather
+than applied blindly.

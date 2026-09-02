@@ -161,6 +161,21 @@ class PcaFrequencyTest(unittest.TestCase):
         self.assertEqual(3, respiratory["consensus"]["eligible_slice_count"])
         self.assertTrue(any(item["support_count"] == 2 for item in respiratory["resolution_bin_support"]))
 
+    def test_adjacent_fft_bins_are_not_false_cross_slice_recurrence(self) -> None:
+        """Resolution intervals that only touch at one FFT edge remain distinct bins."""
+        timestamps_s = np.arange(50, dtype=float) * 0.171
+        lower_bin = analyze_image_series(synthetic_series(timestamps_s, respiratory_hz=0.24), timestamps_s)
+        adjacent_bin = analyze_image_series(synthetic_series(timestamps_s, respiratory_hz=0.35), timestamps_s)
+
+        respiratory = aggregate_frequency_bands(
+            [lower_bin, adjacent_bin], consensus_min_slice_fraction=0.5
+        )["respiratory"]
+
+        self.assertIsNone(respiratory["verified_band_hz"])
+        self.assertEqual("no_cross_slice_consensus", respiratory["reason"])
+        self.assertEqual(2, len(respiratory["resolution_bin_support"]))
+        self.assertEqual([1, 1], sorted(item["support_count"] for item in respiratory["resolution_bin_support"]))
+
 
 if __name__ == "__main__":
     unittest.main()
