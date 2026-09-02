@@ -36,7 +36,6 @@ UNIFORM_ATOL_S = 1.1e-3
 RESPIRATORY_BAND_HZ = (0.10, 0.60)
 CARDIAC_BAND_HZ = (0.80, 2.00)
 DOMINANCE_THRESHOLD = 2.2
-RELIABLE_RESPIRATORY_DURATION_S = 10.0
 MAXIMUM_DF_HZ = 0.20
 
 
@@ -121,10 +120,10 @@ def analyze_image_series(
     duration_n_dt_s = float(n_frames * median_dt)
     df_hz = sampling_frequency_hz / n_frames
     respiratory_candidate = _select_band_candidate(
-        frequencies_hz, pc_psd, RESPIRATORY_BAND_HZ, duration_n_dt_s, df_hz, "respiratory"
+        frequencies_hz, pc_psd, RESPIRATORY_BAND_HZ, df_hz
     )
     cardiac_candidate = _select_band_candidate(
-        frequencies_hz, pc_psd, CARDIAC_BAND_HZ, duration_n_dt_s, df_hz, "cardiac"
+        frequencies_hz, pc_psd, CARDIAC_BAND_HZ, df_hz
     )
     return {
         "timestamps_s": times,
@@ -149,11 +148,14 @@ def _select_band_candidate(
     frequencies_hz: np.ndarray,
     pc_psd: np.ndarray,
     band_hz: tuple[float, float],
-    duration_n_dt_s: float,
     df_hz: float,
-    kind: str,
 ) -> dict[str, Any]:
-    """Choose the strongest PC peak in one physiological search band with QC."""
+    """Choose the strongest PC peak in one physiological search band with QC.
+
+    Reliability is determined by positive peak power and the explicit dominance
+    threshold.  Observation duration is reported separately as a frequency
+    resolution limitation, not as a hard candidate-rejection threshold.
+    """
     empty = {
         "frequency_hz": None,
         "selected_pc": None,
@@ -191,8 +193,6 @@ def _select_band_candidate(
     }
     if dominance < DOMINANCE_THRESHOLD:
         candidate["reason"] = "insufficient_peak_dominance"
-    elif kind == "respiratory" and duration_n_dt_s < RELIABLE_RESPIRATORY_DURATION_S:
-        candidate["reason"] = "limited_duration"
     else:
         candidate["reliable"] = True
         candidate["reason"] = "peak_dominance_at_least_2.2"

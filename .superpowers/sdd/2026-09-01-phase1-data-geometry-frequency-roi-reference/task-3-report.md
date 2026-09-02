@@ -27,13 +27,15 @@ constructed tests GREEN:
 - rejection of a 20-ms timestamp discontinuity before periodogram use;
 - acceptance of a 1-ms quantisation deviation under the explicit tolerance;
 - null candidates when frequency resolution is insufficient; and
-- a 50-frame, 8.55-s acquisition reporting a respiratory candidate as
-  `limited_duration` and producing no verified global respiratory band.
+- a 50-frame, 8.55-s acquisition retaining a respiratory candidate when it
+  has positive peak power and sufficient dominance, with the temporal PC and
+  its PSD available in the regular outputs and an explicit duration/`df`
+  precision caveat in aggregate JSON.
 - a flat, all-zero 50-frame series returning null frequency, selected-PC,
   peak-power, and dominance fields with reason `no_positive_peak_power`, rather
   than exposing the arbitrary first `argmax` frequency bin as a candidate.
 
-Fresh verification ran `python -m unittest discover -s tests -v`: 26 tests
+Fresh verification ran `python -m unittest discover -s tests -v`: 27 tests
 passed and one pre-existing optional real-loader test was skipped because its
 environment variable was not configured.
 
@@ -58,11 +60,15 @@ duration `N*dt=8.550 s`, `df=0.116959 Hz`, and Nyquist `2.923977 Hz`.
 ## Candidate interpretation and limitations
 
 Following the supplied Shammi PCA criterion, the peak-dominance threshold is
-2.2.  A respiratory peak can be listed per slice, but the approximately 8.55-s
-recording is below the reported 10-s minimum for reliably tracking more than
-one respiratory cycle.  Therefore the aggregate JSON sets
-`respiratory.verified_band_hz` to `null` with reason `limited_duration`; it
-does not claim a verified global respiratory band.
+2.2.  Respiratory and cardiac reliability are both determined by positive peak
+power and this dominance threshold; the approximately 8.55-s recording is not
+a hard respiratory rejection criterion.  The aggregate respiratory result has
+144 reliable per-slice candidates with center frequencies from 0.11696 to
+0.58480 Hz (median 0.35088 Hz).  `respiratory.verified_band_hz` is the merged
+periodogram-resolution interval `[0.05848, 0.64327] Hz`, not a point estimate.
+The JSON records the approximately 8.363-s observation span and 0.116959-Hz
+`df` as an explicit caveat: use the merged resolution bins and do not infer
+precision finer than those bins.
 
 All 144 cardiac slice candidates passed the specified dominance threshold.  The
 reliable cardiac distribution spans 1.0526--1.8713 Hz (median 1.5205 Hz) over

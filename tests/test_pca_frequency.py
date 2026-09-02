@@ -73,8 +73,8 @@ class PcaFrequencyTest(unittest.TestCase):
 
         self.assertLessEqual(result["max_dt_deviation_s"], 0.0010001)
 
-    def test_short_duration_respiration_is_not_a_verified_global_band(self) -> None:
-        """A 50-frame 8.55 s acquisition may report but cannot verify respiration."""
+    def test_short_duration_respiration_remains_a_dominance_based_candidate(self) -> None:
+        """An 8.55 s series keeps a resolvable respiratory signal with duration caveat."""
         timestamps_s = np.arange(50, dtype=float) * 0.171
         result = analyze_image_series(synthetic_series(timestamps_s), timestamps_s)
         bands = aggregate_frequency_bands([result])
@@ -82,10 +82,17 @@ class PcaFrequencyTest(unittest.TestCase):
         self.assertAlmostEqual(8.379, result["duration_span_s"], places=8)
         self.assertAlmostEqual(8.55, result["duration_n_dt_s"], places=8)
         self.assertAlmostEqual(1.0 / 8.55, result["df_hz"], places=8)
-        self.assertFalse(result["respiratory_candidate"]["reliable"])
-        self.assertEqual("limited_duration", result["respiratory_candidate"]["reason"])
-        self.assertIsNone(bands["respiratory"]["verified_band_hz"])
-        self.assertEqual("limited_duration", bands["respiratory"]["reason"])
+        respiratory = result["respiratory_candidate"]
+        self.assertTrue(respiratory["reliable"])
+        self.assertEqual("peak_dominance_at_least_2.2", respiratory["reason"])
+        self.assertIsNotNone(respiratory["frequency_hz"])
+        self.assertIsNotNone(respiratory["selected_pc"])
+        selected_pc = respiratory["selected_pc"] - 1
+        self.assertGreater(float(np.abs(result["temporal_pcs"][:, selected_pc]).max()), 0.0)
+        self.assertGreater(float(result["pc_psd"][:, selected_pc].max()), 0.0)
+        self.assertIsNotNone(bands["respiratory"]["verified_band_hz"])
+        self.assertEqual("reliable_candidates_present", bands["respiratory"]["reason"])
+        self.assertIn("observation_duration_caveat", bands["respiratory"]["limitations"])
         per_slice = bands["respiratory"]["per_slice_candidates"][0]
         self.assertAlmostEqual(8.379, per_slice["duration_span_s"], places=8)
         self.assertAlmostEqual(8.55, per_slice["duration_n_dt_s"], places=8)

@@ -8,15 +8,15 @@ from typing import Any, Iterable
 def aggregate_frequency_bands(slice_results: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Build transparent per-slice and union-bin frequency evidence for all slices.
 
-    Respiratory verification remains null unless every prerequisite supports it;
-    the Phase 1 50-frame acquisition is below the 10 s duration reported as
-    necessary to track more than one respiratory cycle.  Cardiac output retains
-    per-slice candidates and merged spectral-resolution bins instead of forcing
-    a misleading single global frequency across the sequential scan.
+    Respiratory and cardiac verification use the same positive-peak and
+    dominance evidence.  Both retain per-slice candidates and merged
+    spectral-resolution bins instead of forcing a misleading point estimate
+    across the sequential scan.  Observation span and ``df`` remain explicit
+    limitations on the precision of every reported band.
     """
     results = list(slice_results)
-    respiratory = _aggregate_kind(results, "respiratory_candidate", verify_respiration=True)
-    cardiac = _aggregate_kind(results, "cardiac_candidate", verify_respiration=False)
+    respiratory = _aggregate_kind(results, "respiratory_candidate", is_respiratory=True)
+    cardiac = _aggregate_kind(results, "cardiac_candidate", is_respiratory=False)
     return {
         "schema_version": 1,
         "method": {
@@ -35,7 +35,7 @@ def aggregate_frequency_bands(slice_results: Iterable[dict[str, Any]]) -> dict[s
 
 
 def _aggregate_kind(
-    results: list[dict[str, Any]], candidate_key: str, *, verify_respiration: bool) -> dict[str, Any]:
+    results: list[dict[str, Any]], candidate_key: str, *, is_respiratory: bool) -> dict[str, Any]:
     """Collect candidates, summary distribution, and merged resolution bins for one signal kind."""
     per_slice = []
     reliable_frequencies: list[float] = []
@@ -62,19 +62,30 @@ def _aggregate_kind(
         "max_hz": max(reliable_frequencies),
         "median_hz": _median(reliable_frequencies),
     }
-    if verify_respiration:
-        any_limited = any(candidate["reason"] == "limited_duration" for candidate in per_slice)
+    union_bins = _merge_bins(bins)
+    if is_respiratory:
         return {
-            "verified_band_hz": None,
-            "reason": "limited_duration" if any_limited else "no_reliable_respiratory_candidate",
+            "verified_band_hz": union_bins or None,
+            "reason": "reliable_candidates_present" if reliable_frequencies else "no_reliable_respiratory_candidate",
             "per_slice_candidates": per_slice,
             "reliable_frequency_distribution_hz": distribution,
-            "union_resolution_bins_hz": _merge_bins(bins),
+            "union_resolution_bins_hz": union_bins,
+            "limitations": {
+                "observation_duration_caveat": (
+                    "Candidate reliability is based on positive peak power and dominance; "
+                    "duration and df limit frequency precision. Interpret verified_band_hz as "
+                    "merged periodogram-resolution bins, not exact frequencies."
+                ),
+                "duration_span_s_range": _range_or_none(
+                    [float(result["duration_span_s"]) for result in results]
+                ),
+                "df_hz_range": _range_or_none([float(result["df_hz"]) for result in results]),
+            },
         }
     return {
         "per_slice_candidates": per_slice,
         "reliable_frequency_distribution_hz": distribution,
-        "union_resolution_bins_hz": _merge_bins(bins),
+        "union_resolution_bins_hz": union_bins,
     }
 
 
@@ -96,3 +107,8 @@ def _median(values: list[float]) -> float:
     ordered = sorted(values)
     middle = len(ordered) // 2
     return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _range_or_none(values: list[float]) -> list[float] | None:
+    """Return a two-value range, or null when no slice result was supplied."""
+    return None if not values else [min(values), max(values)]
