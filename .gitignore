@@ -19,6 +19,7 @@ local_config.yaml
 
 # Runtime artifacts
 results/
+results*/
 outputs/
 runs/
 logs/

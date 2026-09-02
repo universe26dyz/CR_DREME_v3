@@ -1,14 +1,35 @@
-# Copy to subject_local.yaml and set a local, read-only DICOM root.
-dicom_root: /path/to/read-only/dicom
-views:
-  - SAX
-  - 2CH
-  - 4CH
-results_dir: ../results
-manifest_stem: dicom_manifest
-expected_frames_per_slice: 50
+# Copy to ignored subject_local.yaml; keep patient paths and box values local.
+project: {name: cardioresp4d, results_dir: ../results}
+data:
+  dicom_root: /path/to/read-only/dicom
+  views: [SAX, 2CH, 4CH]
+  expected_frames_per_slice: 50
+  manifest_stem: dicom_manifest
+  inspection_filename: inspection.json
+geometry:
+  required_views: [SAX, 2CH, 4CH]
+  max_qc_planes_per_view: 3
+  pixel_round_trip_tolerance: 1.0e-6
+  world_round_trip_tolerance_mm: 1.0e-6
+  output_subdir: geometry_qc
+frequency:
+  respiratory_band_hz: [0.10, 0.60]
+  cardiac_band_hz: [0.80, 2.00]
+  dominance_threshold: 2.2
+  uniform_relative_tolerance: 0.001
+  uniform_absolute_tolerance_s: 0.0011
+  pca_components: 50
+  output_subdir: frequency
 roi:
-  # Required subject-local patient-world values; determine by three-view QC.
-  # This empirical DREME-style local support is not an anatomical segmentation.
+  # Empirical patient-world DREME-style support; not segmentation.
   cardiac_box_center_mm: null
   cardiac_box_size_mm: null
+  required_views: [SAX, 2CH, 4CH]
+  output_subdir: roi_qc
+reference:
+  source_view: SAX
+  orientation_tolerance: 1.0e-5
+  spacing_tolerance_mm: 1.0e-6
+  duplicate_tolerance_mm: 1.0e-3
+  origin_affine_tolerance_mm: 0.5
+  output_subdir: reference

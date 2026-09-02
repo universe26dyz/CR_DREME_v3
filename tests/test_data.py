@@ -32,6 +32,19 @@ from cardioresp4d.data.dataset import CardioRespDataset, _rescaled_pixels  # noq
 from cardioresp4d.data.inspect_dataset import scan_dicom_frames, write_inspection  # noqa: E402
 
 
+def nested_config_mapping(dicom_root: Path, results_dir: Path, expected_frames: int = 50) -> dict:
+    """Build the module-scoped Phase-1 YAML shape used by configuration tests."""
+    return {
+        "project": {"results_dir": str(results_dir)},
+        "data": {"dicom_root": str(dicom_root), "views": ["SAX", "2CH", "4CH"],
+                 "expected_frames_per_slice": expected_frames},
+        "geometry": {"required_views": ["SAX", "2CH", "4CH"]},
+        "frequency": {},
+        "roi": {"required_views": ["SAX", "2CH", "4CH"]},
+        "reference": {"source_view": "SAX"},
+    }
+
+
 def write_dicom(
     path: Path,
     acquisition_time: str,
@@ -165,11 +178,7 @@ class DataPipelineTest(unittest.TestCase):
     def test_config_and_manifest_reject_results_inside_dicom_root(self) -> None:
         with self.assertRaisesRegex(ValueError, "results_dir"):
             config_from_mapping(
-                {
-                    "dicom_root": str(self.root),
-                    "views": ["SAX"],
-                    "results_dir": str(self.root / "results"),
-                },
+                nested_config_mapping(self.root, self.root / "results"),
                 self.root,
             )
         with self.assertRaisesRegex(ValueError, "results_dir"):
@@ -180,12 +189,7 @@ class DataPipelineTest(unittest.TestCase):
             with self.subTest(expected_frames=expected_frames):
                 with self.assertRaisesRegex(ValueError, "exactly 50"):
                     config_from_mapping(
-                        {
-                            "dicom_root": str(self.root),
-                            "views": ["SAX"],
-                            "results_dir": str(Path(self.tempdir.name) / "results"),
-                            "expected_frames_per_slice": expected_frames,
-                        },
+                        nested_config_mapping(self.root, Path(self.tempdir.name) / "results", expected_frames),
                         self.root,
                     )
 
