@@ -19,6 +19,7 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
+from cardioresp4d.config import validate_expected_frames_per_slice
 from cardioresp4d.data.dataset import CardioRespDataset
 from cardioresp4d.geometry.coordinate_normalization import WorldNormalizer
 from cardioresp4d.geometry.geometry_qc import load_manifest_planes
@@ -116,8 +117,7 @@ def run_roi_qc(
     expected_frames_per_slice: int = 50,
 ) -> tuple[Path, dict[str, Path]]:
     """Generate one shared-box audit report and three temporal-mean overlays."""
-    if expected_frames_per_slice <= 0:
-        raise ValueError("expected_frames_per_slice must be positive")
+    validate_expected_frames_per_slice(expected_frames_per_slice)
     manifest = Path(manifest_path)
     with manifest.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))

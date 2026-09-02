@@ -112,6 +112,26 @@ class CardiacProjectionTest(unittest.TestCase):
         np.testing.assert_allclose(np.sort(intersection["pixel"][:, 1]), [1.0, 1.0, 3.0, 3.0])
         np.testing.assert_allclose(intersection["world_mm"][:, 2], 30.0)
 
+    def test_intersection_preserves_single_vertex_tangent_contact(self) -> None:
+        """A tangent plane touching only the upper box corner yields one audited contact point."""
+        root_two = np.sqrt(2.0)
+        root_six = np.sqrt(6.0)
+        plane = DicomPlane.from_geometry({
+            **AXIAL_GEOMETRY,
+            "image_position_patient": [1.0, 1.0, 1.0],
+            "image_orientation_patient": [
+                1.0 / root_two, -1.0 / root_two, 0.0,
+                1.0 / root_six, 1.0 / root_six, -2.0 / root_six,
+            ],
+        })
+        box = CardiacBox(center_mm=[0.0, 0.0, 0.0], size_mm=[2.0, 2.0, 2.0])
+
+        intersection = box_plane_intersection(box, plane)
+
+        self.assertEqual((1, 3), intersection["world_mm"].shape)
+        np.testing.assert_allclose(intersection["world_mm"][0], [1.0, 1.0, 1.0], atol=1e-12)
+        np.testing.assert_allclose(intersection["pixel"][0], [0.0, 0.0], atol=1e-12)
+
     def test_closest_plane_selection_uses_absolute_physical_distance(self) -> None:
         box = CardiacBox([0.0, 0.0, 8.0], [2.0, 2.0, 2.0])
         records = []
@@ -192,6 +212,20 @@ class RoiQcArtifactTest(unittest.TestCase):
                 self.assertAlmostEqual(0.0, view_report["plane_distance_to_box_center_mm"])
                 self.assertEqual(4, view_report["intersection"]["vertex_count"])
                 self.assertTrue(view_report["intersection"]["all_vertices_in_image"])
+
+    def test_qc_rejects_frame_expectations_other_than_project_contract_50(self) -> None:
+        """The public API cannot redefine the acquisition as 49 or 51 frames per slice."""
+        with tempfile.TemporaryDirectory() as directory:
+            missing_manifest = Path(directory) / "not_needed_for_contract_validation.csv"
+            for expected_frames in (49, 51):
+                with self.subTest(expected_frames=expected_frames):
+                    with self.assertRaisesRegex(ValueError, "exactly 50"):
+                        run_roi_qc(
+                            missing_manifest,
+                            Path(directory) / "qc",
+                            CardiacBox([0.0, 0.0, 0.0], [2.0, 2.0, 2.0]),
+                            expected_frames_per_slice=expected_frames,
+                        )
 
 
 def _write_dicom(path: Path, pixels: np.ndarray, origin: list[float], orientation: list[float]) -> None:
