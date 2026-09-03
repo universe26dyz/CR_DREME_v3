@@ -94,7 +94,7 @@ def run_acquisition_qc(manifest_path: str | Path, output_dir: str | Path, *,
                        scale_mad_threshold: float = 6.0, residual_mad_threshold: float = 6.0,
                        mad_floor: float = 1e-6) -> tuple[Path, Path, Path]:
     """Evaluate all or selected complete blocks and write table/summary/compact plot."""
-    dataset = CardioRespDataset(manifest_path, valid_only=False)
+    dataset = CardioRespDataset(manifest_path, valid_only=False, use_qc=False)
     groups: dict[tuple[str, str], list[int]] = defaultdict(list)
     for index, row in enumerate(dataset._rows):
         key = (row["view"], row["slice_id"])
@@ -113,7 +113,7 @@ def run_acquisition_qc(manifest_path: str | Path, output_dir: str | Path, *,
                                       ncc_mad_threshold=ncc_mad_threshold,
                                       scale_mad_threshold=scale_mad_threshold,
                                       residual_mad_threshold=residual_mad_threshold, mad_floor=mad_floor)
-        valid_images = [sample["image"] for sample, metric in zip(samples, metrics) if metric["qc_valid"]]
+        valid_images = [sample["rescaled_image"] for sample, metric in zip(samples, metrics) if metric["qc_valid"]]
         if not valid_images:
             raise ValueError(f"Acquisition QC rejected every frame in {view}/{slice_id}; no fabricated replacement is allowed")
         slice_means[(view, slice_id)] = np.mean(np.stack(valid_images), axis=0)
@@ -122,7 +122,10 @@ def run_acquisition_qc(manifest_path: str | Path, output_dir: str | Path, *,
             metric.update(source_file_token=row.get("source_file_token", ""), view=view, slice_id=slice_id,
                           frame_index=int(row["frame_index"]))
             all_rows.append(metric)
-    _annotate_slice_level(all_rows, slice_means)
+    slice_positions = {
+        key: _slice_position_mm(dataset._rows[indices[0]]) for key, indices in groups.items()
+    }
+    _annotate_slice_level(all_rows, slice_means, slice_positions)
     output = Path(output_dir); output.mkdir(parents=True, exist_ok=True)
     table = write_qc_table(all_rows, output / "acquisition_qc.csv")
     summary = output / "acquisition_qc.json"
@@ -135,18 +138,23 @@ def run_acquisition_qc(manifest_path: str | Path, output_dir: str | Path, *,
     return table, summary, image
 
 
-def _annotate_slice_level(rows: list[dict[str, Any]], slice_means: dict[tuple[str, str], np.ndarray]) -> None:
-    """Conservatively flag only joint intensity-and-neighbour-consistency extremes."""
+def _slice_position_mm(row: dict[str, str]) -> float:
+    orientation = np.asarray(json.loads(row["image_orientation_patient"]), dtype=float)
+    origin = np.asarray(json.loads(row["image_position_patient"]), dtype=float)
+    normal = np.cross(orientation[:3], orientation[3:])
+    return float(np.dot(origin, normal / np.linalg.norm(normal)))
+
+
+def _annotate_slice_level(rows: list[dict[str, Any]], slice_means: dict[tuple[str, str], np.ndarray],
+                          positions_mm: dict[tuple[str, str], float]) -> None:
+    """Flag whole-location scale outliers after sorting by patient-world position."""
     for view in sorted({key[0] for key in slice_means}):
-        keys = sorted(key for key in slice_means if key[0] == view)
+        keys = sorted((key for key in slice_means if key[0] == view), key=positions_mm.__getitem__)
         if len(keys) < 3: continue
         intensities = np.asarray([float(np.median(slice_means[key])) for key in keys])
         center, spread = _median_mad(intensities, 0.01)
-        for index in range(1, len(keys) - 1):
-            key, image = keys[index], slice_means[keys[index]]
-            neighbour = (slice_means[keys[index - 1]] + slice_means[keys[index + 1]]) / 2.0
-            ncc = np.corrcoef(image.ravel(), neighbour.ravel())[0, 1]
-            if abs(intensities[index] - center) > 8.0 * spread and np.isfinite(ncc) and ncc < 0.2:
+        for index, key in enumerate(keys):
+            if abs(intensities[index] - center) > 8.0 * spread:
                 for row in rows:
                     if (row["view"], row["slice_id"]) == key:
                         row["qc_valid"] = False; row["qc_reason"] += ";slice_location_outlier"

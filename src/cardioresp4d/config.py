@@ -213,6 +213,10 @@ def validate_config(config: AppConfig) -> None:
         raise ValueError("Phase 1 v1 dominance and DICOM quantisation tolerances cannot be overridden")
     if config.frequency.pca_components != 50 or config.reference.source_view != "SAX":
         raise ValueError("Phase 1 v1 requires all 50 PCA components and SAX reference")
+    if config.views != REQUIRED_VIEWS or config.geometry.required_views != REQUIRED_VIEWS or config.roi.required_views != REQUIRED_VIEWS:
+        raise ValueError("Phase 1 v1 requires views exactly SAX, 2CH, 4CH in that order")
+    if dict(config.data.expected_series_per_view or {}) != EXPECTED_SERIES_PER_VIEW:
+        raise ValueError("Phase 1 v1 requires expected series SAX:50, 2CH:52, 4CH:42")
     if config.geometry.max_qc_planes_per_view <= 0:
         raise ValueError("geometry.max_qc_planes_per_view must be positive")
     positive_values = (

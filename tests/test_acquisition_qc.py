@@ -7,7 +7,11 @@ import nibabel as nib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from cardioresp4d.outlier_qc.acquisition_qc import analyze_frame_block, write_qc_table
+from cardioresp4d.outlier_qc.acquisition_qc import (
+    _annotate_slice_level,
+    analyze_frame_block,
+    write_qc_table,
+)
 from cardioresp4d.data.dataset import CardioRespDataset
 from cardioresp4d.reference.build_initial_reference import build_initial_reference
 from tests.test_reference import _write_manifest
@@ -68,6 +72,50 @@ class AcquisitionQcTest(unittest.TestCase):
             write_qc_table(qc_rows, root / "acquisition_qc" / "acquisition_qc.csv")
             with self.assertRaisesRegex(ValueError, "no valid frames"):
                 build_initial_reference(manifest, root / "reference_all_invalid")
+
+    def test_partial_qc_table_cannot_silently_admit_unchecked_manifest_frames(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); manifest = root / "manifest.csv"
+            pixels = np.arange(20, dtype=np.uint16).reshape(4, 5)
+            _write_manifest(manifest, root / "dicom", (("slice_a", 0.0, pixels), ("slice_b", 2.0, pixels + 10)))
+            partial = []
+            for frame in range(50):
+                partial.append({"source_file_token": "", "view": "SAX", "slice_id": "slice_a", "frame_index": frame,
+                                "qc_valid": True, "qc_reason": "valid", "qc_ncc": 1, "qc_intensity_scale": 1,
+                                "qc_residual": 0, "rescale_status": "identity_without_rescale_tags"})
+            table = write_qc_table(partial, root / "acquisition_qc" / "acquisition_qc.csv")
+            with self.assertRaisesRegex(ValueError, "does not cover every manifest frame"):
+                CardioRespDataset(manifest, qc_table_path=table)
+
+    def test_slice_location_qc_orders_opaque_ids_by_patient_position(self):
+        normal = (0.8 + np.arange(64, dtype=np.float32).reshape(8, 8) / 160.0)
+        anomalous = np.full((8, 8), 0.05, dtype=np.float32)
+        anomalous[::2, ::2] = 0.0
+        means = {
+            ("SAX", "z0"): normal,
+            ("SAX", "m1"): normal,
+            ("SAX", "a2"): anomalous,
+            ("SAX", "b3"): normal,
+            ("SAX", "c4"): normal,
+        }
+        rows = [{"view": view, "slice_id": slice_id, "qc_valid": True, "qc_reason": "valid"}
+                for view, slice_id in means]
+        positions = {("SAX", "z0"): 0.0, ("SAX", "m1"): 1.0, ("SAX", "a2"): 2.0,
+                     ("SAX", "b3"): 3.0, ("SAX", "c4"): 4.0}
+        _annotate_slice_level(rows, means, positions)
+        flagged = next(row for row in rows if row["slice_id"] == "a2")
+        self.assertFalse(flagged["qc_valid"])
+        self.assertIn("slice_location_outlier", flagged["qc_reason"])
+
+    def test_slice_location_qc_flags_a_world_boundary_scale_outlier(self):
+        normal = (0.8 + np.arange(64, dtype=np.float32).reshape(8, 8) / 160.0)
+        means = {("SAX", "boundary"): normal * 0.05, ("SAX", "middle"): normal,
+                 ("SAX", "last"): normal}
+        rows = [{"view": view, "slice_id": slice_id, "qc_valid": True, "qc_reason": "valid"}
+                for view, slice_id in means]
+        _annotate_slice_level(rows, means, {("SAX", "boundary"): 0.0, ("SAX", "middle"): 1.0,
+                                            ("SAX", "last"): 2.0})
+        self.assertFalse(next(row for row in rows if row["slice_id"] == "boundary")["qc_valid"])
 
 
 if __name__ == "__main__": unittest.main()

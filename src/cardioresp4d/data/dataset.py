@@ -30,7 +30,7 @@ class CardioRespDataset:
     """A lightweight manifest-backed DICOM dataset with no framework dependency."""
 
     def __init__(self, manifest_path: str | Path, *, valid_only: bool = True,
-                 qc_table_path: str | Path | None = None) -> None:
+                 qc_table_path: str | Path | None = None, use_qc: bool = True) -> None:
         self.manifest_path = Path(manifest_path)
         with self.manifest_path.open(newline="", encoding="utf-8") as handle:
             self._rows = list(csv.DictReader(handle))
@@ -43,15 +43,17 @@ class CardioRespDataset:
                 raise FileNotFoundError(f"Sensitive runtime path sidecar is missing: {sidecar}")
             with sidecar.open(encoding="utf-8") as handle:
                 self._token_to_path = json.load(handle)["token_to_absolute_path"]
-        qc_path = Path(qc_table_path) if qc_table_path else self.manifest_path.parent / "acquisition_qc" / "acquisition_qc.csv"
+        qc_path = (Path(qc_table_path) if qc_table_path else self.manifest_path.parent / "acquisition_qc" / "acquisition_qc.csv") if use_qc else None
         qc_by_token: dict[str, dict[str, str]] = {}
         qc_by_key: dict[tuple[str, str, str], dict[str, str]] = {}
-        if qc_path.is_file() and "source_file_token" in self._rows[0]:
+        if qc_path is not None and qc_path.is_file() and "source_file_token" in self._rows[0]:
+            validate_qc_table_coverage(self.manifest_path, qc_path)
             with qc_path.open(newline="", encoding="utf-8") as handle:
                 qc_rows = list(csv.DictReader(handle))
                 qc_by_token = {row["source_file_token"]: row for row in qc_rows if row.get("source_file_token")}
                 qc_by_key = {(row["view"], row["slice_id"], row["frame_index"]): row for row in qc_rows}
-        elif qc_path.is_file():
+        elif qc_path is not None and qc_path.is_file():
+            validate_qc_table_coverage(self.manifest_path, qc_path)
             with qc_path.open(newline="", encoding="utf-8") as handle:
                 qc_rows = list(csv.DictReader(handle))
                 qc_by_key = {(row["view"], row["slice_id"], row["frame_index"]): row for row in qc_rows}
@@ -100,6 +102,25 @@ class CardioRespDataset:
                 "columns": int(row["columns"]),
             },
         }
+
+
+def validate_qc_table_coverage(manifest_path: str | Path, qc_table_path: str | Path) -> None:
+    """Require one, and only one, QC decision for every manifest frame."""
+    with Path(manifest_path).open(newline="", encoding="utf-8") as handle:
+        manifest_rows = list(csv.DictReader(handle))
+    with Path(qc_table_path).open(newline="", encoding="utf-8") as handle:
+        qc_rows = list(csv.DictReader(handle))
+    token_mode = bool(manifest_rows and "source_file_token" in manifest_rows[0])
+    def key(row: dict[str, str]) -> tuple[str, ...]:
+        return ((row.get("source_file_token", ""),) if token_mode else
+                (row.get("view", ""), row.get("slice_id", ""), row.get("frame_index", "")))
+    manifest_keys = [key(row) for row in manifest_rows]
+    qc_keys = [key(row) for row in qc_rows]
+    if (not manifest_keys or len(qc_keys) != len(manifest_keys) or len(set(qc_keys)) != len(qc_keys)
+            or set(qc_keys) != set(manifest_keys)):
+        raise ValueError("Acquisition QC table does not cover every manifest frame exactly once")
+    if any("qc_valid" not in row for row in qc_rows):
+        raise ValueError("Acquisition QC table lacks qc_valid decisions")
 
 
 def _rescaled_pixels(dataset: pydicom.dataset.Dataset) -> np.ndarray:

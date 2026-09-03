@@ -26,9 +26,11 @@ For each fixed 50-frame block, after the reader's actual modality scaling:
 
 A global-scale flag additionally requires a large absolute log-scale excursion
 so normal cardio-respiratory motion and modest first-frame transients are not
-removed. Slice-location flagging requires both an extreme robust stack intensity
-and poor agreement with two neighbours; basal/apical difference alone is not
-enough.
+removed. Slice-location QC computes temporal means from rescaled (not
+per-frame-percentile-normalized) images, sorts locations by patient-world
+plane-normal position rather than opaque IDs, and applies the robust stack-scale
+check even at a physical boundary. This explicitly covers a whole dark 50-frame
+location; ordinary frame-level median QC cannot observe that failure mode.
 
 ## Tests and minimal real result
 
@@ -44,6 +46,14 @@ because their scale/residual pattern was consistent with normal motion. A SAX
 frame-0 scale transient (~1.083, NCC ~0.955, residual ~0.148) was initially a MAD
 extreme but was correctly retained by the conservative large-absolute-change
 guard. Therefore this limited sample provides no confirmed RF-corruption claim.
+
+The later directed check used the original SAX location IDs requested by the
+user: `s10`--`s20` plus `s9/s21` controls (13 locations, 650 frames). It
+rejected exactly one `SAX_s14_2101` frame for low NCC; all other frames and all
+target locations remained valid. The 13-layer minimal reference then used 49
+valid frames for `s14`, with no imputation. This check also established that
+roughly 2-mm IPP centre spacing is stack geometry, while DICOM `SliceThickness`
+remains 8 mm for the future thick-slice renderer. No QC threshold changed.
 
 ## Frequency and Git status
 
@@ -61,7 +71,7 @@ no existing history/tag is rewritten.
 
 ## User decision needed
 
-No blocking decision is required. Before any later Phase-2 dataset is created,
-the pipeline will run the same conservative QC stage over its selected
-observations; threshold tuning should be reviewed against its QC plots rather
-than applied blindly.
+No blocking decision is required. A partial directed QC table is deliberately
+ineligible for downstream use: downstream requires one decision per manifest
+frame. Any later Phase-2 real subset must use a matching complete QC table for
+that subset; threshold tuning remains plot-audited rather than automatic.

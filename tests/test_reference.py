@@ -66,6 +66,10 @@ class InitialReferenceTest(unittest.TestCase):
             self.assertEqual(["SAX_z_z00", "SAX_m_z10", "SAX_a_z20"], metadata["sorted_slice_ids"])
             self.assertEqual([50, 50, 50], metadata["frames_per_slice"])
             self.assertEqual([3, 2, 3], metadata["shape"])
+            self.assertEqual(8.0, metadata["acquisition_slice_thickness_mm"])
+            self.assertEqual("IPP centre-to-centre spacing for stack/world geometry",
+                             metadata["stack_slice_spacing_semantics"])
+            self.assertIn("thick-slice renderer", metadata["acquisition_slice_thickness_semantics"])
 
     def test_affines_use_dicom_column_row_steps_and_explicit_lps_to_ras(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -138,9 +138,10 @@ transposed to output `(column,row,slice)`.
 - Metadata stores both the authoritative DICOM LPS affine and the NIfTI RAS+
   affine, with `RAS = diag(-1,-1,1,1) @ LPS`.
 - Physical IPP steps are 1.999990--2.000010 mm and affine residual is only
-  0.0001005 mm. This measured geometry deliberately overrides the apparently
-  nonrepresentative 8-mm thickness / 10-mm between-slice tags for the stack
-  affine; all values remain recorded for audit.
+  0.0001005 mm. This measured centre-to-centre spacing is authoritative for
+  stack/world geometry only. The DICOM 8-mm `SliceThickness` remains the
+  acquisition thickness for the SIMPLE-4D thick-slice renderer and is never
+  replaced by the approximately 2-mm IPP step.
 - Central and orthogonal QC panels are anatomically continuous and recognizable.
 
 Temporal averaging/stacking is direct from S2V-DREME. LPS/RAS conversion,
@@ -206,7 +207,10 @@ metadata across every frame before manifest writing. Canonical artifacts are
 bound to the current root and complete nested configuration by hashes. Unknown
 keys are rejected at every YAML level.
 
-The new order is `manifest -> acquisition QC -> downstream`. Within each
+The new order is `manifest -> acquisition QC -> downstream`. A QC table must
+cover every manifest frame exactly once before any downstream stage consumes
+it; a targeted/partial table is reporting-only and cannot silently admit
+unchecked observations. Within each
 50-frame block, QC first records actual modality-rescale status, then uses a
 temporal median reference, NCC, robust global intensity scale, and
 scale-corrected normalized residual. Median/MAD rules are conservative: a scale
@@ -219,12 +223,18 @@ invalid slice rather than filling zeros. PCA excludes incomplete post-QC blocks
 because ordinary FFT requires its complete uniform temporal grid, recording the
 exclusion instead of resampling silently.
 
-Minimal real QC intentionally did not rerun full Geometry/ROI/PCA. Nine opaque
-representative blocks (450 frames) were examined: 450 remained valid and no
-obvious acquisition corruption was confirmed. The most extreme transient scale
-candidate was retained after conservative absolute-scale gating. Synthetic tests
-independently prove global intensity-drop and local-bright corruption detection.
-Threshold approval and an optional all-slice QC pass remain a user decision.
+Minimal real QC intentionally did not rerun full Geometry/ROI/PCA. The initial
+nine opaque representative blocks (450 frames) remained valid. A subsequent
+user-directed check used the actual SAX `s10`--`s20` locations plus `s9/s21`
+physical controls (13 locations, 650 frames): one `SAX_s14_2101` frame was
+rejected for low NCC; no target location was wholly rejected. Slice-location
+scale checks use rescaled (not per-frame-normalized) images and patient-world
+normal ordering, including physical stack boundaries. A 13-layer minimal
+reference used the remaining 49 valid `s14` frames, retained 8-mm acquisition
+thickness alongside 2-mm stack spacing, and did not fabricate a missing slice.
+No threshold was changed. Synthetic tests independently prove global
+intensity-drop, local-bright, boundary-layer, partial-QC-mask, and valid-frame
+reference behaviours.
 
 ## Known limitations and Phase 2 plan
 
@@ -239,7 +249,7 @@ Threshold approval and an optional all-slice QC pass remain a user decision.
   alter absolute intensity scale.
 - No GPU work was required locally. Phase-2 code must remain server-compatible.
 
-After explicit user approval only, Phase 2 will implement the P0 canonical
-hash-INR, 3-level respiratory and local cardiac B-spline MBCs, sequential
-deformation, thick-slice renderer, FiLM encoder with 9+3 scores, specified losses,
-and forward/backward/checkpoint smoke tests. No Phase-2 module has been started.
+The user has now authorized Phase 2 P0 only: canonical hash-INR, 3-level
+respiratory and local cardiac B-spline MBCs, sequential deformation, thick-slice
+renderer, FiLM encoder with 9+3 scores, specified losses, and a compact
+forward/backward/checkpoint smoke test. Phase 3 remains out of scope.

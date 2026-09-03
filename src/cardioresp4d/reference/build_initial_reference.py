@@ -57,6 +57,10 @@ def build_initial_reference(
     with manifest.open(newline="", encoding="utf-8") as handle:
         original_rows = list(csv.DictReader(handle))
     original_sax_ids = {row["slice_id"] for row in original_rows if row.get("view", "").upper() == "SAX"}
+    sax_thicknesses = {float(row["slice_thickness"]) for row in original_rows if row.get("view", "").upper() == "SAX"}
+    if len(sax_thicknesses) != 1:
+        raise ValueError("SAX DICOM SliceThickness must be constant for the current renderer contract")
+    acquisition_slice_thickness_mm = sax_thicknesses.pop()
     valid_sax_ids = {row["slice_id"] for row in rows if row.get("view", "").upper() == "SAX"}
     missing_valid_slices = sorted(original_sax_ids - valid_sax_ids)
     if missing_valid_slices:
@@ -174,6 +178,9 @@ def build_initial_reference(
             float(np.linalg.norm(dicom_lps_affine[:3, 1])),
             float(np.linalg.norm(dicom_lps_affine[:3, 2])),
         ],
+        "acquisition_slice_thickness_mm": acquisition_slice_thickness_mm,
+        "stack_slice_spacing_semantics": "IPP centre-to-centre spacing for stack/world geometry",
+        "acquisition_slice_thickness_semantics": "DICOM SliceThickness retained for the SIMPLE-4D thick-slice renderer; it is not replaced by IPP stack spacing",
         "dicom_lps_affine": dicom_lps_affine.tolist(),
         "nifti_ras_affine": nifti_ras_affine.tolist(),
         "coordinate_conversion": "nifti_ras_affine = diag(-1,-1,1,1) @ dicom_lps_affine",

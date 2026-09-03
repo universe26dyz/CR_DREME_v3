@@ -29,6 +29,7 @@ from cardioresp4d.reference.build_initial_reference import build_initial_referen
 from cardioresp4d.roi.cardiac_box import CardiacBox  # noqa: E402
 from cardioresp4d.roi.roi_qc import run_roi_qc  # noqa: E402
 from cardioresp4d.outlier_qc.acquisition_qc import run_acquisition_qc  # noqa: E402
+from cardioresp4d.data.dataset import validate_qc_table_coverage  # noqa: E402
 
 STAGES = ("inspect", "manifest", "qc", "geometry", "frequency", "roi", "reference")
 
@@ -71,6 +72,7 @@ def run_pipeline(config: AppConfig, from_stage: str | None = None,
         qc_table = config.results_dir / config.outlier_qc.output_subdir / "acquisition_qc.csv"
         if not qc_table.is_file():
             raise FileNotFoundError("Acquisition QC table is required before downstream Phase-1 stages")
+        validate_qc_table_coverage(manifest, qc_table)
     if "geometry" in stages:
         report, image = run_geometry_qc(manifest, config.results_dir / config.geometry.output_subdir,
                                          max_per_view=config.geometry.max_qc_planes_per_view)

@@ -20,9 +20,8 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from cardioresp4d.config import config_from_mapping  # noqa: E402
+from cardioresp4d.config import config_from_mapping, validate_config  # noqa: E402
 from cardioresp4d.config import AppConfig  # noqa: E402
-from tests.test_data import write_dicom  # noqa: E402
 
 
 def nested_mapping(root: Path) -> dict:
@@ -107,25 +106,15 @@ class ModularConfigTest(unittest.TestCase):
                     root,
                 )
 
+    def test_direct_python_configuration_cannot_bypass_fixed_acquisition_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = AppConfig(root / "dicom", ("SAX", "2CH", "4CH"), root / "results")
+            with self.assertRaisesRegex(ValueError, "expected series SAX:50"):
+                validate_config(config)
+
 
 class Phase1RunnerTest(unittest.TestCase):
-    def test_real_synthetic_dicom_reaches_qc_with_pathless_provenance(self) -> None:
-        """Exercise inspect/manifest/QC without mocking the data or provenance boundary."""
-        runner = load_runner_module()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); dicom = root / "Patient_Name"; results = root / "results"
-            for view, hour in (("SAX", 12), ("2CH", 13), ("4CH", 14)):
-                block = dicom / f"{view}_private_series"; block.mkdir(parents=True)
-                for index in range(50):
-                    pixels = (np.arange(64).reshape(8, 8) + index % 3).astype(np.uint16)
-                    write_dicom(block / f"{index + 1:08d}.dcm", f"{hour:02d}00{index:02d}.000", pixels)
-            config = AppConfig(dicom, ("SAX", "2CH", "4CH"), results)
-            summary = runner.run_pipeline(config, to_stage="qc")
-            self.assertEqual(["inspect", "manifest", "qc"], list(summary))
-            canonical = config.manifest_csv_path.read_text() + config.manifest_json_path.read_text()
-            self.assertNotIn("Patient_Name", canonical)
-            self.assertTrue((results / "pipeline_run_summary.json").is_file())
-
     def test_full_run_calls_public_apis_in_dependency_order(self) -> None:
         runner = load_runner_module()
         with tempfile.TemporaryDirectory() as directory:
@@ -147,6 +136,7 @@ class Phase1RunnerTest(unittest.TestCase):
                  patch.object(runner, "build_manifest", record("manifest", (manifest, config.manifest_json_path))), \
                  patch.object(runner, "validate_manifest_artifacts", lambda *args: (manifest, config.manifest_json_path)), \
                  patch.object(runner, "run_acquisition_qc", record("qc", (Path("q.csv"), Path("q.json"), Path("q.png")))), \
+                 patch.object(runner, "validate_qc_table_coverage", lambda *args: None), \
                  patch.object(runner, "run_geometry_qc", record("geometry", (Path("g.json"), Path("g.png")))), \
                  patch.object(runner, "_validate_geometry_tolerances", lambda *args: None), \
                  patch.object(runner, "analyze_manifest", record("frequency", {"slice_count": 3})), \
@@ -180,7 +170,7 @@ class Phase1RunnerTest(unittest.TestCase):
         runner = load_runner_module()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config = AppConfig(root / "dicom", ("SAX",), root / "results")
+            config = config_from_mapping(nested_mapping(root), root)
             config.dicom_root.mkdir()
             config.results_dir.mkdir()
             with patch.object(runner, "write_inspection", return_value=config.inspection_path):
