@@ -29,7 +29,7 @@ class CubicBSplineMBC(nn.Module):
             mask[:, 0] = mask[:, -1] = 0; mask[:, :, 0] = mask[:, :, -1] = 0; mask[:, :, :, 0] = mask[:, :, :, -1] = 0
         self.register_buffer("control_mask", mask)
 
-    def forward(self, points_mm: torch.Tensor) -> torch.Tensor:
+    def forward(self, points_mm: torch.Tensor, controls_mm: torch.Tensor | None = None) -> torch.Tensor:
         if points_mm.shape[-1] != 3: raise ValueError("points_mm must end in xyz")
         shape = points_mm.shape[:-1]; p = points_mm.reshape(-1, 3)
         normalized = (p - self.domain_min_mm) / (self.domain_max_mm - self.domain_min_mm)
@@ -37,7 +37,11 @@ class CubicBSplineMBC(nn.Module):
         coordinate = normalized.clamp(0, 1) * (self.controls.shape[1] - 3) + 1
         base = torch.floor(coordinate).long() - 1; frac = coordinate - torch.floor(coordinate)
         base = base.clamp(0, self.controls.shape[1] - 4); weights = _cubic(frac)
-        field = torch.zeros(p.shape[0], 3, dtype=p.dtype, device=p.device); controls = self.controls * self.control_mask
+        field = torch.zeros(p.shape[0], 3, dtype=p.dtype, device=p.device)
+        controls = self.controls if controls_mm is None else controls_mm
+        if controls.shape != self.controls.shape:
+            raise ValueError(f"controls_mm must have shape {tuple(self.controls.shape)}")
+        controls = controls.to(dtype=p.dtype, device=p.device) * self.control_mask
         for ix in range(4):
             for iy in range(4):
                 for iz in range(4):

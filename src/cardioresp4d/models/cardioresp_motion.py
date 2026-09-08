@@ -27,7 +27,10 @@ class ScoreWeightedMBCField(nn.Module):
         if scores.ndim != 3 or scores.shape[-1] != 3:
             raise ValueError("scores must have shape [B, levels, 3]")
         self.mbc = mbc
-        self.register_buffer("scores", scores.detach().clone().float())
+        # Scores are encoder outputs during dynamic training, so detaching them
+        # here would silently cut the reconstruction gradient to FiLM.  This is
+        # intentionally a tensor reference, not a checkpoint buffer.
+        self.scores = scores
 
     def forward(self, points_mm: torch.Tensor) -> torch.Tensor:
         if points_mm.ndim < 3 or points_mm.shape[-1] != 3:

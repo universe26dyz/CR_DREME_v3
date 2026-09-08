@@ -29,3 +29,32 @@ class SliceUncertainty(nn.Module):
         frame_variance = F.softplus(self.frame_log_variance(frame_indices)).view(batch,1,1) + self.epsilon
         total = pixel_variance + frame_variance
         return {"pixel_variance": pixel_variance, "frame_variance": frame_variance, "total_variance": total}
+
+
+class NamespacedObservationUncertainty(nn.Module):
+    """NeSVoR-style variance with disjoint mean-slice and dynamic-frame ID spaces.
+
+    ``enabled=False`` implements the MSE/unit-variance warm-up required before
+    uncertainty is allowed to explain residuals.  Stage 1A must not call this
+    module at all.
+    """
+    _NAMESPACES = ("mean_slice", "dynamic_frame")
+
+    def __init__(self, latent_dim: int, *, num_mean_slices: int, num_dynamic_frames: int, embedding_dim: int = 8, epsilon: float = 1e-6) -> None:
+        super().__init__()
+        if min(latent_dim, num_mean_slices, num_dynamic_frames, embedding_dim) <= 0 or epsilon <= 0: raise ValueError("positive uncertainty dimensions required")
+        self.embeddings = nn.ModuleDict({name: nn.Embedding(size, embedding_dim) for name, size in zip(self._NAMESPACES, (num_mean_slices, num_dynamic_frames))})
+        self.log_variances = nn.ModuleDict({name: nn.Embedding(size, 1) for name, size in zip(self._NAMESPACES, (num_mean_slices, num_dynamic_frames))})
+        self.pixel_head = nn.Sequential(nn.Linear(latent_dim + embedding_dim, latent_dim), nn.ReLU(), nn.Linear(latent_dim, 1)); self.epsilon = epsilon
+
+    def forward(self, latent_samples: torch.Tensor, observation_ids: torch.Tensor, weights: torch.Tensor, *, namespace: str, enabled: bool) -> dict[str, torch.Tensor]:
+        if namespace not in self._NAMESPACES: raise ValueError(f"namespace must be one of {self._NAMESPACES}")
+        if latent_samples.ndim != 5 or observation_ids.shape != (latent_samples.shape[0],) or weights.shape != (latent_samples.shape[1],): raise ValueError("latent [B,S,H,W,D], IDs [B], and sample weights [S] required")
+        batch, samples, height, width, _ = latent_samples.shape
+        if not enabled:
+            one = latent_samples.new_ones((batch, height, width)); return {"pixel_variance": one, "observation_variance": one[:, :1, :1], "total_variance": one, "enabled": False}
+        emb = self.embeddings[namespace](observation_ids)[:,None,None,None,:].expand(batch,samples,height,width,-1)
+        pixel = F.softplus(self.pixel_head(torch.cat((latent_samples,emb),-1)).squeeze(-1))+self.epsilon
+        pixel = (pixel*weights[None,:,None,None]).sum(1)
+        observation = F.softplus(self.log_variances[namespace](observation_ids)).view(batch,1,1)+self.epsilon
+        return {"pixel_variance":pixel,"observation_variance":observation,"total_variance":pixel+observation,"enabled":True}
