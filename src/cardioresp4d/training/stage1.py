@@ -17,6 +17,7 @@ from cardioresp4d.models.uncertainty import NamespacedObservationUncertainty
 from cardioresp4d.reference.build_mean_slices import build_mean_slices
 from cardioresp4d.rendering.psf_renderer import AnisotropicPSFRenderer
 from cardioresp4d.losses.stage_aware import gaussian_nll, masked_reference_mse
+from cardioresp4d.training.sampling import BalancedViewEpochSampler,pixel_indices_to_world,roi_pixel_pool,sample_pixels
 LPS_FROM_RAS=torch.tensor([-1.,-1.,1.])
 
 def resolve_device(requested:str)->torch.device:
@@ -69,6 +70,94 @@ def train_stage1b(stage1a_checkpoint:Path, mean_manifest:Path, canonical_domain:
         view=('SAX','2CH','4CH')[step%3]; row=by_view[view][(step//3)%len(by_view[view])]; target,geo=_mean_observation(root,row,patch); out=renderer(model,**geo); variance=uncertainty(out['latent_samples'],torch.tensor([observation_ids[row['mean_slice_id']]]),out['psf_weights'],namespace='mean_slice',enabled=not warmup)['total_variance']; loss=((out['predicted_slice'].squeeze(1)-target).square().mean() if warmup else gaussian_nll(out['predicted_slice'].squeeze(1),target,variance)); opt.zero_grad(); loss.backward(); opt.step(); losses.append(float(loss.detach())); per_view[view]['mse' if warmup else 'nll'].append(float(loss.detach()))
     checkpoint=output/'stage1b.pt'; _save_checkpoint(checkpoint,model,stage='1B',warmup_steps=warmup_steps,nll_steps=nll_steps,losses=losses,uncertainty_state=uncertainty.state_dict()); volume=_export_canonical(model,canonical_domain,output/'stage1b_canonical.nii.gz'); _difference(output/'stage1a_canonical.nii.gz' if (output/'stage1a_canonical.nii.gz').is_file() else None,volume,output/'stage1a_vs_stage1b_difference.nii.gz'); metrics=_qc_views(model,renderer,uncertainty,root,by_view,observation_ids,patch,output); missing={'hard_invalid_mean_observations':'recorded by exclusion summary','canonical_domain_unchanged':True,'canonical_query_finite':bool(np.isfinite(np.asanyarray(nib.load(str(volume)).dataobj)).all())}; (output/'missing_slice_through_plane_qc.json').write_text(json.dumps(missing,indent=2)); (output/'stage1b_curve.csv').write_text('step,loss\n'+'\n'.join(f'{i},{x}' for i,x in enumerate(losses))+'\n'); report={'stage':'1B','steps':len(schedule),'seconds':time.perf_counter()-started,'loss_first':losses[0],'loss_last':losses[-1],'per_view_batch_count':{v:sum(len(x) for x in per_view[v].values()) for v in per_view},'per_view_train_loss':{v:{phase:{'first':x[0],'last':x[-1]} for phase,x in per_view[v].items() if x} for v in per_view},'checkpoint':str(checkpoint),'volume':str(volume),'initial_metrics':initial_metrics,'metrics':metrics,'missing_slice_qc':missing}; (output/'stage1b_metrics.json').write_text(json.dumps(report,indent=2)); return report
 
+def train_stage1b_balanced(
+    stage1a_checkpoint, mean_manifest, canonical_domain, output, *,
+    epochs=30, pixels_per_view=2048, margin_mm=15.0, roi_fraction=0.8,
+    lr=1e-3, seed=0, device='auto', uncertainty_mode='off',
+):
+    """Run no-motion Stage-1B with one sampled observation from every view per step.
+
+    The Stage-1B production path intentionally keeps uncertainty disabled.  The
+    calibrated variance refinement belongs to the deferred next Stage-1 work.
+    """
+    if uncertainty_mode != 'off':
+        raise NotImplementedError('Stage1B calibrated uncertainty is deferred; use uncertainty_mode=off')
+    with Path(mean_manifest).open(newline='') as file:
+        rows = list(csv.DictReader(file))
+    root = Path(mean_manifest).parent
+    by_view = {view: [row for row in rows if row['view'] == view] for view in ('SAX', '2CH', '4CH')}
+    if any(not observations for observations in by_view.values()):
+        raise ValueError('Stage1B requires at least one valid temporal-mean observation from each view')
+    sampler = BalancedViewEpochSampler(by_view, seed)
+    domain_payload = json.loads(Path(canonical_domain).read_text())
+    box = domain_payload['cardiac_box']
+    box_center = np.asarray(box['center_mm'])
+    box_size = np.asarray(box['size_mm'])
+    lower, upper = box_center - box_size / 2, box_center + box_size / 2
+    dev = resolve_device(device)
+    stage1a_payload = torch.load(stage1a_checkpoint, map_location='cpu', weights_only=True)
+    model = _load_checkpoint(Path(stage1a_checkpoint)).to(dev)
+    renderer = AnisotropicPSFRenderer(_load_domain(Path(canonical_domain))).to(dev)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    curve, visits = [], {view: 0 for view in by_view}
+    no_roi_intersection = 0
+    generator = torch.Generator().manual_seed(seed)
+    for epoch in range(epochs):
+        losses = {view: [] for view in by_view}
+        for batch in sampler.epoch(epoch):
+            optimizer.zero_grad()
+            total_loss = 0.0
+            for view, row in batch.items():
+                image = np.load(root / row['image_file'])
+                geometry = json.loads(row['geometry_json'])
+                pool = roi_pixel_pool(geometry, lower, upper, margin_mm)
+                pixel_rows, pixel_columns, _ = sample_pixels(pool, pixels_per_view, roi_fraction, generator)
+                no_roi_intersection += not pool['intersects_roi']
+                world = torch.tensor(pixel_indices_to_world(pixel_rows, pixel_columns, geometry), dtype=torch.float32, device=dev)
+                orientation = np.asarray(geometry['image_orientation_patient'])
+                row_direction = torch.tensor(orientation[:3], dtype=torch.float32, device=dev)
+                column_direction = torch.tensor(orientation[3:], dtype=torch.float32, device=dev)
+                rendered = renderer.render_pixel_centers(
+                    model,
+                    pixel_centers_mm=world,
+                    row_direction=row_direction,
+                    column_direction=column_direction,
+                    normal=torch.linalg.cross(row_direction, column_direction),
+                    pixel_spacing_mm=torch.tensor(geometry['pixel_spacing'], dtype=torch.float32, device=dev),
+                    thickness_mm=torch.tensor(float(geometry['slice_thickness']), dtype=torch.float32, device=dev),
+                )
+                target = torch.tensor(image[pixel_rows, pixel_columns], dtype=torch.float32, device=dev)
+                loss = (rendered['predicted'] - target).square().mean()
+                total_loss = total_loss + loss / 3.0
+                losses[view].append(float(loss.detach()))
+                visits[view] += 1
+            total_loss.backward()
+            optimizer.step()
+        curve.append({
+            'epoch': int(epoch),
+            'total_mse': float(sum(np.mean(losses[view]) for view in by_view) / 3),
+            **{f'{view.lower()}_mse': float(np.mean(losses[view])) for view in by_view},
+        })
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    checkpoint = output / 'stage1b.pt'
+    _save_checkpoint(
+        checkpoint, model, model_config=stage1a_payload['model_config'], stage='1B',
+        stage1b_epochs=epochs, pixels_per_view=pixels_per_view, roi_margin_mm=margin_mm,
+        roi_fraction=roi_fraction, uncertainty_mode=uncertainty_mode,
+        steps_per_epoch=sampler.steps_per_epoch,
+        n_mean_slices_per_view={view: len(observations) for view, observations in by_view.items()},
+        visits=visits, curve=curve,
+    )
+    with (output / 'stage1b_curve.csv').open('w', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=curve[0].keys())
+        writer.writeheader()
+        writer.writerows(curve)
+    return {
+        'checkpoint': str(checkpoint), 'steps_per_epoch': sampler.steps_per_epoch,
+        'visits': visits, 'no_roi_intersection': no_roi_intersection,
+    }
+
 def _mean_observation(root:Path,row:dict,patch:int)->tuple[torch.Tensor,dict]:
     image=np.load(root/row['image_file']); r0=image.shape[0]//2-patch//2; c0=image.shape[1]//2-patch//2; target=torch.tensor(image[r0:r0+patch,c0:c0+patch])[None]; g=json.loads(row['geometry_json']); origin=np.asarray(g['image_position_patient']); orient=np.asarray(g['image_orientation_patient']); spacing=np.asarray(g['pixel_spacing']); center=origin+((g['columns']-1)/2)*spacing[1]*orient[:3]+((g['rows']-1)/2)*spacing[0]*orient[3:]; rowd=torch.tensor(orient[:3])[None].float(); cold=torch.tensor(orient[3:])[None].float(); normal=torch.linalg.cross(rowd,cold); return target,{'center_mm':torch.tensor(center)[None].float(),'row_direction':rowd,'column_direction':cold,'normal':normal,'pixel_spacing_mm':torch.tensor(spacing)[None].float(),'thickness_mm':torch.tensor([float(g['slice_thickness'])]),'height':patch,'width':patch}
 
@@ -92,5 +181,5 @@ def _plot_qc(target,pred,path):
     f.tight_layout(); f.savefig(path,dpi=120); plt.close(f)
 
 def main()->None:
-    p=argparse.ArgumentParser(description='Run Stage 1 no-motion Canonical INR.'); p.add_argument('--initial-reference',type=Path,required=True);p.add_argument('--initial-reference-valid-mask',type=Path);p.add_argument('--canonical-domain',type=Path,required=True);p.add_argument('--manifest',type=Path,required=True);p.add_argument('--qc-table',type=Path);p.add_argument('--output-dir',type=Path,required=True);p.add_argument('--profile',choices=('smoke','production'),default='production');p.add_argument('--device',choices=('auto','cpu','cuda'),default='auto');p.add_argument('--stage1a-steps',type=int,default=1000);p.add_argument('--stage1a-batch-size',type=int,default=8192);p.add_argument('--stage1a-lr',type=float,default=2e-3);p.add_argument('--coarsest-resolution-mm',type=float,default=16.);p.add_argument('--finest-resolution-mm',type=float,default=1.5);p.add_argument('--level-scale',type=float,default=1.38);p.add_argument('--features-per-level',type=int,default=2);p.add_argument('--log2-hashmap-size',type=int,default=19);p.add_argument('--hidden-dim',type=int,default=64);p.add_argument('--latent-dim',type=int,default=32);p.add_argument('--seed',type=int,default=0);args=p.parse_args();kw={k:getattr(args,k) for k in ('coarsest_resolution_mm','finest_resolution_mm','level_scale','features_per_level','log2_hashmap_size','hidden_dim','latent_dim')}; a=train_stage1a(args.initial_reference,args.initial_reference_valid_mask,args.canonical_domain,args.output_dir,steps=args.stage1a_steps,batch_size=args.stage1a_batch_size,lr=args.stage1a_lr,profile=args.profile,device=args.device,seed=args.seed,**kw); print(json.dumps(a,indent=2))
+    p=argparse.ArgumentParser(description='Run Stage 1 no-motion Canonical INR.'); p.add_argument('--initial-reference',type=Path,required=True);p.add_argument('--initial-reference-valid-mask',type=Path);p.add_argument('--canonical-domain',type=Path,required=True);p.add_argument('--manifest',type=Path,required=True);p.add_argument('--qc-table',type=Path);p.add_argument('--output-dir',type=Path,required=True);p.add_argument('--profile',choices=('smoke','production'),default='production');p.add_argument('--device',choices=('auto','cpu','cuda'),default='auto');p.add_argument('--stage1a-steps',type=int,default=1000);p.add_argument('--stage1a-batch-size',type=int,default=8192);p.add_argument('--stage1a-lr',type=float,default=2e-3);p.add_argument('--stage1b-epochs',type=int,default=30);p.add_argument('--pixels-per-view',type=int,default=2048);p.add_argument('--cardiac-roi-margin-mm',type=float,default=15.);p.add_argument('--roi-sampling-fraction',type=float,default=.8);p.add_argument('--stage1b-lr',type=float,default=1e-3);p.add_argument('--uncertainty-mode',choices=('off','calibrated'),default='off');p.add_argument('--coarsest-resolution-mm',type=float,default=16.);p.add_argument('--finest-resolution-mm',type=float,default=1.5);p.add_argument('--level-scale',type=float,default=1.38);p.add_argument('--features-per-level',type=int,default=2);p.add_argument('--log2-hashmap-size',type=int,default=19);p.add_argument('--hidden-dim',type=int,default=64);p.add_argument('--latent-dim',type=int,default=32);p.add_argument('--seed',type=int,default=0);args=p.parse_args();kw={k:getattr(args,k) for k in ('coarsest_resolution_mm','finest_resolution_mm','level_scale','features_per_level','log2_hashmap_size','hidden_dim','latent_dim')}; a=train_stage1a(args.initial_reference,args.initial_reference_valid_mask,args.canonical_domain,args.output_dir,steps=args.stage1a_steps,batch_size=args.stage1a_batch_size,lr=args.stage1a_lr,profile=args.profile,device=args.device,seed=args.seed,**kw); mean=build_mean_slices(args.manifest,args.output_dir/'reference',qc_table_path=args.qc_table); b=train_stage1b_balanced(a['checkpoint'],mean,args.canonical_domain,args.output_dir,epochs=args.stage1b_epochs,pixels_per_view=args.pixels_per_view,margin_mm=args.cardiac_roi_margin_mm,roi_fraction=args.roi_sampling_fraction,lr=args.stage1b_lr,seed=args.seed,device=args.device,uncertainty_mode=args.uncertainty_mode); print(json.dumps({'stage1a':a,'stage1b':b},indent=2))
 if __name__=='__main__': main()
