@@ -1,0 +1,8 @@
+{
+  "hostname": "universe",
+  "pwd": "/home/universe/SVR/code/CR_DREME_v1",
+  "python": "/home/universe/anaconda3/envs/knesvr_torch/bin/python",
+  "torch": "2.5.1",
+  "cuda_available": false,
+  "gpu": "none"
+}
