@@ -37,6 +37,34 @@ FIELDS = (
 
 
 class InitialReferenceTest(unittest.TestCase):
+    def test_whole_hard_invalid_sax_location_is_finite_masked_supervision_hole(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "manifest.csv"
+            layers = tuple(
+                (f"SAX_{index + 1}", float(index * 10), np.full((2, 3), index + 1, dtype=np.uint16))
+                for index in range(5)
+            )
+            _write_manifest(manifest, root / "dicom", layers)
+            _write_qc_table(manifest, root / "acquisition_qc" / "acquisition_qc.csv", invalid_slice_id="SAX_3")
+
+            reference_path, metadata_path, _ = build_initial_reference(manifest, root / "reference")
+            reference = nib.load(reference_path)
+            mask = nib.load(root / "reference" / "initial_reference_valid_mask.nii.gz")
+            values = np.asanyarray(reference.dataobj)
+            mask_values = np.asanyarray(mask.dataobj)
+            self.assertEqual((3, 2, 5), reference.shape)
+            np.testing.assert_allclose(reference.affine[:3, 2], [0.0, 0.0, 10.0])
+            np.testing.assert_allclose(mask.affine, reference.affine)
+            self.assertTrue(np.isfinite(values).all())
+            self.assertTrue(np.all(mask_values[:, :, 2] == 0))
+            self.assertTrue(np.all(mask_values[:, :, [0, 1, 3, 4]] == 1))
+            metadata = json.loads(metadata_path.read_text())
+            self.assertEqual(["SAX_3"], metadata["missing_slice_ids"])
+            self.assertEqual(1, metadata["missing_slice_count"])
+            self.assertEqual("mask_zero_means_no_stage1a_reference_supervision", metadata["supervision_contract"])
+            self.assertIn("linear", metadata["placeholder_method"])
+
     def test_temporal_means_are_transposed_and_sorted_by_physical_position(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -70,6 +98,10 @@ class InitialReferenceTest(unittest.TestCase):
             self.assertEqual("IPP centre-to-centre spacing for stack/world geometry",
                              metadata["stack_slice_spacing_semantics"])
             self.assertIn("thick-slice renderer", metadata["acquisition_slice_thickness_semantics"])
+            mask = nib.load(root / "reference" / "initial_reference_valid_mask.nii.gz")
+            self.assertEqual(volume.shape, mask.shape)
+            self.assertTrue(np.all(np.asanyarray(mask.dataobj) == 1))
+            self.assertEqual([], metadata["missing_slice_ids"])
 
     def test_affines_use_dicom_column_row_steps_and_explicit_lps_to_ras(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -206,6 +238,18 @@ def _write_dicom(path: Path, pixels: np.ndarray, origin: list[float], orientatio
     dataset.PixelRepresentation = 0
     dataset.PixelData = pixels.astype(np.uint16).tobytes()
     dataset.save_as(path, write_like_original=False)
+
+
+def _write_qc_table(manifest: Path, path: Path, *, invalid_slice_id: str) -> None:
+    with manifest.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("view", "slice_id", "frame_index", "qc_valid", "qc_reason"))
+        writer.writeheader()
+        for row in rows:
+            invalid = row["slice_id"] == invalid_slice_id
+            writer.writerow({"view": row["view"], "slice_id": row["slice_id"], "frame_index": row["frame_index"], "qc_valid": "0" if invalid else "1", "qc_reason": "manual_exclusion" if invalid else "not_evaluated"})
 
 
 if __name__ == "__main__":
