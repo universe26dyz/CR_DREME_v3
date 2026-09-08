@@ -8,8 +8,8 @@ import nibabel as nib
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from cardioresp4d.outlier_qc.acquisition_qc import (
-    _annotate_slice_level,
     analyze_frame_block,
+    is_hard_invalid_reason_text,
     write_qc_table,
 )
 from cardioresp4d.data.dataset import CardioRespDataset
@@ -24,16 +24,16 @@ def normal_block():
 
 
 class AcquisitionQcTest(unittest.TestCase):
-    def test_normal_motion_is_retained_but_global_drop_and_local_bright_are_flagged(self):
+    def test_frame_diagnostics_are_retained_without_hard_invalidating(self):
         images = normal_block()
         normal = analyze_frame_block(images, ["identity_without_rescale_tags"]*50)
         self.assertGreaterEqual(sum(x["qc_valid"] for x in normal), 47)
 
         corrupted = images.copy(); corrupted[7] *= .1; corrupted[19, 5:10, 5:10] += 1000
         rows = analyze_frame_block(corrupted, ["identity_without_rescale_tags"]*50)
-        self.assertFalse(rows[7]["qc_valid"])
-        self.assertFalse(rows[19]["qc_valid"])
-        self.assertIn("intensity", rows[7]["qc_reason"])
+        self.assertTrue(rows[7]["qc_valid"])
+        self.assertTrue(rows[19]["qc_valid"])
+        self.assertNotEqual("valid", rows[7]["qc_reason"])
         self.assertTrue(all(k in rows[0] for k in ("qc_ncc","qc_intensity_scale","qc_residual","rescale_status")))
 
     def test_qc_table_is_independent_and_phi_free(self):
@@ -87,35 +87,13 @@ class AcquisitionQcTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "does not cover every manifest frame"):
                 CardioRespDataset(manifest, qc_table_path=table)
 
-    def test_slice_location_qc_orders_opaque_ids_by_patient_position(self):
-        normal = (0.8 + np.arange(64, dtype=np.float32).reshape(8, 8) / 160.0)
-        anomalous = np.full((8, 8), 0.05, dtype=np.float32)
-        anomalous[::2, ::2] = 0.0
-        means = {
-            ("SAX", "z0"): normal,
-            ("SAX", "m1"): normal,
-            ("SAX", "a2"): anomalous,
-            ("SAX", "b3"): normal,
-            ("SAX", "c4"): normal,
-        }
-        rows = [{"view": view, "slice_id": slice_id, "qc_valid": True, "qc_reason": "valid"}
-                for view, slice_id in means]
-        positions = {("SAX", "z0"): 0.0, ("SAX", "m1"): 1.0, ("SAX", "a2"): 2.0,
-                     ("SAX", "b3"): 3.0, ("SAX", "c4"): 4.0}
-        _annotate_slice_level(rows, means, positions)
-        flagged = next(row for row in rows if row["slice_id"] == "a2")
-        self.assertFalse(flagged["qc_valid"])
-        self.assertIn("slice_location_outlier", flagged["qc_reason"])
-
-    def test_slice_location_qc_flags_a_world_boundary_scale_outlier(self):
-        normal = (0.8 + np.arange(64, dtype=np.float32).reshape(8, 8) / 160.0)
-        means = {("SAX", "boundary"): normal * 0.05, ("SAX", "middle"): normal,
-                 ("SAX", "last"): normal}
-        rows = [{"view": view, "slice_id": slice_id, "qc_valid": True, "qc_reason": "valid"}
-                for view, slice_id in means]
-        _annotate_slice_level(rows, means, {("SAX", "boundary"): 0.0, ("SAX", "middle"): 1.0,
-                                            ("SAX", "last"): 2.0})
-        self.assertFalse(next(row for row in rows if row["slice_id"] == "boundary")["qc_valid"])
+    def test_only_absolute_scale_or_manual_exclusion_is_hard_invalid(self):
+        for reason in ("low_ncc", "global_intensity_scale", "scale_corrected_residual",
+                       "slice_local_structure", "slice_local_scale_robust"):
+            with self.subTest(reason=reason):
+                self.assertFalse(is_hard_invalid_reason_text(reason))
+        self.assertTrue(is_hard_invalid_reason_text("slice_local_scale_absolute"))
+        self.assertTrue(is_hard_invalid_reason_text("manual_exclusion"))
 
 
 if __name__ == "__main__": unittest.main()

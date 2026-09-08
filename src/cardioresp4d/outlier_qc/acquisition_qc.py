@@ -98,6 +98,13 @@ INVALID_REASON_WHITELIST = frozenset({
 })
 
 
+def is_hard_invalid_reason_text(reason_text: str | None) -> bool:
+    """Return whether a semicolon-delimited QC reason triggers hard exclusion."""
+    if reason_text in (None, "", "valid"):
+        return False
+    return any(reason in INVALID_REASON_WHITELIST for reason in str(reason_text).split(";"))
+
+
 # -----------------------------------------------------------------------------
 # 输出 schema
 # -----------------------------------------------------------------------------
@@ -255,7 +262,7 @@ def analyze_frame_block(
 
         output.append(
             {
-                "qc_valid": not reasons,
+                "qc_valid": not is_hard_invalid_reason_text(";".join(reasons)),
                 "qc_reason": "valid" if not reasons else ";".join(reasons),
                 "qc_ncc": ncc,
                 "qc_intensity_scale": scale,
@@ -1059,9 +1066,7 @@ def run_acquisition_qc(
         parts = (
             [] if reason_text in ("", "valid", None) else reason_text.split(";")
         )
-        row["qc_valid"] = not any(
-            p in INVALID_REASON_WHITELIST for p in parts
-        )
+        row["qc_valid"] = not is_hard_invalid_reason_text(reason_text)
 
     # slice-level 同理：根据白名单重算 slice_qc_valid。
     for row in slice_rows:
@@ -1069,9 +1074,7 @@ def run_acquisition_qc(
         parts = (
             [] if reason_text in ("", "valid", None) else reason_text.split(";")
         )
-        row["slice_qc_valid"] = not any(
-            p in INVALID_REASON_WHITELIST for p in parts
-        )
+        row["slice_qc_valid"] = not is_hard_invalid_reason_text(reason_text)
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
