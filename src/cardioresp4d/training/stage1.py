@@ -12,33 +12,46 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import torch
-from cardioresp4d.models.hash_inr import CanonicalINR
+from cardioresp4d.models.hash_inr import CanonicalINR, PhysicalHashConfig
 from cardioresp4d.models.uncertainty import NamespacedObservationUncertainty
 from cardioresp4d.reference.build_mean_slices import build_mean_slices
 from cardioresp4d.rendering.psf_renderer import AnisotropicPSFRenderer
 from cardioresp4d.losses.stage_aware import gaussian_nll, masked_reference_mse
 LPS_FROM_RAS=torch.tensor([-1.,-1.,1.])
 
-def _model() -> CanonicalINR: return CanonicalINR(levels=4,features_per_level=2,hash_size=512,min_resolution=8,max_resolution=32,hidden_dim=32,latent_dim=12)
+def resolve_device(requested:str)->torch.device:
+    if requested=='cuda' and not torch.cuda.is_available(): raise RuntimeError('device=cuda was requested but CUDA is unavailable')
+    return torch.device('cuda' if requested=='auto' and torch.cuda.is_available() else ('cpu' if requested=='auto' else requested))
+def model_config(domain:Path,profile:str='production',**overrides)->dict:
+    extent=(np.asarray(json.loads(domain.read_text())['world_max_mm'])-np.asarray(json.loads(domain.read_text())['world_min_mm'])).tolist()
+    if profile=='smoke': return {'profile':'smoke','levels':4,'features_per_level':2,'hash_size':512,'min_resolution':8,'max_resolution':32,'hidden_dim':32,'latent_dim':12,'canonical_world_extent_mm':extent}
+    if profile!='production': raise ValueError('profile must be smoke or production')
+    physical=PhysicalHashConfig(**{k:v for k,v in overrides.items() if k in PhysicalHashConfig.__dataclass_fields__}).derive(extent); return {'profile':'production',**physical}
+def _model(config:dict|None=None) -> CanonicalINR:
+    config=config or {'profile':'smoke','levels':4,'features_per_level':2,'hash_size':512,'min_resolution':8,'max_resolution':32,'hidden_dim':32,'latent_dim':12}
+    if config['profile']=='smoke': return CanonicalINR(**{k:config[k] for k in ('levels','features_per_level','hash_size','min_resolution','max_resolution','hidden_dim','latent_dim')})
+    return CanonicalINR(features_per_level=config['features_per_level'],hash_size=config['hash_size'],hidden_dim=config['hidden_dim'],latent_dim=config['latent_dim'],resolutions=config['grid_resolutions'])
 def _load_domain(path:Path) -> torch.Tensor: return torch.tensor(json.loads(path.read_text())['world_to_normalized'],dtype=torch.float32)
 def _to_norm_lps(ras:torch.Tensor,w2n:torch.Tensor)->torch.Tensor:
     lps=ras*LPS_FROM_RAS.to(ras); return torch.einsum('ij,...j->...i',w2n,torch.cat((lps,torch.ones((*lps.shape[:-1],1),device=ras.device)), -1))[...,:3]
-def _save_checkpoint(path:Path,model:CanonicalINR,**payload:object)->None: torch.save({'model':model.state_dict(),**payload},path)
+def _save_checkpoint(path:Path,model:CanonicalINR,**payload:object)->None: torch.save({'model_state':model.state_dict(),'model_config':payload.pop('model_config',model.config),**payload},path)
 def _load_checkpoint(path:Path)->CanonicalINR:
-    model=_model(); model.load_state_dict(torch.load(path,map_location='cpu',weights_only=True)['model']); return model
+    payload=torch.load(path,map_location='cpu',weights_only=True)
+    if 'model_config' not in payload: raise ValueError('legacy checkpoint has no model_config')
+    model=_model(payload['model_config']); model.load_state_dict(payload['model_state']); return model
 
-def train_stage1a(initial_reference:Path, valid_mask:Path|None, canonical_domain:Path, output:Path, *, steps:int=24, batch_size:int=2048, lr:float=2e-3)->dict:
+def train_stage1a(initial_reference:Path, valid_mask:Path|None, canonical_domain:Path, output:Path, *, steps:int=24, batch_size:int=2048, lr:float=2e-3, profile:str='smoke', device:str='auto', seed:int=0, **kwargs)->dict:
     started=time.perf_counter(); output.mkdir(parents=True,exist_ok=True); image=nib.load(str(initial_reference)); volume=np.asanyarray(image.dataobj).astype(np.float32)
     if valid_mask is None or not valid_mask.is_file():
         mask=np.isfinite(volume).astype(np.float32); valid_mask=output/'initial_reference_valid_mask.nii.gz'; nib.save(nib.Nifti1Image(mask,image.affine),str(valid_mask)); mask_source='derived_all_finite_existing_reference'
     else: mask=np.asanyarray(nib.load(str(valid_mask)).dataobj).astype(np.float32); mask_source='provided'
     if volume.shape!=mask.shape: raise ValueError('initial-reference and valid-mask shapes differ')
     indices=np.argwhere(mask>0); assert len(indices)>0
-    affine=torch.tensor(image.affine,dtype=torch.float32); w2n=_load_domain(canonical_domain); model=_model(); opt=torch.optim.Adam(model.parameters(),lr=lr); losses=[]
-    target=torch.tensor(volume); generator=torch.Generator().manual_seed(0)
+    dev=resolve_device(device); cfg=model_config(canonical_domain,profile,**kwargs); affine=torch.tensor(image.affine,dtype=torch.float32,device=dev); w2n=_load_domain(canonical_domain).to(dev); model=_model(cfg).to(dev); opt=torch.optim.Adam(model.parameters(),lr=lr); losses=[]
+    target=torch.tensor(volume,device=dev); generator=torch.Generator().manual_seed(seed)
     for _ in range(steps):
-        pick=indices[torch.randint(len(indices),(min(batch_size,len(indices)),),generator=generator).numpy()]; vox=torch.tensor(pick,dtype=torch.float32); ras=torch.cat((vox,torch.ones(len(vox),1)),1)@affine.T; pred=model(_to_norm_lps(ras[:,:3],w2n)).squeeze(-1); observed=target[pick[:,0],pick[:,1],pick[:,2]]; loss=masked_reference_mse(pred,observed,torch.ones_like(observed)); opt.zero_grad(); loss.backward(); opt.step(); losses.append(float(loss.detach()))
-    checkpoint=output/'stage1a.pt'; _save_checkpoint(checkpoint,model,stage='1A',steps=steps,losses=losses,mask_path=str(valid_mask)); volume_path=_export_canonical(model,canonical_domain,output/'stage1a_canonical.nii.gz'); report={'stage':'1A','steps':steps,'seconds':time.perf_counter()-started,'loss_first':losses[0],'loss_last':losses[-1],'checkpoint':str(checkpoint),'volume':str(volume_path),'valid_mask':str(valid_mask),'valid_mask_source':mask_source}; (output/'stage1a_metrics.json').write_text(json.dumps(report,indent=2)); return report
+        pick=indices[torch.randint(len(indices),(min(batch_size,len(indices)),),generator=generator).numpy()]; vox=torch.tensor(pick,dtype=torch.float32,device=dev); ras=torch.cat((vox,torch.ones(len(vox),1,device=dev)),1)@affine.T; pred=model(_to_norm_lps(ras[:,:3],w2n)).squeeze(-1); observed=target[pick[:,0],pick[:,1],pick[:,2]]; loss=masked_reference_mse(pred,observed,torch.ones_like(observed)); opt.zero_grad(); loss.backward(); opt.step(); losses.append(float(loss.detach()))
+    checkpoint=output/'stage1a.pt'; _save_checkpoint(checkpoint,model,stage='1A',steps=steps,losses=losses,mask_path=str(valid_mask),model_config=cfg); report={'stage':'1A','steps':steps,'seconds':time.perf_counter()-started,'loss_first':losses[0],'loss_last':losses[-1],'checkpoint':str(checkpoint),'model_config':cfg}; (output/'stage1a_metrics.json').write_text(json.dumps(report,indent=2)); return report
 
 def _export_canonical(model:CanonicalINR,domain:Path,path:Path,size:int=64)->Path:
     payload=json.loads(domain.read_text()); lower=np.asarray(payload['world_min_mm']); upper=np.asarray(payload['world_max_mm']); axes=[np.linspace(lower[i],upper[i],size,dtype=np.float32) for i in range(3)]; grid=np.stack(np.meshgrid(*axes,indexing='ij'),-1).reshape(-1,3); w2n=torch.tensor(payload['world_to_normalized'],dtype=torch.float32); values=[]
@@ -79,5 +92,5 @@ def _plot_qc(target,pred,path):
     f.tight_layout(); f.savefig(path,dpi=120); plt.close(f)
 
 def main()->None:
-    p=argparse.ArgumentParser(description='Run short Stage 1A/1B no-motion Canonical INR validation.'); p.add_argument('--initial-reference',type=Path,required=True);p.add_argument('--initial-reference-valid-mask',type=Path);p.add_argument('--canonical-domain',type=Path,required=True);p.add_argument('--manifest',type=Path,required=True);p.add_argument('--qc-table',type=Path);p.add_argument('--output-dir',type=Path,required=True);p.add_argument('--stage1a-steps',type=int,default=24);p.add_argument('--stage1b-warmup-steps',type=int,default=6);p.add_argument('--stage1b-nll-steps',type=int,default=6);args=p.parse_args();a=train_stage1a(args.initial_reference,args.initial_reference_valid_mask,args.canonical_domain,args.output_dir,steps=args.stage1a_steps); mean=build_mean_slices(args.manifest,args.output_dir/'reference',qc_table_path=args.qc_table); b=train_stage1b(Path(a['checkpoint']),mean,args.canonical_domain,args.output_dir,warmup_steps=args.stage1b_warmup_steps,nll_steps=args.stage1b_nll_steps); print(json.dumps({'stage1a':a,'stage1b':b},indent=2))
+    p=argparse.ArgumentParser(description='Run Stage 1 no-motion Canonical INR.'); p.add_argument('--initial-reference',type=Path,required=True);p.add_argument('--initial-reference-valid-mask',type=Path);p.add_argument('--canonical-domain',type=Path,required=True);p.add_argument('--manifest',type=Path,required=True);p.add_argument('--qc-table',type=Path);p.add_argument('--output-dir',type=Path,required=True);p.add_argument('--profile',choices=('smoke','production'),default='production');p.add_argument('--device',choices=('auto','cpu','cuda'),default='auto');p.add_argument('--stage1a-steps',type=int,default=1000);p.add_argument('--stage1a-batch-size',type=int,default=8192);p.add_argument('--stage1a-lr',type=float,default=2e-3);p.add_argument('--coarsest-resolution-mm',type=float,default=16.);p.add_argument('--finest-resolution-mm',type=float,default=1.5);p.add_argument('--level-scale',type=float,default=1.38);p.add_argument('--features-per-level',type=int,default=2);p.add_argument('--log2-hashmap-size',type=int,default=19);p.add_argument('--hidden-dim',type=int,default=64);p.add_argument('--latent-dim',type=int,default=32);p.add_argument('--seed',type=int,default=0);args=p.parse_args();kw={k:getattr(args,k) for k in ('coarsest_resolution_mm','finest_resolution_mm','level_scale','features_per_level','log2_hashmap_size','hidden_dim','latent_dim')}; a=train_stage1a(args.initial_reference,args.initial_reference_valid_mask,args.canonical_domain,args.output_dir,steps=args.stage1a_steps,batch_size=args.stage1a_batch_size,lr=args.stage1a_lr,profile=args.profile,device=args.device,seed=args.seed,**kw); print(json.dumps(a,indent=2))
 if __name__=='__main__': main()
