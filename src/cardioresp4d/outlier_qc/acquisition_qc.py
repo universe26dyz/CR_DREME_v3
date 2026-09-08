@@ -84,7 +84,7 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
-from cardioresp4d.data.dataset import CardioRespDataset
+from cardioresp4d.data.dataset import CardioRespDataset, validate_qc_table_coverage
 
 
 # -----------------------------------------------------------------------------
@@ -454,6 +454,42 @@ def _prepare_manual_matches(
         )
 
     return matches
+
+
+def apply_manual_exclusions(
+    manifest_path: str | Path,
+    existing_qc_table: str | Path,
+    output_dir: str | Path,
+    *,
+    manual_exclude: Sequence[str] | None = None,
+    manual_exclude_file: str | Path | None = None,
+) -> tuple[Path, Path]:
+    """Propagate formal manual exclusions without rerunning automatic QC.
+
+    This is intentionally narrower than :func:`run_acquisition_qc`: it first
+    requires an existing complete table, resolves selectors against original
+    manifest IDs/runtime paths, and changes only matched rows by appending the
+    hard-whitelisted ``manual_exclusion`` reason.
+    """
+    manifest_path, existing_qc_table, output_dir = Path(manifest_path), Path(existing_qc_table), Path(output_dir)
+    validate_qc_table_coverage(manifest_path, existing_qc_table)
+    dataset = CardioRespDataset(manifest_path, valid_only=False, use_qc=False)
+    selectors = load_manual_exclusions(manual_exclude, manual_exclude_file)
+    matches = _prepare_manual_matches(dataset, selectors)
+    with existing_qc_table.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle)); fields = list(rows[0])
+    token_mode = "source_file_token" in dataset._rows[0]
+    by_key = {(row.get("source_file_token", ""),) if token_mode else (row["view"], row["slice_id"], row["frame_index"]): row for row in rows}
+    changed = 0
+    for index, matched in matches.items():
+        if not matched: continue
+        source = dataset._rows[index]; key = (source.get("source_file_token", ""),) if token_mode else (source["view"], source["slice_id"], source["frame_index"])
+        row = by_key[key]; row["qc_valid"] = "False"; row["qc_reason"] = _append_reason(str(row.get("qc_reason", "valid")), "manual_exclusion"); changed += 1
+    output_dir.mkdir(parents=True, exist_ok=True); table = output_dir / "acquisition_qc.csv"
+    with table.open("w", newline="", encoding="utf-8") as handle: writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader(); writer.writerows(rows)
+    summary = output_dir / "manual_exclusion_summary.json"
+    summary.write_text(json.dumps({"selectors": selectors, "matched_frames": changed, "total_frames": len(rows), "method": "formal_manual_exclusion_propagation_without_automatic_qc_rerun"}, indent=2) + "\n", encoding="utf-8")
+    return table, summary
 
 
 # -----------------------------------------------------------------------------
