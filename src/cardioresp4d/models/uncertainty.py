@@ -45,6 +45,7 @@ class NamespacedObservationUncertainty(nn.Module):
         if min(latent_dim, num_mean_slices, num_dynamic_frames, embedding_dim) <= 0 or epsilon <= 0: raise ValueError("positive uncertainty dimensions required")
         self.embeddings = nn.ModuleDict({name: nn.Embedding(size, embedding_dim) for name, size in zip(self._NAMESPACES, (num_mean_slices, num_dynamic_frames))})
         self.log_variances = nn.ModuleDict({name: nn.Embedding(size, 1) for name, size in zip(self._NAMESPACES, (num_mean_slices, num_dynamic_frames))})
+        for embedding in self.log_variances.values(): nn.init.zeros_(embedding.weight)
         self.pixel_head = nn.Sequential(nn.Linear(latent_dim + embedding_dim, latent_dim), nn.ReLU(), nn.Linear(latent_dim, 1)); self.epsilon = epsilon
 
     def forward(self, latent_samples: torch.Tensor, observation_ids: torch.Tensor, weights: torch.Tensor, *, namespace: str, enabled: bool) -> dict[str, torch.Tensor]:
