@@ -22,6 +22,7 @@ from cardioresp4d.training.stage1 import (
     train_stage1a,
     train_stage1b_balanced,
 )
+from cardioresp4d.training.static_qc import run_final_static_qc
 
 
 def _geometry(*, origin=(0.0, 0.0, 0.0), orientation=(1, 0, 0, 0, 1, 0)):
@@ -105,7 +106,7 @@ class Stage1BalancedSamplingTests(unittest.TestCase):
             nib.save(nib.Nifti1Image(np.ones_like(volume), affine), mask)
             stage1a = train_stage1a(reference, mask, domain, root / "stage1a", steps=2, batch_size=8, profile="smoke", device="cpu")
             manifest = root / "mean_slice_manifest.csv"
-            fields = ["mean_slice_id", "view", "image_file", "geometry_json"]
+            fields = ["mean_slice_id", "view", "slice_id", "image_file", "geometry_json"]
             with manifest.open("w", newline="") as file:
                 writer = csv.DictWriter(file, fieldnames=fields)
                 writer.writeheader()
@@ -113,7 +114,7 @@ class Stage1BalancedSamplingTests(unittest.TestCase):
                     filename = f"{view}.npy"
                     np.save(root / filename, np.full((4, 4), 0.5, dtype=np.float32))
                     geometry = _geometry(origin=(0, 0, z))
-                    writer.writerow({"mean_slice_id": view, "view": view, "image_file": filename, "geometry_json": json.dumps(geometry)})
+                    writer.writerow({"mean_slice_id": view, "view": view, "slice_id": view, "image_file": filename, "geometry_json": json.dumps(geometry)})
             outcome = train_stage1b_balanced(stage1a["checkpoint"], manifest, domain, root / "stage1b", epochs=1, pixels_per_view=8, device="cpu")
             self.assertEqual(outcome["visits"], {"SAX": 1, "2CH": 1, "4CH": 1})
             self.assertTrue((root / "stage1b" / "stage1b_curve.csv").is_file())
@@ -126,6 +127,21 @@ class Stage1BalancedSamplingTests(unittest.TestCase):
             self.assertTrue(np.isfinite(payload["curve"][0]["total_mse"]))
             loaded = _load_checkpoint(Path(outcome["checkpoint"]))
             self.assertTrue(any(torch.count_nonzero(value).item() for value in loaded.parameters()))
+            source = root / "source_manifest.csv"
+            source_fields = ["view", "slice_id", "image_position_patient", "image_orientation_patient", "pixel_spacing", "slice_thickness", "rows", "columns"]
+            with source.open("w", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=source_fields); writer.writeheader()
+                for slice_id, view, z in (("SAX", "SAX", 0), ("s17", "SAX", 1), ("2CH", "2CH", 1), ("4CH", "4CH", 2)):
+                    geometry = _geometry(origin=(0, 0, z))
+                    writer.writerow({"view": view, "slice_id": slice_id, **{key: json.dumps(geometry[key]) if isinstance(geometry[key], list) else geometry[key] for key in ("image_position_patient", "image_orientation_patient", "pixel_spacing", "slice_thickness", "rows", "columns")}})
+            qc = run_final_static_qc(
+                _load_checkpoint(Path(stage1a["checkpoint"])), loaded, manifest, source, domain, root / "final_qc",
+                overview_spacing_mm=4.0, cardiac_export_spacing_mm=1.5, cardiac_roi_margin_mm=1.5,
+                eval_chunk_pixels=8, stage1b_metadata=payload,
+            )
+            for filename in ("canonical_overview.nii.gz", "stage1a_cardiac_1p5mm.nii.gz", "stage1b_cardiac_1p5mm.nii.gz", "stage1a_vs_stage1b_cardiac_difference.nii.gz", "stage1b_per_slice_metrics.csv", "stage1b_per_view_metrics.json", "s17_stage1a_prediction.png", "s17_stage1b_prediction.png", "s17_stage1b_minus_stage1a.png", "s17_neighboring_sax_qc.png", "s17_through_plane_qc.png", "stage1_coverage_summary.json"):
+                self.assertTrue((root / "final_qc" / filename).is_file(), filename)
+            self.assertTrue(qc["s17"]["s17_absence_confirmed"])
 
     def test_balanced_training_defers_calibrated_uncertainty(self):
         with self.assertRaises(NotImplementedError):
