@@ -1,8 +1,0 @@
-{
-  "selectors": [
-    "SAX/SAX_s17_2401"
-  ],
-  "matched_frames": 50,
-  "total_frames": 7200,
-  "method": "formal_manual_exclusion_propagation_without_automatic_qc_rerun"
-}
