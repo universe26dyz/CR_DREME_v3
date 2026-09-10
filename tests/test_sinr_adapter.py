@@ -21,13 +21,13 @@ class SINRAdapterTest(unittest.TestCase):
         self.assertIsInstance(basis.siren, BSplineSiren)
         self.assertIsInstance(basis.ffd, CubicBSplineFFDTransform)
         controls = torch.zeros(1, 9, *basis.control_shape)
-        torch.testing.assert_close(basis.dense_dvf_mm(controls), torch.zeros(1, 9, 8, 8, 8))
+        torch.testing.assert_close(basis.dense_dvf_mm(controls), torch.zeros(1, 9, 16, 16, 16))
 
     def test_adapter_matches_upstream_ffd_with_explicit_mm_conversion(self) -> None:
         basis = SINRFFDBasis(torch.tensor([-8., -12., -16.]), torch.tensor([8., 12., 16.]), grid_shape=(8, 8, 8), cps=(2, 2, 2), hidden_dim=8)
         controls = torch.randn(1, 9, *basis.control_shape)
-        expected = basis.ffd(controls).reshape(1, 3, 3, 8, 8, 8) * basis.grid_spacing_mm.view(1, 1, 3, 1, 1, 1)
-        actual = basis.dense_dvf_mm(controls).reshape(1, 3, 3, 8, 8, 8)
+        expected = basis.ffd(controls).reshape(1, 3, 3, 16, 16, 16) * basis.grid_spacing_mm.view(1, 1, 3, 1, 1, 1)
+        actual = basis.dense_dvf_mm(controls).reshape(1, 3, 3, 16, 16, 16)
         torch.testing.assert_close(actual, expected)
 
     def test_cardiac_boundary_is_zero_and_siren_and_controls_receive_gradients(self) -> None:

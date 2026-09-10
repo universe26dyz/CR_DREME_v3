@@ -25,6 +25,7 @@ class DynamicObservation:
     slice_thickness_mm: float
     qc_valid: bool
     qc_reason: str
+    timestamp_s: float = 0.0
 
 
 class ViewLocationBalancedSampler:
@@ -46,3 +47,13 @@ class ViewLocationBalancedSampler:
             location = self._rng.choice(locations)
             selected.append(self._rng.choice(self._grouped[view][location]))
         return selected
+
+    def temporal_batch(self, *, max_items: int) -> list[DynamicObservation]:
+        """One differentiable same-location sequence sorted by true acquisition time."""
+        if max_items <= 0:
+            raise ValueError("max_items must be positive")
+        candidates = [(view, location) for view, locations in self._grouped.items() for location, frames in locations.items() if len(frames) >= 3]
+        if not candidates:
+            return []
+        view, location = self._rng.choice(sorted(candidates))
+        return sorted(self._grouped[view][location], key=lambda item: item.timestamp_s)[:max_items]

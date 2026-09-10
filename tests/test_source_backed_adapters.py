@@ -29,7 +29,7 @@ class SourceBackedAdapterTest(unittest.TestCase):
         direct_density, _, direct_z = adapter.inr(points)
         density, z = adapter(points, return_features=True)
         torch.testing.assert_close(density, direct_density)
-        torch.testing.assert_close(z, direct_z[..., 1:])
+        torch.testing.assert_close(z, direct_z[..., 1:].reshape(*density.shape, -1))
 
     def test_psf_sigma_and_zero_motion_sampling_match_upstream(self) -> None:
         from nesvor.utils import resolution2sigma
@@ -37,7 +37,8 @@ class SourceBackedAdapterTest(unittest.TestCase):
         resolution = torch.tensor([[1.5, 2.0, 8.0]])
         torch.testing.assert_close(psf.sigma_mm(resolution), resolution2sigma(resolution, isotropic=False))
         points = torch.zeros(2, 3)
-        torch.manual_seed(7); adapter_samples = psf.sample(points, resolution)
+        directions = {"row_direction": torch.tensor([[1., 0., 0.]]).expand(2, -1), "column_direction": torch.tensor([[0., 1., 0.]]).expand(2, -1), "normal": torch.tensor([[0., 0., 1.]]).expand(2, -1)}
+        torch.manual_seed(7); adapter_samples = psf.sample(points, resolution, **directions)
         torch.manual_seed(7); direct_samples = torch.randn(2, 3, 3) * resolution2sigma(resolution, isotropic=False).view(-1, 1, 3) + points[:, None]
         torch.testing.assert_close(adapter_samples, direct_samples)
 
@@ -49,7 +50,7 @@ class SourceBackedAdapterTest(unittest.TestCase):
                 latent = torch.zeros(*points.shape[:-1], 4, dtype=points.dtype, device=points.device)
                 return (intensity, latent) if return_features else intensity
         inr = NeSVoRCanonicalAdapter(torch.tensor([[-10., -10., -10.], [10., 10., 10.]]), width=8, depth=1, n_features_z=4)
-        output = NeSVoRPSFAdapter(n_samples=3)(ConstantCanonical(inr.inr), torch.zeros(2, 3), torch.tensor([[1., 1., 6.]]))
+        output = NeSVoRPSFAdapter(n_samples=3)(ConstantCanonical(inr.inr), torch.zeros(2, 3), torch.tensor([[1., 1., 6.]]), row_direction=torch.tensor([[1., 0., 0.]]).expand(2, -1), column_direction=torch.tensor([[0., 1., 0.]]).expand(2, -1), normal=torch.tensor([[0., 0., 1.]]).expand(2, -1))
         torch.testing.assert_close(output["predicted_intensity"], torch.ones(2))
 
     def test_uncertainty_uses_dynamic_frame_ids_and_matches_torch_nll(self) -> None:

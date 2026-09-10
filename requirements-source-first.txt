@@ -1,0 +1,12 @@
+# Minimal v3 source-first runtime for local CPU tests.  Do not install every
+# upstream research-repository requirement: these are the imports reached by
+# CR_DREME mainline adapters only.
+torch>=2.0
+numpy
+scipy
+nibabel
+pydicom
+PyYAML
+omegaconf
+ipdb
+termcolor

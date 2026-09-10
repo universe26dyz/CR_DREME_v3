@@ -1,8 +1,18 @@
 # v3 source-first runtime contract for local CPU smoke and later GPU real-data runs.
 model:
-  canonical: {implementation: nesvor_official, upstream_commit: 2e96a91bdd30174210caea911e03a2778c65adbe}
+  canonical:
+    implementation: nesvor_official
+    upstream_commit: 2e96a91bdd30174210caea911e03a2778c65adbe
+    coarsest_resolution: 8
+    finest_resolution: 1
+    level_scale: 1.5
+    features_per_level: 2
+    log2_hashmap_size: 19
+    latent_dim: 16
+    width: 64
+    depth: 2
   psf: {implementation: nesvor_official, n_samples: 8}
-  uncertainty: {implementation: nesvor_derived, enable_stage: stage2_late}
+  uncertainty: {implementation: nesvor_derived, enable_stage: stage3}
   respiratory_mbc: {implementation: sinr_official, upstream_commit: 1a524ca7ae453b55310595fe957245088a108233, levels: 3}
   cardiac_mbc: {implementation: sinr_official, local_box: true}
 training:
@@ -12,6 +22,9 @@ training:
   stage1: {short_bootstrap: true, motion_enabled: false, uncertainty_enabled: false}
   stage2: {respiratory_progressive: true}
   stage3: {cardiac_enabled: true, uncertainty_enabled: true}
-domain: {reconstruction_domain: full_acquisition_supported, cardiac_box_is_crop: true}
+  loss_weights: {image: 0.0001, mbc: 0.00001, smooth: 0.00001, freq_resp: 0.0001, freq_card: 0.0001, score: 0.00001}
+  temporal_auxiliary: {every_steps: 1, batch_size: 8, frequency_bands_json: frequency_bands.json}
+  normalization: {mode: per_series}
+domain: {reconstruction_domain: full_acquisition_supported, cardiac_box_is_crop: false}
 coverage: {plane_center_qc: true, psf_aware: true, view_count: true, observation_count: true}
 runtime_status: local_cpu_verified_pending_gpu_real_data

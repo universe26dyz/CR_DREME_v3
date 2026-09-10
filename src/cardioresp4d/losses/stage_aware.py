@@ -23,6 +23,9 @@ def dvf_smoothness(dvf_mm:torch.Tensor, spacing_mm:torch.Tensor)->torch.Tensor:
 def inr_tv(values:torch.Tensor)->torch.Tensor: return sum(values.diff(dim=axis).abs().mean() for axis in range(1,values.ndim))
 def frequency_leakage(scores:torch.Tensor,timestamps_s:torch.Tensor,forbidden_band_hz:tuple[float,float])->torch.Tensor:
     if scores.shape[0]!=timestamps_s.numel() or timestamps_s.ndim!=1: raise ValueError('time-leading scores and timestamps required')
+    if timestamps_s.numel() < 3 or not torch.isfinite(scores).all() or not torch.isfinite(timestamps_s).all() or forbidden_band_hz[0] < 0 or forbidden_band_hz[1] < forbidden_band_hz[0]: raise ValueError('need finite >=3 timestamps and a valid nonnegative band')
     duration=(timestamps_s.max()-timestamps_s.min()).clamp_min(torch.finfo(timestamps_s.dtype).eps); frequencies=torch.arange(1,max(2,timestamps_s.numel()//2+1),device=timestamps_s.device,dtype=timestamps_s.dtype)/duration
-    spectrum=torch.abs(torch.einsum('t...,tf->f...',scores-scores.mean(0),torch.exp(-2j*math.pi*timestamps_s[:,None]*frequencies[None])))**2
-    forbidden=(frequencies>=forbidden_band_hz[0])&(frequencies<=forbidden_band_hz[1]); return spectrum[forbidden].mean()/(spectrum.mean()+torch.finfo(scores.dtype).eps)
+    spectrum=torch.abs(torch.einsum('t...,tf->f...',scores.to(torch.complex64)-scores.mean(0).to(torch.complex64),torch.exp(-2j*math.pi*timestamps_s[:,None]*frequencies[None])))**2
+    forbidden=(frequencies>=forbidden_band_hz[0])&(frequencies<=forbidden_band_hz[1])
+    if not bool(forbidden.any()): return scores.sum() * 0.
+    return spectrum[forbidden].mean()/(spectrum.mean()+torch.finfo(scores.dtype).eps)

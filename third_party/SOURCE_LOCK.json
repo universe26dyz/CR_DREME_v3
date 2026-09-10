@@ -1,0 +1,28 @@
+{
+  "NeSVoR": {
+    "repo": "https://github.com/daviddmc/NeSVoR",
+    "commit": "2e96a91bdd30174210caea911e03a2778c65adbe",
+    "state": "vendored",
+    "key_files_sha256": {
+      "nesvor/inr/models.py": "df09093a9956fc7681949f9b660debe76788c33227498ba68e60584fdf2aec36",
+      "nesvor/utils/psf.py": "f36d06be5184bdc2544cf69674c029cb7b6ffbf1f1b26f659b4972e3191da0af"
+    }
+  },
+  "SINR": {
+    "repo": "https://github.com/vasl12/SINR",
+    "commit": "1a524ca7ae453b55310595fe957245088a108233",
+    "state": "vendored",
+    "key_files_sha256": {
+      "networks/networks.py": "ff11b270b78aab948e2562dbbbee86b5e55e1bea33817d501d49873a60cb2eb5",
+      "models/transformation.py": "73462bb8b5a1c3117b3db4e980012a2e19497b331b3476664b8e1238e6cf0572"
+    }
+  },
+  "FiLM": {
+    "repo": "https://github.com/ethanjperez/film",
+    "commit": "fe43ddf8a22b339dcca2efa07091ce9d498955cf",
+    "state": "vendored",
+    "key_files_sha256": {
+      "vr/models/filmed_net.py": "943bfed724c377763d467327d54416f57ffdcb8fb34827cd9cd5f51f74846bc9"
+    }
+  }
+}

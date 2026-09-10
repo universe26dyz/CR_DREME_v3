@@ -11,8 +11,8 @@ module-level record.
   via `src/cardioresp4d/adapters/nesvor_*.py`.
 - FiLM modulation is imported from the pinned MIT `FiLM` primitive via
   `src/cardioresp4d/adapters/film.py`.
-- SINR SIREN and cubic B-spline FFD are imported directly from the independent
-  pinned external checkout via `src/cardioresp4d/adapters/sinr_mbc.py`.
+- SINR `BSplineSiren` and `CubicBSplineFFDTransform` are imported directly
+  from the pinned vendored source under `third_party/SINR`.
 - PyTorch Gaussian NLL is used through its official loss class.
 
 ## Necessary adapters and paper-derived work
@@ -31,21 +31,36 @@ and progressive orchestration are paper-derived necessary adaptations.
 selected by a v3 mainline runtime. Stage1A/Stage1B and initial-reference / mean
 slice construction are not v3 mainline prerequisites.
 
-## External SINR dependency
+## Vendored source lock
 
-`vasl12/SINR` is a public research-code external pinned dependency at
-`1a524ca7ae453b55310595fe957245088a108233`. It has no explicit upstream
-license file, so it is not labelled MIT/Apache. No SINR source is copied or
-modified in CR_DREME; its adapter directly imports the checkout. No custom
-SINR/FFD fallback is selected by the v3 mainline.
+`third_party/SOURCE_LOCK.json` fixes repository URLs, commits and SHA256 hashes
+for every runtime source file. NeSVoR, SINR and FiLM are ordinary vendored
+directories, not gitlinks. `vasl12/SINR` is public research code with no
+explicit upstream license file; it is not labelled MIT/Apache and is unmodified
+inside this repository. No custom SINR/FFD fallback is selected by mainline.
+
+## Clean local CPU source tests
+
+Install the narrow adapter dependency set into the existing environment when
+needed (PyTorch build selection remains platform-specific):
+
+```bash
+conda run -n knesvr_torch python -m pip install -r requirements-source-first.txt
+```
+
+```bash
+conda run --no-capture-output -n knesvr_torch \
+  python -m unittest tests.test_v3_change1_contracts \
+  tests.test_v3_change1_training tests.test_source_backed_adapters \
+  tests.test_sinr_adapter tests.test_unified_progressive_smoke
+```
 
 ## First GPU real-data validation
 
-After copying this checkout and creating an independent SINR checkout on the
-GPU host, run only the short Stage1 -> Stage2a chain:
+After copying this checkout to the GPU host, run only the short Stage1 ->
+Stage2a chain:
 
 ```bash
-CARDIORESP4D_SINR_ROOT=/absolute/path/to/SINR \
 python scripts/train_source_first.py \
   --source-config configs/source_first.yaml \
   --manifest /absolute/path/to/results/dicom_manifest.csv \

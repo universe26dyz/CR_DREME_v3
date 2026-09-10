@@ -21,15 +21,15 @@ from cardioresp4d.training.source_first_config import validate_source_dependenci
 from cardioresp4d.training.trainer import UnifiedProgressiveTrainer
 
 
-def observations_from_manifest(manifest: Path, qc_table: Path, device: torch.device) -> list[DynamicObservation]:
-    dataset = CardioRespDataset(manifest, valid_only=False, qc_table_path=qc_table)
+def observations_from_manifest(manifest: Path, qc_table: Path, device: torch.device, *, normalization_mode: str) -> tuple[list[DynamicObservation], dict[str, dict[str, float]]]:
+    dataset = CardioRespDataset(manifest, valid_only=False, qc_table_path=qc_table, normalization_mode=normalization_mode)
     ids = {token: index for index, token in enumerate(sorted(row.get("source_file_token", f"{row['view']}:{row['slice_id']}:{row['frame_index']}") for row in dataset._rows))}
     observations: list[DynamicObservation] = []
     for index, row in enumerate(dataset._rows):
         sample = dataset[index]; plane = DicomPlane.from_geometry(sample["geometry"])
         token = row.get("source_file_token", f"{row['view']}:{row['slice_id']}:{row['frame_index']}")
-        observations.append(DynamicObservation(image=torch.from_numpy(sample["image"])[None].to(device), view=sample["view"].upper(), slice_id=sample["slice_id"], dynamic_frame_id=ids[token], center_mm=torch.from_numpy(plane.pixel_to_world((plane.columns - 1) / 2., (plane.rows - 1) / 2.)).float().to(device), row_direction=torch.from_numpy(plane.row_direction).float().to(device), column_direction=torch.from_numpy(plane.column_direction).float().to(device), normal=torch.from_numpy(plane.normal).float().to(device), pixel_spacing_mm=torch.from_numpy(plane.pixel_spacing).float().to(device), slice_thickness_mm=float(plane.slice_thickness or row["slice_thickness"]), qc_valid=bool(sample["qc_valid"]), qc_reason=str(sample["qc_reason"])))
-    return observations
+        observations.append(DynamicObservation(image=torch.from_numpy(sample["image"])[None].to(device), view=sample["view"].upper(), slice_id=sample["slice_id"], dynamic_frame_id=ids[token], center_mm=torch.from_numpy(plane.pixel_to_world((plane.columns - 1) / 2., (plane.rows - 1) / 2.)).float().to(device), row_direction=torch.from_numpy(plane.row_direction).float().to(device), column_direction=torch.from_numpy(plane.column_direction).float().to(device), normal=torch.from_numpy(plane.normal).float().to(device), pixel_spacing_mm=torch.from_numpy(plane.pixel_spacing).float().to(device), slice_thickness_mm=float(plane.slice_thickness or row["slice_thickness"]), qc_valid=bool(sample["qc_valid"]), qc_reason=str(sample["qc_reason"]), timestamp_s=float(sample["timestamp_s"])))
+    return observations, dataset.normalization_parameters
 
 
 def main() -> None:
@@ -42,15 +42,18 @@ def main() -> None:
     parser.add_argument("--stage2b-steps", type=int, default=0); parser.add_argument("--stage2c-steps", type=int, default=0); parser.add_argument("--stage3-steps", type=int, default=0)
     args = parser.parse_args(); device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available(): parser.error("CUDA requested but unavailable")
-    with args.source_config.open(encoding="utf-8") as handle: validate_source_first_config(yaml.safe_load(handle), PROJECT_ROOT)
+    with args.source_config.open(encoding="utf-8") as handle: source_config = yaml.safe_load(handle)
+    validate_source_first_config(source_config, PROJECT_ROOT)
     validate_source_dependencies()
     with args.canonical_domain.open(encoding="utf-8") as handle: domain = json.load(handle)
-    observations = observations_from_manifest(args.manifest, args.qc_table, device)
+    observations, normalization_parameters = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=source_config["training"]["normalization"]["mode"])
     cardiac = domain["cardiac_box"]
     model = SourceFirstDynamicModel(torch.tensor(domain["world_min_mm"], device=device), torch.tensor(domain["world_max_mm"], device=device), cardiac_lower_world_mm=torch.tensor(cardiac["min_mm"], device=device), cardiac_upper_world_mm=torch.tensor(cardiac["max_mm"], device=device), n_dynamic_frames=len(observations)).to(device)
-    trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(observations), pixel_samples=args.pixel_samples)
+    bands_path = PROJECT_ROOT / source_config["training"]["temporal_auxiliary"]["frequency_bands_json"]
+    frequency_bands = {key: tuple(value) for key, value in json.loads(bands_path.read_text(encoding="utf-8")).items() if key.endswith("_hz")}
+    trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(observations), pixel_samples=args.pixel_samples, loss_weights=source_config["training"]["loss_weights"], frequency_bands=frequency_bands, temporal_every=int(source_config["training"]["temporal_auxiliary"]["every_steps"]), temporal_batch_size=int(source_config["training"]["temporal_auxiliary"]["batch_size"]), cardiac_sampling_fraction=float(source_config["training"]["cardiac_sampling_fraction"]))
     stages = (("stage1", args.stage1_steps), ("stage2a", args.stage2a_steps), ("stage2b", args.stage2b_steps), ("stage2c", args.stage2c_steps), ("stage3", args.stage3_steps))
-    report = {stage: trainer.run_stage(stage, steps=steps) for stage, steps in stages if steps > 0}
+    report = {"stages": {stage: trainer.run_stage(stage, steps=steps) for stage, steps in stages if steps > 0}, "source_config": source_config, "normalization_parameters": normalization_parameters, "frequency_bands": frequency_bands}
     args.output_dir.mkdir(parents=True, exist_ok=True); torch.save({"model": model.state_dict(), "report": report}, args.output_dir / "source_first_last.pt")
     (args.output_dir / "source_first_training_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))

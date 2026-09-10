@@ -31,6 +31,10 @@ def validate_source_first_config(config: Mapping[str, Any], project_root: str | 
         raise ValueError("cardiac_box is only permitted for explicit cardiac_only_ablation")
     if domain.get("reconstruction_domain") != "full_acquisition_supported" and config.get("experiment_mode") != "cardiac_only_ablation":
         raise ValueError("v3 mainline requires a full acquisition-supported reconstruction domain")
+    if domain.get("cardiac_box_is_crop") is not False and config.get("experiment_mode") != "cardiac_only_ablation":
+        raise ValueError("v3 mainline requires cardiac_box_is_crop = false")
+    if _mapping(model, "uncertainty").get("enable_stage") != "stage3":
+        raise ValueError("v3 formal uncertainty schedule is stage3")
     if training.get("view_balanced") is not True:
         raise ValueError("v3 formal training requires view_balanced = true")
 

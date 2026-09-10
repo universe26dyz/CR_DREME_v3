@@ -26,8 +26,15 @@ class NeSVoRDynamicFrameUncertainty(nn.Module):
         pixel_scale = self.sigma_net(torch.cat((latent_z, frame), dim=-1)).squeeze(-1).exp()
         frame_variance = self.log_var_frame.exp()[dynamic_frame_ids]
         while frame_variance.ndim < pixel_scale.ndim: frame_variance = frame_variance.unsqueeze(-1)
-        variance = pixel_scale.square() + frame_variance
-        return {"pixel_scale": pixel_scale, "frame_variance": frame_variance, "variance": variance}
+        # NeSVoR.forward squares the mean sample scale, then adds one slice
+        # variance. The only adaptation is slice ID -> dynamic frame ID.
+        if pixel_scale.ndim >= 2:
+            pixel_scale_aggregate = pixel_scale.mean(dim=-1)
+            frame_variance = frame_variance.select(-1, 0) if frame_variance.ndim >= 2 else frame_variance
+        else:
+            pixel_scale_aggregate = pixel_scale
+        variance = pixel_scale_aggregate.square() + frame_variance
+        return {"pixel_scale": pixel_scale, "pixel_scale_aggregate": pixel_scale_aggregate, "frame_variance": frame_variance, "variance": variance}
 
     @staticmethod
     def nll(prediction: torch.Tensor, target: torch.Tensor, variance: torch.Tensor) -> torch.Tensor:

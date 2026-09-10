@@ -24,12 +24,18 @@ class NeSVoRCanonicalAdapter(nn.Module):
     def forward(self, points_world_mm: torch.Tensor, return_features: bool = False):
         if points_world_mm.shape[-1] != 3 or not torch.isfinite(points_world_mm).all():
             raise ValueError("points_world_mm must be finite and end in xyz millimetres")
-        result = self.inr(points_world_mm)
+        # The pinned INR uses ``view`` internally; DICOM PSF/motion broadcasting
+        # can produce a valid non-contiguous tensor, so the adapter materializes
+        # only layout (not coordinates or INR math) at this interface.
+        result = self.inr(points_world_mm.contiguous())
         if self.inr.training:
             density, _encoding, latent_z = result
             # NeSVoR's sigma_net concatenates its slice embedding with z[...,1:],
             # reserving z[...,0] for density before the official softplus.
-            return (density, latent_z[..., 1:]) if return_features else density
+            # Upstream preserves density prefix dimensions but keeps z flattened
+            # for its own batch loss; restore only the public adapter layout.
+            features = latent_z[..., 1:].reshape(*density.shape, latent_z.shape[-1] - 1)
+            return (density, features) if return_features else density
         if return_features:
             raise RuntimeError("NeSVoR INR exposes latent z only in training mode")
         return result

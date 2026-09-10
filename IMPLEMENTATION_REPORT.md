@@ -1,13 +1,14 @@
 # v3 Source-first implementation report
 
-Date: 2026-09-09. Specification: `CR_DREME_v3_FULL_PIPELINE_2026-09-09_SOURCE_FIRST_NESVOR_SINR.md`.
+Date: 2026-09-10. Specification: `CR_DREME_v3_FULL_PIPELINE_2026-09-09_SOURCE_FIRST_NESVOR_SINR.md`; second-round contract: `v3_change1_codex.md`.
 
 ## Completed source audit
 
 `SOURCE_PROVENANCE.md` records the actual repository, immutable commit, source
 file, reused symbol, license, and adapter for every requested primitive.
-Unmodified pinned checkouts exist in `third_party/NeSVoR`, `third_party/film`,
-and external `/home/universe/SVR/code/external/SINR`. The supplied DREME-MR, S2V-DREME, NISF++, SIMPLE-4D,
+Unmodified pinned source trees exist in `third_party/NeSVoR`, `third_party/SINR`,
+and `third_party/film`; `third_party/SOURCE_LOCK.json` records their identity.
+The supplied DREME-MR, S2V-DREME, NISF++, SIMPLE-4D,
 and PCA/FFT papers were reviewed. Only the direct source calls listed in the
 provenance file are described as upstream reuse.
 
@@ -23,10 +24,15 @@ provenance file are described as upstream reuse.
 - Added identity/numerical adapter tests, external SINR FFD adapter, unified
   Stage1/Stage2a-b-c/Stage3 trainer, and expanded canonical-domain tests.
 - Added the source-first configuration and third-party notices.
+- Corrected geometry units (canonical-normalized position Fourier features;
+  separate direction and acquisition inputs), oblique DICOM-basis PSF sampling,
+  SINR logical control-grid versus dense-grid semantics, NeSVoR variance
+  aggregation, true timestamp propagation, 80/20 cardiac sampling, and real
+  stage freeze/unfreeze with per-stage Adam recreation.
 
 ## Mainline status
 
-The local CPU runtime now has external SINR MBC/FFD adapters and a unified
+The local CPU runtime now has vendored-source SINR MBC/FFD adapters and a unified
 Stage 1 / Stage 2a-b-c / Stage 3 trainer. It never constructs an initial V,
 mean-slice training set, Stage1A, or Stage1B. The cardiac MBC requires an
 explicit local cardiac box within the full-FOV canonical bounds.
@@ -39,10 +45,14 @@ explicit local cardiac box within the full-FOV canonical bounds.
   `cubic_bspline1d`, and `conv1d` source.
 - Read pinned FiLM primitive source and confirmed the official `gamma * x + beta` operation.
 - Confirmed commits: NeSVoR `2e96a91...`, SINR `1a524ca...`, FiLM `fe43ddf...`.
-- Ran CPU source adapter tests (NeSVoR/PSF/uncertainty/FiLM: 6/6), external
-  SINR adapter tests (3/3), coverage test (1/1), and unified progressive
-  synthetic tests (3/3). The Stage3 test confirmed non-None gradients for
-  INR, FiLM, respiratory SINR, cardiac SINR, and uncertainty.
+- Ran `python -m unittest tests.test_v3_change1_training
+  tests.test_source_backed_adapters tests.test_sinr_adapter
+  tests.test_v3_change1_contracts tests.test_unified_progressive_smoke
+  tests.test_source_first_config` in local `knesvr_torch`: 23/23 passed.
+  This includes direct source identity, oblique PSF variance, logical
+  8/12/16/16 control grids, variance equality, irregular timestamp frequency
+  gradients, 80/20 sampling, real stage freeze/unfreeze, central pullback and
+  unified Stage1→2a→2b→2c→3 synthetic smoke.
 - Ran the source-first configuration validator red→green cycle: it rejects
   legacy canonical/SINR, cardiac-only, and unbalanced settings, and accepts
   the pinned source contract (2/2 tests passed).
@@ -57,9 +67,8 @@ was launched, by design: it remains a GPU-server task.
 
 ## Remaining issues
 
-1. Execute the shortest real-data Stage1 + Stage2a validation on the GPU server
-   after copying this checkout and setting `CARDIORESP4D_SINR_ROOT`.
-2. Frequency-leakage regularization based on the Phase-1 subject-specific,
-   nonuniform-timestamp PCA/FFT bands has not yet been connected to the
-   trainer's score-history objective; it must be added before a long Stage3
-   scientific run. The current short GPU command deliberately stops at Stage2a.
+1. Run the shortest real-data Stage1 + Stage2a validation on the GPU server
+   after replacing the template `configs/frequency_bands.json` with Phase-1
+   subject-specific bands.
+2. The tiny CPU smoke is not a real-data reprojection or long-training result;
+   those remain GPU-server work.

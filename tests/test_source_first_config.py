@@ -12,7 +12,7 @@ from cardioresp4d.training.source_first_config import validate_source_first_conf
 
 
 def _valid() -> dict:
-    return {"model": {"canonical": {"implementation": "nesvor_official", "upstream_commit": "2e96a91bdd30174210caea911e03a2778c65adbe"}, "respiratory_mbc": {"implementation": "sinr_official", "upstream_commit": "1a524ca7ae453b55310595fe957245088a108233"}, "cardiac_mbc": {"implementation": "sinr_official"}}, "training": {"view_balanced": True}, "domain": {"reconstruction_domain": "full_acquisition_supported"}}
+    return {"model": {"canonical": {"implementation": "nesvor_official", "upstream_commit": "2e96a91bdd30174210caea911e03a2778c65adbe"}, "respiratory_mbc": {"implementation": "sinr_official", "upstream_commit": "1a524ca7ae453b55310595fe957245088a108233"}, "cardiac_mbc": {"implementation": "sinr_official"}, "uncertainty": {"enable_stage": "stage3"}}, "training": {"view_balanced": True}, "domain": {"reconstruction_domain": "full_acquisition_supported", "cardiac_box_is_crop": False}}
 
 
 class SourceFirstConfigTest(unittest.TestCase):

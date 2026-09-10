@@ -3,7 +3,7 @@
 论文来源：Necessary adaptation: image-domain DICOM loader for local free-breathing MRI.
 输入：Task 1 CSV manifest 和其引用的 DICOM 帧。
 输出：归一化 float32 图像、AcquisitionTime 秒数、视图、固定层标识、DICOM 几何及 rescale 状态。
-主要步骤：读取 manifest，按 pydicom modality LUT/rescale 规则变换像素，再作每帧 1/99 percentile 归一化。
+主要步骤：读取 manifest，按 pydicom modality LUT/rescale 规则变换像素，再按 qc-valid frames 拟合 per-series 稳定归一化。
 是否属于原论文直接实现 / 必要适配 / 可选实验：Necessary adaptation.
 命令行使用示例：python -m cardioresp4d.data.dataset --manifest results/dicom_manifest.csv --index 0
 """
@@ -30,8 +30,12 @@ class CardioRespDataset:
     """A lightweight manifest-backed DICOM dataset with no framework dependency."""
 
     def __init__(self, manifest_path: str | Path, *, valid_only: bool = True,
-                 qc_table_path: str | Path | None = None, use_qc: bool = True) -> None:
+                 qc_table_path: str | Path | None = None, use_qc: bool = True,
+                 normalization_mode: str = "per_series") -> None:
         self.manifest_path = Path(manifest_path)
+        if normalization_mode not in {"per_frame_legacy", "per_series", "per_view", "subject_global"}:
+            raise ValueError("normalization_mode must be per_frame_legacy, per_series, per_view, or subject_global")
+        self.normalization_mode = normalization_mode
         with self.manifest_path.open(newline="", encoding="utf-8") as handle:
             self._rows = list(csv.DictReader(handle))
         if not self._rows:
@@ -66,6 +70,7 @@ class CardioRespDataset:
             self._rows = [row for row in self._rows if row["qc_valid"] not in ("0", "false", "False")]
             if not self._rows:
                 raise ValueError("Acquisition QC leaves no valid observations")
+        self._normalization_parameters = self._fit_normalization_parameters()
 
     def __len__(self) -> int:
         return len(self._rows)
@@ -78,7 +83,7 @@ class CardioRespDataset:
         dataset = pydicom.dcmread(path)
         rescale_status = _rescale_status(dataset)
         rescaled = _rescaled_pixels(dataset)
-        image = _normalise_image(rescaled)
+        image = _normalise_image(rescaled, self._normalization_parameters.get(self._normalization_key(row)))
         return {
             "image": image,
             "timestamp_s": float(row["timestamp_s"]),
@@ -102,6 +107,41 @@ class CardioRespDataset:
                 "columns": int(row["columns"]),
             },
         }
+
+    @property
+    def normalization_parameters(self) -> dict[str, dict[str, float]]:
+        """Serializable bounds estimated solely from qc-valid acquired frames."""
+        return {key: dict(value) for key, value in self._normalization_parameters.items()}
+
+    def _normalization_key(self, row: dict[str, str]) -> str:
+        if self.normalization_mode == "per_frame_legacy":
+            return ""
+        if self.normalization_mode == "subject_global":
+            return "subject_global"
+        if self.normalization_mode == "per_view":
+            return f"view:{row['view']}"
+        return f"series:{row.get('series_instance_uid') or row['view'] + ':' + row['slice_id']}"
+
+    def _fit_normalization_parameters(self) -> dict[str, dict[str, float]]:
+        if self.normalization_mode == "per_frame_legacy":
+            return {}
+        values: dict[str, list[np.ndarray]] = {}
+        for row in self._rows:
+            if row["qc_valid"] in ("0", "false", "False") or row["qc_reason"] in {"slice_local_scale_absolute", "manual_exclusion"}:
+                continue
+            path = self._token_to_path.get(row.get("source_file_token", ""), row.get("dicom_path", ""))
+            if not path:
+                continue
+            values.setdefault(self._normalization_key(row), []).append(_rescaled_pixels(pydicom.dcmread(path)).reshape(-1))
+        result: dict[str, dict[str, float]] = {}
+        for key, arrays in values.items():
+            lower, upper = np.percentile(np.concatenate(arrays), (1.0, 99.0))
+            if not np.isfinite(lower) or not np.isfinite(upper):
+                raise ValueError("normalization percentiles must be finite")
+            result[key] = {"lower": float(lower), "upper": float(upper), "mode": self.normalization_mode}
+        if not result:
+            raise ValueError("normalization requires at least one qc-valid acquired frame")
+        return result
 
 
 def validate_qc_table_coverage(manifest_path: str | Path, qc_table_path: str | Path) -> None:
@@ -139,8 +179,8 @@ def _rescale_status(dataset: pydicom.dataset.Dataset) -> str:
     return "modality_lut" if has_slope else "identity_without_rescale_tags"
 
 
-def _normalise_image(image: np.ndarray) -> np.ndarray:
-    lower, upper = np.percentile(image, (1.0, 99.0))
+def _normalise_image(image: np.ndarray, parameters: dict[str, float] | None = None) -> np.ndarray:
+    lower, upper = (np.percentile(image, (1.0, 99.0)) if parameters is None else (parameters["lower"], parameters["upper"]))
     if not np.isfinite(lower) or not np.isfinite(upper):
         raise ValueError("Image percentiles must be finite")
     if upper <= lower:

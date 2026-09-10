@@ -1,0 +1,5 @@
+{
+  "respiratory_hz": [0.1, 0.7],
+  "cardiac_hz": [0.8, 3.0],
+  "source": "Phase-1 subject-specific PCA/FFT output; replace this template per subject before formal training."
+}
