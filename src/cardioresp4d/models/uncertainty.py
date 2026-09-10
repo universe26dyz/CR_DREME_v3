@@ -59,3 +59,22 @@ class NamespacedObservationUncertainty(nn.Module):
         pixel = (pixel*weights[None,:,None,None]).sum(1)
         observation = F.softplus(self.log_variances[namespace](observation_ids)).view(batch,1,1)+self.epsilon
         return {"pixel_variance":pixel,"observation_variance":observation,"total_variance":pixel+observation,"enabled":True}
+
+    def initialize_observation_variance(self, namespace: str, observation_ids: torch.Tensor, target_mse: torch.Tensor) -> None:
+        """Initialize selected scalar observation variances after MSE warm-up.
+
+        This inverse-softplus assignment is a calibration hand-off only: it
+        neither enables the uncertainty likelihood nor creates an extra
+        variance penalty.
+        """
+        if namespace not in self._NAMESPACES:
+            raise ValueError(f"namespace must be one of {self._NAMESPACES}")
+        weight = self.log_variances[namespace].weight
+        identifiers = torch.as_tensor(observation_ids, dtype=torch.long, device=weight.device).reshape(-1)
+        values = torch.as_tensor(target_mse, dtype=weight.dtype, device=weight.device).reshape(-1)
+        if identifiers.numel() != values.numel() or not torch.isfinite(values).all():
+            raise ValueError("finite target_mse values matching observation_ids are required")
+        raw = values.clamp_min(self.epsilon * 2) - self.epsilon
+        inverse_softplus = raw + torch.log(-torch.expm1(-raw))
+        with torch.no_grad():
+            weight[identifiers, 0] = inverse_softplus

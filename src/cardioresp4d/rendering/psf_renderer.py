@@ -51,3 +51,8 @@ class AnisotropicPSFRenderer(nn.Module):
 
     def _normalize(self, points_mm: torch.Tensor) -> torch.Tensor:
         one=torch.ones((*points_mm.shape[:-1],1),dtype=points_mm.dtype,device=points_mm.device); return torch.einsum('ij,...j->...i',self.world_to_normalized.to(points_mm),torch.cat((points_mm,one),-1))[...,:3]
+
+    def render_pixel_centers(self, inr: nn.Module, *, pixel_centers_mm: torch.Tensor, row_direction: torch.Tensor, column_direction: torch.Tensor, normal: torch.Tensor, pixel_spacing_mm: torch.Tensor, thickness_mm: torch.Tensor, motion: nn.Module|None=None) -> dict[str,torch.Tensor]:
+        """Render arbitrary DICOM pixel centres ``[N,3]`` without centre-patch approximation."""
+        if pixel_centers_mm.ndim!=2 or pixel_centers_mm.shape[1]!=3: raise ValueError('pixel_centers_mm must be [N,3]')
+        sigma=psf_sigma_mm(pixel_spacing_mm[None],thickness_mm[None])[0]; axes=torch.stack((row_direction,column_direction,normal),-1); offsets=torch.einsum('ik,sk->si',axes,self.standard_nodes.to(pixel_centers_mm)*math.sqrt(2)*sigma); samples=pixel_centers_mm[None]+offsets[:,None]; reference=motion(samples)['reference_points_mm'] if motion else samples; intensity,latent=inr(self._normalize(reference),return_features=True); return {'predicted':(intensity.squeeze(-1)*self.weights[:,None]).sum(0),'latent_samples':latent,'psf_weights':self.weights,'sample_world_mm':samples}

@@ -52,7 +52,9 @@ def build_initial_reference(
     _validate_positive_tolerance(origin_tolerance_mm, "origin_tolerance_mm")
 
     manifest = Path(manifest_path)
-    dataset = CardioRespDataset(manifest)
+    # Keep every acquired SAX location in the physical stack.  QC only decides
+    # whether frames provide supervision, never whether their location exists.
+    dataset = CardioRespDataset(manifest, valid_only=False)
     rows = dataset._rows
     with manifest.open(newline="", encoding="utf-8") as handle:
         original_rows = list(csv.DictReader(handle))
@@ -61,11 +63,6 @@ def build_initial_reference(
     if len(sax_thicknesses) != 1:
         raise ValueError("SAX DICOM SliceThickness must be constant for the current renderer contract")
     acquisition_slice_thickness_mm = sax_thicknesses.pop()
-    valid_sax_ids = {row["slice_id"] for row in rows if row.get("view", "").upper() == "SAX"}
-    missing_valid_slices = sorted(original_sax_ids - valid_sax_ids)
-    if missing_valid_slices:
-        raise ValueError(f"Acquisition QC leaves no valid frames for SAX slice(s): {', '.join(missing_valid_slices)}")
-    qc_applied = any(row.get("qc_reason", "not_evaluated") != "not_evaluated" for row in rows)
     sax_rows = [(index, row) for index, row in enumerate(rows) if row.get("view", "").upper() == "SAX"]
     if not sax_rows:
         raise ValueError(f"Manifest contains no SAX frames: {manifest}")
@@ -79,18 +76,17 @@ def build_initial_reference(
         ordered = sorted(indexed_rows, key=lambda item: int(item[1]["frame_index"]))
         frame_indices = [int(row["frame_index"]) for _, row in ordered]
         complete = len(ordered) == expected_frames_per_slice and frame_indices == list(range(expected_frames_per_slice))
-        valid_subset = qc_applied and 0 < len(ordered) <= expected_frames_per_slice and len(set(frame_indices)) == len(frame_indices) and all(0 <= index < expected_frames_per_slice for index in frame_indices)
-        if not complete and not valid_subset:
-            raise ValueError(
-                f"SAX/{slice_id} must contain exactly 50 frames unless an explicit QC table supplies a non-empty valid subset; got {len(ordered)}"
-            )
+        if not complete:
+            raise ValueError(f"SAX/{slice_id} must contain exactly {expected_frames_per_slice} acquired frames; got {len(ordered)}")
         planes = [DicomPlane.from_geometry(row) for _, row in ordered]
         _validate_within_slice_geometry(slice_id, planes, orientation_tolerance, spacing_tolerance_mm)
         slice_records.append({
             "slice_id": slice_id,
             "indices": [index for index, _ in ordered],
+            "valid_indices": [index for index, row in ordered if row["qc_valid"] not in ("0", "false", "False")],
             "frame_indices": frame_indices,
-            "valid_frame_count": len(ordered),
+            "valid_frame_count": sum(row["qc_valid"] not in ("0", "false", "False") for _, row in ordered),
+            "acquired_frame_count": len(ordered),
             "plane": planes[0],
         })
 
@@ -135,17 +131,20 @@ def build_initial_reference(
     dicom_lps_affine[:3, 3] = first_origin
     nifti_ras_affine = LPS_TO_RAS @ dicom_lps_affine
 
-    temporal_means: list[np.ndarray] = []
+    temporal_means: list[np.ndarray | None] = []
+    valid_location_flags: list[bool] = []
     rescale_status_counts: dict[str, int] = defaultdict(int)
     for record in slice_records:
         frames = []
-        for index in record["indices"]:
+        for index in record["valid_indices"]:
             sample = dataset[index]
             frames.append(sample["image"])
             rescale_status_counts[sample["rescale_status"]] += 1
-        temporal_mean_rows_columns = np.mean(np.stack(frames), axis=0, dtype=np.float64)
-        temporal_means.append(temporal_mean_rows_columns.T.astype(np.float32))
+        valid_location_flags.append(bool(frames))
+        temporal_means.append(None if not frames else np.mean(np.stack(frames), axis=0, dtype=np.float64).T.astype(np.float32))
+    temporal_means, placeholder_details = _fill_missing_location_placeholders(temporal_means, positions)
     volume = np.stack(temporal_means, axis=2)
+    valid_mask = np.broadcast_to(np.asarray(valid_location_flags, dtype=np.float32)[None, None, :], volume.shape).copy()
     expected_shape = (reference_plane.columns, reference_plane.rows, len(slice_records))
     if volume.shape != expected_shape or not np.isfinite(volume).all():
         raise RuntimeError(f"Invalid reference volume shape/finiteness: {volume.shape}, expected {expected_shape}")
@@ -153,17 +152,24 @@ def build_initial_reference(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     nifti_path = output / "initial_reference.nii.gz"
+    valid_mask_path = output / "initial_reference_valid_mask.nii.gz"
     metadata_path = output / "initial_reference.json"
     qc_path = output / "reference_qc.png"
     image = nib.Nifti1Image(volume, nifti_ras_affine)
     image.header.set_xyzt_units("mm")
     nib.save(image, nifti_path)
+    mask_image = nib.Nifti1Image(valid_mask, nifti_ras_affine)
+    mask_image.header.set_xyzt_units("mm")
+    nib.save(mask_image, valid_mask_path)
     reopened = nib.load(nifti_path)
     reopened_values = np.asanyarray(reopened.dataobj)
     if reopened.shape != volume.shape or not np.isfinite(reopened_values).all():
         raise RuntimeError("Reopened initial-reference NIfTI failed shape/finiteness validation")
     if not np.allclose(reopened.affine, nifti_ras_affine, atol=1e-5, rtol=1e-7):
         raise RuntimeError("Reopened initial-reference NIfTI affine differs from the requested RAS+ affine")
+    reopened_mask = nib.load(valid_mask_path)
+    if reopened_mask.shape != volume.shape or not np.allclose(reopened_mask.affine, nifti_ras_affine, atol=1e-5, rtol=1e-7):
+        raise RuntimeError("Initial-reference valid mask must share the reference shape and RAS+ affine")
 
     metadata = {
         "schema_version": 1,
@@ -189,6 +195,16 @@ def build_initial_reference(
         "sorted_slice_positions_along_normal_mm": positions.tolist(),
         "sorted_slice_origins_lps_mm": actual_origins.tolist(),
         "frames_per_slice": [record["valid_frame_count"] for record in slice_records],
+        "acquired_frames_per_slice": [record["acquired_frame_count"] for record in slice_records],
+        "missing_slice_ids": [record["slice_id"] for record, valid in zip(slice_records, valid_location_flags) if not valid],
+        "missing_slice_positions_mm": [record["position_mm"] for record, valid in zip(slice_records, valid_location_flags) if not valid],
+        "missing_slice_positions_semantics": "physical position projected onto representative_sax_unit_normal_lps",
+        "missing_slice_origins_lps_mm": [record["plane"].origin.tolist() for record, valid in zip(slice_records, valid_location_flags) if not valid],
+        "missing_slice_count": int(sum(not valid for valid in valid_location_flags)),
+        "placeholder_method": "linear interpolation between bracketing valid SAX temporal means; nearest valid temporal mean at a stack edge",
+        "placeholder_details": placeholder_details,
+        "initial_reference_valid_mask": str(valid_mask_path),
+        "supervision_contract": "mask_zero_means_no_stage1a_reference_supervision",
         "temporal_averaging_frames": "arithmetic mean over qc_valid frames only",
         "normalization": {
             "input": "existing CardioRespDataset per-frame normalization",
@@ -242,6 +258,39 @@ def _validate_within_slice_geometry(
             plane.column_direction, reference.column_direction, atol=orientation_tolerance, rtol=0.0
         ):
             raise ValueError(f"SAX/{slice_id} has inconsistent orientation across frames")
+
+
+def _fill_missing_location_placeholders(
+    temporal_means: list[np.ndarray | None], positions_mm: np.ndarray
+) -> tuple[list[np.ndarray], list[dict[str, Any]]]:
+    """Fill storage-only holes without changing their zero-supervision status.
+
+    Locations are already sorted by physical normal projection.  Interpolation
+    is done in physical position, not slice index, so an irregular stack cannot
+    silently change the placeholder weighting or the reference affine.
+    """
+    valid = [index for index, image in enumerate(temporal_means) if image is not None]
+    if not valid:
+        raise ValueError("No qc_valid SAX location remains to form a finite reference placeholder")
+    output = list(temporal_means)
+    details: list[dict[str, Any]] = []
+    for index, image in enumerate(output):
+        if image is not None:
+            continue
+        lower = max((candidate for candidate in valid if candidate < index), default=None)
+        upper = min((candidate for candidate in valid if candidate > index), default=None)
+        if lower is not None and upper is not None:
+            weight = float((positions_mm[index] - positions_mm[lower]) / (positions_mm[upper] - positions_mm[lower]))
+            output[index] = ((1.0 - weight) * output[lower] + weight * output[upper]).astype(np.float32)
+            details.append({"slice_index": index, "method": "linear_bracketing_valid_temporal_means", "lower_valid_index": lower, "upper_valid_index": upper, "physical_weight": weight})
+        else:
+            neighbour = lower if lower is not None else upper
+            assert neighbour is not None
+            output[index] = output[neighbour].copy()
+            details.append({"slice_index": index, "method": "nearest_valid_temporal_mean_edge_fallback", "nearest_valid_index": neighbour})
+    if any(image is None or not np.isfinite(image).all() for image in output):
+        raise RuntimeError("Reference placeholder filling failed to produce finite storage values")
+    return [image for image in output if image is not None], details
 
 
 def _validate_cross_slice_geometry(
