@@ -14,6 +14,17 @@ provenance file are described as upstream reuse.
 
 ## Implemented changes
 
+### MBC topology audit — v3_change2
+
+DREME-MR defines one scalar score per level and Cartesian displacement
+component: respiratory scores `[B,3,3]`, cardiac scores `[B,1,3]`. S2V-DREME
+uses a SINR generator that emits a 3D displacement vector per control point.
+The compatible contract is therefore `resp_mbc [B,3,N,3]` and `card_mbc
+[B,1,N,3]`, with element-wise Cartesian weighting. The former local 9-channel
+`[basis,xyz]` construction was not justified by either tensor definition and
+has been removed from the formal adapter; upstream SINR is still called
+directly with output dimension 3.
+
 - Added NeSVoR world-mm INR, PSF, and dynamic-frame uncertainty adapters.
 - Added a direct FiLM primitive adapter and changed the geometry motion encoder
   to call it instead of locally multiplying gamma and beta.
@@ -66,6 +77,21 @@ The Python runtime is local `knesvr_torch` CPU-only (PyTorch 2.5.1,
 was launched, by design: it remains a GPU-server task.
 
 ## Remaining issues
+
+### v3_change2 status (not yet a GPU gate)
+
+- Implemented and CPU-tested: Phase-1 aggregate prior parser, 3-channel
+  Cartesian SINR MBC topology, Eq.6 MBC normalization, Eq.7 zero-mean score,
+  nonuniform Eq.8/Eq.9 loss primitives, full-span temporal subsampling,
+  runtime source-lock verification and CLI frequency-path precedence.
+- Still required before claiming v3_change2 complete: config-to-model builder
+  for every formal hyperparameter, separate respiratory/cardiac smoothness on
+  configured 16³ grids, stage-specific learning-rate groups, and the requested
+  fixture repair for all-repository legacy tests.
+- Full `unittest discover -s tests`: 105 passed, 1 skipped, 5 errors in
+  `tests.test_data` (single-view fixtures rejected by formal three-view Phase-1
+  validator), and 2 legacy initial-reference/QC expectation failures. These
+  are not hidden or excluded.
 
 1. Run the shortest real-data Stage1 + Stage2a validation on the GPU server
    after replacing the template `configs/frequency_bands.json` with Phase-1

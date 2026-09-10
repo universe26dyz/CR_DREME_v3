@@ -13,8 +13,8 @@ model:
     depth: 2
   psf: {implementation: nesvor_official, n_samples: 8}
   uncertainty: {implementation: nesvor_derived, enable_stage: stage3}
-  respiratory_mbc: {implementation: sinr_official, upstream_commit: 1a524ca7ae453b55310595fe957245088a108233, levels: 3}
-  cardiac_mbc: {implementation: sinr_official, local_box: true}
+  respiratory_mbc: {implementation: sinr_official, upstream_commit: 1a524ca7ae453b55310595fe957245088a108233, logical_control_shapes: [[8,8,8],[12,12,12],[16,16,16]], cps: 2, hidden_dim: 64}
+  cardiac_mbc: {implementation: sinr_official, local_box: true, logical_control_shape: [16,16,16], cps: 2, hidden_dim: 64, taper_mm: 4}
 training:
   view_balanced: true
   fixed_location_balanced: true
@@ -22,8 +22,10 @@ training:
   stage1: {short_bootstrap: true, motion_enabled: false, uncertainty_enabled: false}
   stage2: {respiratory_progressive: true}
   stage3: {cardiac_enabled: true, uncertainty_enabled: true}
-  loss_weights: {image: 0.0001, mbc: 0.00001, smooth: 0.00001, freq_resp: 0.0001, freq_card: 0.0001, score: 0.00001}
-  temporal_auxiliary: {every_steps: 1, batch_size: 8, frequency_bands_json: frequency_bands.json}
+  loss_weights: {image: 0.0001, mbc_normalization: 0.00001, smooth_resp: 0.00001, smooth_card: 0.00001, zero_mean_score: 0.00001, cardiac_leakage_in_resp: 0.0001, respiratory_leakage_in_card: 0.0001}
+  temporal_auxiliary: {every_steps: 1, mode: full_location_sequence, max_frames: 50, frequency_bands_json: frequency_bands.json}
+  frequency_prior: {allow_template_fallback: false}
+  motion_regularization: {evaluation_grid: {mode: fixed_physical, shape: [16,16,16]}}
   normalization: {mode: per_series}
 domain: {reconstruction_domain: full_acquisition_supported, cardiac_box_is_crop: false}
 coverage: {plane_center_qc: true, psf_aware: true, view_count: true, observation_count: true}

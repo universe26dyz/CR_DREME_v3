@@ -14,6 +14,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from cardioresp4d.data.dataset import CardioRespDataset
+from cardioresp4d.adapters.source_lock import verify_vendored_source_lock
+from cardioresp4d.frequency.training_prior import load_training_frequency_prior
 from cardioresp4d.geometry.world_geometry import DicomPlane
 from cardioresp4d.training.model import SourceFirstDynamicModel
 from cardioresp4d.training.sampler import DynamicObservation, ViewLocationBalancedSampler
@@ -37,6 +39,7 @@ def main() -> None:
     parser.add_argument("--source-config", type=Path, default=PROJECT_ROOT / "configs" / "source_first.yaml")
     parser.add_argument("--manifest", required=True, type=Path); parser.add_argument("--qc-table", required=True, type=Path)
     parser.add_argument("--canonical-domain", required=True, type=Path); parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--frequency-bands", type=Path, help="Phase-1 aggregate frequency_bands.json; overrides config-relative path")
     parser.add_argument("--device", default="cuda"); parser.add_argument("--pixel-samples", type=int, default=256)
     parser.add_argument("--stage1-steps", type=int, default=100); parser.add_argument("--stage2a-steps", type=int, default=100)
     parser.add_argument("--stage2b-steps", type=int, default=0); parser.add_argument("--stage2c-steps", type=int, default=0); parser.add_argument("--stage3-steps", type=int, default=0)
@@ -45,17 +48,19 @@ def main() -> None:
     with args.source_config.open(encoding="utf-8") as handle: source_config = yaml.safe_load(handle)
     validate_source_first_config(source_config, PROJECT_ROOT)
     validate_source_dependencies()
+    source_lock = verify_vendored_source_lock(PROJECT_ROOT)
     with args.canonical_domain.open(encoding="utf-8") as handle: domain = json.load(handle)
     observations, normalization_parameters = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=source_config["training"]["normalization"]["mode"])
     cardiac = domain["cardiac_box"]
     model = SourceFirstDynamicModel(torch.tensor(domain["world_min_mm"], device=device), torch.tensor(domain["world_max_mm"], device=device), cardiac_lower_world_mm=torch.tensor(cardiac["min_mm"], device=device), cardiac_upper_world_mm=torch.tensor(cardiac["max_mm"], device=device), n_dynamic_frames=len(observations)).to(device)
-    bands_path = PROJECT_ROOT / source_config["training"]["temporal_auxiliary"]["frequency_bands_json"]
-    frequency_bands = {key: tuple(value) for key, value in json.loads(bands_path.read_text(encoding="utf-8")).items() if key.endswith("_hz")}
-    trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(observations), pixel_samples=args.pixel_samples, loss_weights=source_config["training"]["loss_weights"], frequency_bands=frequency_bands, temporal_every=int(source_config["training"]["temporal_auxiliary"]["every_steps"]), temporal_batch_size=int(source_config["training"]["temporal_auxiliary"]["batch_size"]), cardiac_sampling_fraction=float(source_config["training"]["cardiac_sampling_fraction"]))
+    bands_path = (args.frequency_bands or (args.source_config.parent / source_config["training"]["temporal_auxiliary"]["frequency_bands_json"])).resolve()
+    prior = load_training_frequency_prior(bands_path, allow_template_fallback=bool(source_config["training"].get("frequency_prior",{}).get("allow_template_fallback",False)))
+    trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(observations), pixel_samples=args.pixel_samples, loss_weights=source_config["training"]["loss_weights"], frequency_prior=prior, temporal_every=int(source_config["training"]["temporal_auxiliary"]["every_steps"]), temporal_batch_size=int(source_config["training"]["temporal_auxiliary"]["max_frames"]), cardiac_sampling_fraction=float(source_config["training"]["cardiac_sampling_fraction"]))
     stages = (("stage1", args.stage1_steps), ("stage2a", args.stage2a_steps), ("stage2b", args.stage2b_steps), ("stage2c", args.stage2c_steps), ("stage3", args.stage3_steps))
-    report = {"stages": {stage: trainer.run_stage(stage, steps=steps) for stage, steps in stages if steps > 0}, "source_config": source_config, "normalization_parameters": normalization_parameters, "frequency_bands": frequency_bands}
+    report = {"stages": {stage: trainer.run_stage(stage, steps=steps) for stage, steps in stages if steps > 0}, "effective_config": source_config, "normalization_parameters": normalization_parameters, "frequency_prior": prior.__dict__, "source_lock": source_lock}
     args.output_dir.mkdir(parents=True, exist_ok=True); torch.save({"model": model.state_dict(), "report": report}, args.output_dir / "source_first_last.pt")
     (args.output_dir / "source_first_training_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    (args.output_dir / "effective_config.json").write_text(json.dumps(report["effective_config"], indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
 
 

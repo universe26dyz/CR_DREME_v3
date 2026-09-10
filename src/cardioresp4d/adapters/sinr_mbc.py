@@ -45,7 +45,9 @@ class SINRFFDBasis(nn.Module):
         self.dense_evaluation_shape = tuple(logical * spacing for logical, spacing in zip(self.logical_control_shape, self.cps))
         self.padded_control_shape = tuple(int(math.ceil(size / stride)) + 2 for size, stride in zip(self.dense_evaluation_shape, self.cps))
         self.register_buffer("grid_spacing_mm", (self.upper_world_mm - self.lower_world_mm) / torch.tensor([size - 1 for size in self.dense_evaluation_shape], dtype=torch.float32))
-        self.siren = BSplineSiren([3, hidden_dim, hidden_dim, 9])
+        # DREME/S2V contract: one MBC vector e_i(x)=[e_ix,e_iy,e_iz], not
+        # three vectors mixed again by Cartesian scores.
+        self.siren = BSplineSiren([3, hidden_dim, hidden_dim, 3])
         self.ffd = CubicBSplineFFDTransform(ndim=3, img_size=self.dense_evaluation_shape, cps=self.cps)
 
     @property
@@ -56,14 +58,14 @@ class SINRFFDBasis(nn.Module):
     def control_parameters_grid_units(self, batch_size: int) -> torch.Tensor:
         axes = [torch.linspace(-1., 1., size, device=self.lower_world_mm.device, dtype=self.lower_world_mm.dtype) for size in self.padded_control_shape]
         coordinates = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).reshape(-1, 3)
-        values = self.siren(coordinates).reshape(*self.padded_control_shape, 9).permute(3, 0, 1, 2).unsqueeze(0)
+        values = self.siren(coordinates).reshape(*self.padded_control_shape, 3).permute(3, 0, 1, 2).unsqueeze(0)
         return values.expand(batch_size, -1, -1, -1, -1)
 
     def dense_dvf_mm(self, controls_grid_units: torch.Tensor) -> torch.Tensor:
-        if controls_grid_units.ndim != 5 or controls_grid_units.shape[1:] != (9, *self.padded_control_shape):
-            raise ValueError("controls must be [B,9,*padded_control_shape] in upstream grid units")
+        if controls_grid_units.ndim != 5 or controls_grid_units.shape[1:] != (3, *self.padded_control_shape):
+            raise ValueError("controls must be [B,3,*padded_control_shape] in upstream grid units")
         dense_grid_units = self.ffd(controls_grid_units)
-        return (dense_grid_units.reshape(-1, 3, 3, *self.dense_evaluation_shape) * self.grid_spacing_mm.view(1, 1, 3, 1, 1, 1)).reshape_as(dense_grid_units)
+        return dense_grid_units * self.grid_spacing_mm.view(1, 3, 1, 1, 1)
 
     def forward(self, points_world_mm: torch.Tensor) -> torch.Tensor:
         if points_world_mm.ndim != 3 or points_world_mm.shape[-1] != 3:
@@ -73,7 +75,7 @@ class SINRFFDBasis(nn.Module):
         normalized = 2. * (points_world_mm - self.lower_world_mm) / (self.upper_world_mm - self.lower_world_mm) - 1.
         grid = normalized[..., [2, 1, 0]].reshape(batch, count, 1, 1, 3)
         sampled = F.grid_sample(dense, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
-        return sampled.reshape(batch, 3, 3, count).permute(0, 3, 1, 2)
+        return sampled.reshape(batch, 3, count).permute(0, 2, 1)
 
 
 class RespiratorySINRMBCAdapter(nn.Module):
@@ -114,4 +116,4 @@ class CardiacSINRMBCAdapter(nn.Module):
         field = self.basis(points_world_mm)
         distance = torch.minimum(points_world_mm - self.lower_world_mm, self.upper_world_mm - points_world_mm)
         taper = (distance / self.taper_mm).clamp(0., 1.).amin(dim=-1)
-        return field * taper[..., None, None]
+        return field * taper[..., None]

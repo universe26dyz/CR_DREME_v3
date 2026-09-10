@@ -40,12 +40,11 @@ class ScoreWeightedMBCField(nn.Module):
         fields = self.mbc(points_mm.reshape(batch, -1, 3))
         # A respiratory MBC exposes levels explicitly; the one-level cardiac
         # MBC returns a single field and is promoted to the same contract.
-        if fields.ndim == 4:
-            fields = fields[:, None]
+        if fields.ndim == 3: fields = fields[:, None]
         scores = self.scores.to(points_mm).expand(batch, -1, -1)
-        if fields.ndim != 5 or fields.shape[-2:] != (3, 3):
-            raise ValueError("upstream SINR MBC must return [B,level,N,basis,xyz]")
-        return torch.einsum("bla,blnaj->bnj", scores, fields).reshape(batch, *spatial_shape, 3)
+        if fields.ndim != 4 or fields.shape[-1] != 3:
+            raise ValueError("upstream SINR MBC must return [B,level,N,xyz]")
+        return (fields * scores[:, :, None, :]).sum(1).reshape(batch, *spatial_shape, 3)
 
 
 class SequentialPullbackMotion(nn.Module):

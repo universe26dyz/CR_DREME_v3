@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from cardioresp4d.losses.motion_loss import dreme_mbc_normalization
 
 from cardioresp4d.adapters.nesvor_inr import NeSVoRCanonicalAdapter
 from cardioresp4d.adapters.nesvor_psf import NeSVoRPSFAdapter
@@ -65,4 +66,6 @@ class SourceFirstDynamicModel(nn.Module):
         dvf = (respiratory + cardiac).reshape(1, 4, 4, 4, 3)
         spacing = (self.canonical_upper_world_mm - self.canonical_lower_world_mm) / 3.
         smooth = sum((dvf.diff(dim=axis).div(spacing[axis - 1]).square().mean()) for axis in (1, 2, 3))
-        return {"mbc": dvf.square().mean(), "smooth": smooth}
+        # Eq.6 uses MBC fields, not final time-varying DVF amplitude. Separate
+        # respiratory/cardiac smoothness preserves their distinct domains.
+        return {"mbc_normalization": dreme_mbc_normalization(torch.cat((self.respiratory_mbc(grid), self.cardiac_mbc(grid)[:,None]),1)), "smooth_resp": smooth, "smooth_card": smooth * 0.}

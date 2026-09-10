@@ -68,3 +68,25 @@
 ### Git
 
 - 最终 commit: 待创建。
+
+### 阶段验证补充
+
+- v3_change2 target CPU suite：28/28 passed。
+- full discover：105 passed、1 skipped、7 failed；详见 `IMPLEMENTATION_REPORT.md`，尚未创建本轮 commit。
+
+---
+
+## 2026-09-10 20:18:54 +0800 — v3_change2_codex.md — motion-training scientific correctness 修正
+
+### 修改目的
+
+以 `d947ad71bc84dbe5441117b6c0e0400c39337909` 为基线，修正 motion topology、DREME Eq.6–9、Phase-1 frequency prior 和 runtime integration。
+
+### 验证
+
+- 审计与 TDD 开始；结果将在本轮完成记录。
+
+### Git
+
+- 基线 commit: `d947ad71bc84dbe5441117b6c0e0400c39337909`
+- 最终 commit: 待创建。

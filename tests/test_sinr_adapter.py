@@ -20,20 +20,20 @@ class SINRAdapterTest(unittest.TestCase):
         from models.transformation import CubicBSplineFFDTransform
         self.assertIsInstance(basis.siren, BSplineSiren)
         self.assertIsInstance(basis.ffd, CubicBSplineFFDTransform)
-        controls = torch.zeros(1, 9, *basis.control_shape)
-        torch.testing.assert_close(basis.dense_dvf_mm(controls), torch.zeros(1, 9, 16, 16, 16))
+        controls = torch.zeros(1, 3, *basis.control_shape)
+        torch.testing.assert_close(basis.dense_dvf_mm(controls), torch.zeros(1, 3, 16, 16, 16))
 
     def test_adapter_matches_upstream_ffd_with_explicit_mm_conversion(self) -> None:
         basis = SINRFFDBasis(torch.tensor([-8., -12., -16.]), torch.tensor([8., 12., 16.]), grid_shape=(8, 8, 8), cps=(2, 2, 2), hidden_dim=8)
-        controls = torch.randn(1, 9, *basis.control_shape)
-        expected = basis.ffd(controls).reshape(1, 3, 3, 16, 16, 16) * basis.grid_spacing_mm.view(1, 1, 3, 1, 1, 1)
-        actual = basis.dense_dvf_mm(controls).reshape(1, 3, 3, 16, 16, 16)
+        controls = torch.randn(1, 3, *basis.control_shape)
+        expected = basis.ffd(controls) * basis.grid_spacing_mm.view(1, 3, 1, 1, 1)
+        actual = basis.dense_dvf_mm(controls)
         torch.testing.assert_close(actual, expected)
 
     def test_cardiac_boundary_is_zero_and_siren_and_controls_receive_gradients(self) -> None:
         cardiac = CardiacSINRMBCAdapter(torch.tensor([-10., -10., -10.]), torch.tensor([10., 10., 10.]), grid_shape=(8, 8, 8), cps=2, hidden_dim=8, taper_mm=2.)
         boundary = torch.tensor([[[10., 0., 0.]]])
-        torch.testing.assert_close(cardiac(boundary), torch.zeros(1, 1, 3, 3))
+        torch.testing.assert_close(cardiac(boundary), torch.zeros(1, 1, 3))
         points = torch.tensor([[[0., 0., 0.], [1., 1., 1.]]], requires_grad=True)
         value = cardiac(points)
         value.sum().backward()

@@ -56,4 +56,8 @@ class ViewLocationBalancedSampler:
         if not candidates:
             return []
         view, location = self._rng.choice(sorted(candidates))
-        return sorted(self._grouped[view][location], key=lambda item: item.timestamp_s)[:max_items]
+        ordered=sorted(self._grouped[view][location], key=lambda item: item.timestamp_s)
+        if len(ordered)<=max_items: return ordered
+        # Deterministic full-span stratification; never use only early frames.
+        indices=torch.linspace(0,len(ordered)-1,max_items).round().long().tolist()
+        return [ordered[index] for index in indices]
