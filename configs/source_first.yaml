@@ -1,0 +1,17 @@
+# v3 source-first runtime contract for local CPU smoke and later GPU real-data runs.
+model:
+  canonical: {implementation: nesvor_official, upstream_commit: 2e96a91bdd30174210caea911e03a2778c65adbe}
+  psf: {implementation: nesvor_official, n_samples: 8}
+  uncertainty: {implementation: nesvor_derived, enable_stage: stage2_late}
+  respiratory_mbc: {implementation: sinr_official, upstream_commit: 1a524ca7ae453b55310595fe957245088a108233, levels: 3}
+  cardiac_mbc: {implementation: sinr_official, local_box: true}
+training:
+  view_balanced: true
+  fixed_location_balanced: true
+  cardiac_sampling_fraction: 0.8
+  stage1: {short_bootstrap: true, motion_enabled: false, uncertainty_enabled: false}
+  stage2: {respiratory_progressive: true}
+  stage3: {cardiac_enabled: true, uncertainty_enabled: true}
+domain: {reconstruction_domain: full_acquisition_supported, cardiac_box_is_crop: true}
+coverage: {plane_center_qc: true, psf_aware: true, view_count: true, observation_count: true}
+runtime_status: local_cpu_verified_pending_gpu_real_data

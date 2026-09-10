@@ -44,14 +44,20 @@ class CanonicalDomainTest(unittest.TestCase):
                 root / "geometry", coverage_spacing_mm=2.0,
             )
             payload = json.loads(report.read_text())
-            self.assertEqual("multi_view_acquisition_support_union_cardiac_box", payload["derivation_rule"])
+            self.assertEqual("multi_view_acquisition_supported_full_fov", payload["derivation_rule"])
             self.assertEqual([0.0, 0.0, -2.0], payload["world_min_mm"])
             self.assertEqual([8.0, 8.0, 8.0], payload["world_max_mm"])
             self.assertEqual([4.0, 4.0, 5.0], payload["scale_mm_per_normalized_unit"])
-            self.assertEqual("stage1_supervision_only", payload["initial_reference_support"]["role"])
+            self.assertEqual("legacy_not_used_by_mainline", payload["initial_reference_support"]["role"])
             self.assertTrue(all(path.is_file() for path in outputs.values()))
             normalised = np.asarray(payload["cardiac_box"]["normalized"]["corners"])
             self.assertTrue(np.all(normalised >= -1.0) and np.all(normalised <= 1.0))
+            self.assertEqual(1, int(np.asanyarray(nib.load(outputs["canonical_domain_mask"]).dataobj).min()))
+            self.assertEqual(1, int(np.asanyarray(nib.load(outputs["canonical_domain_mask"]).dataobj).max()))
+            self.assertTrue(np.any(np.asanyarray(nib.load(outputs["coverage_plane_center_sax"]).dataobj) == 0))
+            self.assertGreaterEqual(int(np.asanyarray(nib.load(outputs["coverage_psf_union"]).dataobj).sum()), int(np.asanyarray(nib.load(outputs["coverage_plane_center_sax"]).dataobj).sum()))
+            self.assertLessEqual(int(np.asanyarray(nib.load(outputs["coverage_view_count"]).dataobj).max()), 3)
+            self.assertGreater(int(np.asanyarray(nib.load(outputs["coverage_observation_count"]).dataobj).max()), 0)
 
             reference_mask = root / "subject_specific_mask.nii.gz"
             nib.save(nib.Nifti1Image(np.ones((2, 2, 2), dtype=np.uint8), np.eye(4)), reference_mask)
