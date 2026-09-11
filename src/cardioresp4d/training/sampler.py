@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from collections import defaultdict
 
 import torch
+from .runtime_state import HARD_INVALID_REASONS, is_hard_invalid_reason
 
 _VIEWS = ("SAX", "2CH", "4CH")
-_HARD_INVALID = {"slice_local_scale_absolute", "manual_exclusion"}
+_HARD_INVALID = HARD_INVALID_REASONS
 
 
 @dataclass(frozen=True)
@@ -33,7 +34,12 @@ class ViewLocationBalancedSampler:
     def __init__(self, observations: list[DynamicObservation], *, seed: int = 0) -> None:
         grouped: dict[str, dict[str, list[DynamicObservation]]] = defaultdict(lambda: defaultdict(list))
         for observation in observations:
-            if not observation.qc_valid or observation.qc_reason in _HARD_INVALID:
+            hard = is_hard_invalid_reason(observation.qc_reason)
+            if not observation.qc_valid and not hard:
+                raise ValueError("qc_valid=false observation has no hard-invalid token")
+            if observation.qc_valid and hard:
+                raise ValueError("hard-invalid observation must have qc_valid=false")
+            if not observation.qc_valid:
                 continue
             grouped[observation.view.upper()][observation.slice_id].append(observation)
         missing = [view for view in _VIEWS if not grouped[view]]
@@ -61,3 +67,9 @@ class ViewLocationBalancedSampler:
         # Deterministic full-span stratification; never use only early frames.
         indices=torch.linspace(0,len(ordered)-1,max_items).round().long().tolist()
         return [ordered[index] for index in indices]
+
+    def state_dict(self) -> dict:
+        return {"python_random_state": self._rng.getstate()}
+
+    def load_state_dict(self, state: dict) -> None:
+        self._rng.setstate(state["python_random_state"])

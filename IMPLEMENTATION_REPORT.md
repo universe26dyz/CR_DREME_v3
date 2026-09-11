@@ -98,3 +98,35 @@ was launched, by design: it remains a GPU-server task.
    subject-specific bands.
 2. The tiny CPU smoke is not a real-data reprojection or long-training result;
    those remain GPU-server work.
+
+## v3_change3 closure repair — 2026-09-10
+
+The v3_change3 repair moved the formal mainline from masking/fallback behavior
+to explicit runtime contracts. `training/stage_contract.py` owns Stage1,
+Stage2a/b/c and Stage3 call/gradient/regularizer ownership. Stage1 now calls
+only NeSVoR PSF→INR; Stage2 calls only active respiratory source-SINR levels;
+Stage3 adds cardiac source-SINR and dynamic-frame uncertainty. Respiratory
+level scheduling is a non-trainable buffer, not a learnable amplitude gate.
+
+`dreme_mbc_normalization` now preserves level×Cartesian axes while reducing
+only batch/spatial samples. Eq.8 uses complex paired Fourier subtraction;
+NUDFT uses relative timestamps, score centring and sample-count normalization.
+The Phase-1 `slice_key=view/slice_id` producer schema was checked, enabling
+per-location cardiac evidence only when that exact identity exists; otherwise
+the report marks global fallback provenance.
+
+`training/build_model.py` is the sole formal model constructor. It applies
+canonical INR, PSF, SINR cps/grid/taper, FiLM, uncertainty, image regularizer
+and separate respiratory/full-FOV vs cardiac/local-box smoothness settings;
+effective config is introspected from objects. Runtime state now validates
+hard-QC/identity/timestamps, records seed/RNG, retains optimizer state across
+progression, writes resumable checkpoint state and emits per-step metrics.
+
+Actually run locally in `knesvr_torch` (PyTorch 2.5.1 CPU): final full
+`python -m unittest discover -s tests` — 126 passed, 1 explicit skip; targeted
+stage/factory/frequency/runtime/data tests — 23 passed, 1 explicit skip. A
+final real-data no-step CPU preflight passed on the locally available DYL0709
+manifest sidecar plus full Phase-1 QC/domain/frequency artifacts: source lock
+verified, 7200 observations (7150 valid, 50 hard-invalid) validated, 143
+location candidates resolved, and Stage1–Stage3 forwards were finite. No GPU
+or long training was run.

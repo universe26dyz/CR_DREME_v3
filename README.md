@@ -46,13 +46,29 @@ needed (PyTorch build selection remains platform-specific):
 
 ```bash
 conda run -n knesvr_torch python -m pip install -r requirements-source-first.txt
+conda run -n knesvr_torch python -m pip install -e . --no-deps
 ```
 
 ```bash
 conda run --no-capture-output -n knesvr_torch \
-  python -m unittest tests.test_v3_change1_contracts \
-  tests.test_v3_change1_training tests.test_source_backed_adapters \
-  tests.test_sinr_adapter tests.test_unified_progressive_smoke
+  python -m unittest discover -s tests
+```
+
+## CPU real-data preflight, then first GPU validation
+
+Run this no-step CPU validation before a GPU run. It validates the exact
+manifest/QC/domain/frequency/source-lock contract, reports normalization groups
+and location priors, and executes one no-grad forward for each stage.
+
+```bash
+python scripts/preflight_source_first.py \
+  --source-config configs/source_first.yaml \
+  --frequency-bands /absolute/path/to/results/frequency/frequency_bands.json \
+  --manifest /absolute/path/to/results/dicom_manifest.csv \
+  --qc-table /absolute/path/to/results/acquisition_qc/acquisition_qc.csv \
+  --canonical-domain /absolute/path/to/results/domain/canonical_domain.json \
+  --output-dir /absolute/path/to/results/training/source_first_preflight \
+  --device cpu
 ```
 
 ## First GPU real-data validation
@@ -63,6 +79,7 @@ Stage2a chain:
 ```bash
 python scripts/train_source_first.py \
   --source-config configs/source_first.yaml \
+  --frequency-bands /absolute/path/to/results/frequency/frequency_bands.json \
   --manifest /absolute/path/to/results/dicom_manifest.csv \
   --qc-table /absolute/path/to/results/acquisition_qc/acquisition_qc.csv \
   --canonical-domain /absolute/path/to/results/domain/canonical_domain.json \

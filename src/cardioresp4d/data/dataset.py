@@ -113,6 +113,18 @@ class CardioRespDataset:
         """Serializable bounds estimated solely from qc-valid acquired frames."""
         return {key: dict(value) for key, value in self._normalization_parameters.items()}
 
+    @property
+    def normalization_group_report(self) -> list[dict[str, Any]]:
+        """Auditable membership and percentile provenance for formal preflight."""
+        groups: dict[str, list[dict[str, str]]] = {}
+        for row in self._rows:
+            groups.setdefault(self._normalization_key(row), []).append(row)
+        report = []
+        for key, rows in sorted(groups.items()):
+            parameters = self._normalization_parameters.get(key, {})
+            report.append({"group_key": key, "mode": self.normalization_mode, "views": sorted({row["view"] for row in rows}), "slice_ids": sorted({row["slice_id"] for row in rows}), "frame_count": len(rows), "valid_frame_count": sum(row["qc_valid"] not in ("0", "false", "False") and row["qc_reason"] not in {"slice_local_scale_absolute", "manual_exclusion"} for row in rows), "percentile_1": parameters.get("lower"), "percentile_99": parameters.get("upper")})
+        return report
+
     def _normalization_key(self, row: dict[str, str]) -> str:
         if self.normalization_mode == "per_frame_legacy":
             return ""
@@ -132,13 +144,18 @@ class CardioRespDataset:
             path = self._token_to_path.get(row.get("source_file_token", ""), row.get("dicom_path", ""))
             if not path:
                 continue
-            values.setdefault(self._normalization_key(row), []).append(_rescaled_pixels(pydicom.dcmread(path)).reshape(-1))
+            pixels = _rescaled_pixels(pydicom.dcmread(path)).reshape(-1)
+            # Keep deterministic, bounded memory on real 50-frame locations;
+            # small fixtures use every value and therefore remain exact.
+            if pixels.size > 8192:
+                pixels = pixels[np.linspace(0, pixels.size - 1, 8192, dtype=np.int64)]
+            values.setdefault(self._normalization_key(row), []).append(pixels)
         result: dict[str, dict[str, float]] = {}
         for key, arrays in values.items():
             lower, upper = np.percentile(np.concatenate(arrays), (1.0, 99.0))
             if not np.isfinite(lower) or not np.isfinite(upper):
                 raise ValueError("normalization percentiles must be finite")
-            result[key] = {"lower": float(lower), "upper": float(upper), "mode": self.normalization_mode}
+            result[key] = {"lower": float(lower), "upper": float(upper), "mode": self.normalization_mode, "estimator": "exact_if_frame_pixels_le_8192_else_deterministic_uniform_frame_subsample", "per_frame_sample_cap": 8192.0}
         if not result:
             raise ValueError("normalization requires at least one qc-valid acquired frame")
         return result

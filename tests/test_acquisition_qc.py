@@ -60,7 +60,7 @@ class AcquisitionQcTest(unittest.TestCase):
                                     "frame_index": frame, "qc_valid": valid, "qc_reason": "valid" if valid else "synthetic_corruption",
                                     "qc_ncc": 1, "qc_intensity_scale": 1, "qc_residual": 0, "rescale_status": "identity_without_rescale_tags"})
             write_qc_table(qc_rows, root / "acquisition_qc" / "acquisition_qc.csv")
-            dataset = CardioRespDataset(manifest)
+            dataset = CardioRespDataset(manifest, normalization_mode="per_frame_legacy")
             expected = np.mean(np.stack([dataset[i]["image"] for i, row in enumerate(dataset._rows) if row["slice_id"] == "slice_a"]), axis=0).T
             nifti, metadata, _ = build_initial_reference(manifest, root / "reference")
             volume = np.asanyarray(nib.load(nifti).dataobj)
@@ -68,10 +68,13 @@ class AcquisitionQcTest(unittest.TestCase):
             self.assertIn("49", metadata.read_text())
             for row in qc_rows:
                 if row["slice_id"] == "slice_a":
-                    row["qc_valid"] = False; row["qc_reason"] = "all_invalid_test"
+                    row["qc_valid"] = False; row["qc_reason"] = "manual_exclusion"
             write_qc_table(qc_rows, root / "acquisition_qc" / "acquisition_qc.csv")
-            with self.assertRaisesRegex(ValueError, "no valid frames"):
-                build_initial_reference(manifest, root / "reference_all_invalid")
+            # Legacy reference preserves acquisition geometry with a masked
+            # placeholder; source-first training never uses this artifact.
+            nifti, metadata, _ = build_initial_reference(manifest, root / "reference_all_invalid")
+            self.assertTrue(np.all(np.asanyarray(nib.load(root / "reference_all_invalid" / "initial_reference_valid_mask.nii.gz").dataobj)[:, :, 0] == 0))
+            self.assertIn("slice_a", metadata.read_text())
 
     def test_partial_qc_table_cannot_silently_admit_unchecked_manifest_frames(self):
         with tempfile.TemporaryDirectory() as d:

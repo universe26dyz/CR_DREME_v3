@@ -7,32 +7,62 @@ from cardioresp4d.losses.motion_loss import dreme_mbc_normalization, dreme_zero_
 from cardioresp4d.losses.frequency_loss import dreme_cardiac_leakage_in_resp, dreme_respiratory_leakage_in_card
 from .model import SourceFirstDynamicModel
 from .sampler import DynamicObservation, ViewLocationBalancedSampler
+from .stage_contract import stage_contract
 
 
 class UnifiedProgressiveTrainer:
     """Stage-aware optimizer, losses, sampling and true-timestamp score auxiliary."""
-    def __init__(self, model: SourceFirstDynamicModel, sampler: ViewLocationBalancedSampler, *, pixel_samples: int = 256, learning_rate: float = 1e-3, loss_weights: dict[str, float] | None = None, frequency_prior=None, temporal_every: int = 1, temporal_batch_size: int = 50, cardiac_sampling_fraction: float = .8) -> None:
+    def __init__(self, model: SourceFirstDynamicModel, sampler: ViewLocationBalancedSampler, *, pixel_samples: int = 256, learning_rate: float = 1e-3, optimizer_config: dict[str, dict[str, float]] | None = None, loss_weights: dict[str, float] | None = None, frequency_prior=None, temporal_every: int = 1, temporal_batch_size: int = 50, cardiac_sampling_fraction: float = .8) -> None:
         if pixel_samples <= 0 or learning_rate <= 0 or not 0 <= cardiac_sampling_fraction <= 1:
             raise ValueError("pixel_samples, learning_rate, and cardiac_sampling_fraction are invalid")
         self.model, self.sampler, self.pixel_samples, self.learning_rate = model, sampler, pixel_samples, learning_rate
+        self.optimizer_config = optimizer_config or {}
         self.loss_weights = {"image": 1e-4, "mbc_normalization": 1e-5, "smooth_resp": 1e-5, "smooth_card": 1e-5, "zero_mean_score": 1e-5, "cardiac_leakage_in_resp": 1e-4, "respiratory_leakage_in_card": 1e-4, **(loss_weights or {})}
         self.frequency_prior = frequency_prior
         self.temporal_every, self.temporal_batch_size, self.cardiac_sampling_fraction = temporal_every, temporal_batch_size, cardiac_sampling_fraction
         self.optimizer: torch.optim.Optimizer | None = None
+        self._optimizer_parameter_ids: set[int] = set()
+        self.current_stage: str | None = None
+        self.global_step = 0
+        self.stage_step = 0
+        self.metrics: list[dict[str, object]] = []
 
     def _configure_stage(self, stage: str) -> None:
-        active_resp = {"stage1": 0, "stage2a": 1, "stage2b": 2, "stage2c": 3, "stage3": 3}[stage]
-        groups = {"canonical": self.model.canonical, "film": self.model.film_encoder, "resp": self.model.respiratory_mbc, "card": self.model.cardiac_mbc, "uncertainty": self.model.uncertainty}
-        enabled = {"stage1": {"canonical"}, "stage2a": {"canonical", "film", "resp"}, "stage2b": {"canonical", "film", "resp"}, "stage2c": {"canonical", "film", "resp"}, "stage3": set(groups)}[stage]
+        contract = stage_contract(stage)
+        groups = {"canonical": self.model.canonical, "film": self.model.film_encoder, "respiratory_mbc": self.model.respiratory_mbc, "cardiac_mbc": self.model.cardiac_mbc, "uncertainty": self.model.uncertainty}
+        enabled = contract.trainable_modules
         for name, module in groups.items():
             for parameter in module.parameters():
                 parameter.requires_grad_(name in enabled)
         for index, level in enumerate(self.model.respiratory_mbc.levels):
             for parameter in level.parameters():
-                parameter.requires_grad_("resp" in enabled and index < active_resp)
-        self.model.respiratory_mbc.level_gates.requires_grad_("resp" in enabled)
-        self.model.respiratory_mbc.activate_levels(active_resp)
-        self.optimizer = torch.optim.Adam([parameter for parameter in self.model.parameters() if parameter.requires_grad], lr=self.learning_rate)
+                parameter.requires_grad_("respiratory_mbc" in enabled and index < contract.active_respiratory_levels)
+        self.model.respiratory_mbc.set_active_levels(contract.active_respiratory_levels)
+        stage_key = "stage1" if stage == "stage1" else "stage3" if stage == "stage3" else "stage2"
+        aliases = {"canonical": "canonical_lr", "film": "film_lr", "respiratory_mbc": "respiratory_mbc_lr", "cardiac_mbc": "cardiac_mbc_lr", "uncertainty": "uncertainty_lr"}
+        configured = self.optimizer_config.get(stage_key, {})
+        active_by_module: dict[str, list[torch.nn.Parameter]] = {}
+        for name, module in groups.items():
+            parameters = [parameter for parameter in module.parameters() if parameter.requires_grad]
+            if parameters:
+                active_by_module[name] = parameters
+        if self.optimizer is None:
+            first_name, first_parameters = next(iter(active_by_module.items()))
+            self.optimizer = torch.optim.Adam([{"params": first_parameters, "lr": float(configured.get(aliases[first_name], self.learning_rate)), "name": first_name}])
+            self._optimizer_parameter_ids.update(id(parameter) for parameter in first_parameters)
+            active_by_module.pop(first_name)
+        assert self.optimizer is not None
+        for name, parameters in active_by_module.items():
+            fresh = [parameter for parameter in parameters if id(parameter) not in self._optimizer_parameter_ids]
+            if fresh:
+                self.optimizer.add_param_group({"params": fresh, "lr": float(configured.get(aliases[name], self.learning_rate)), "name": name})
+                self._optimizer_parameter_ids.update(id(parameter) for parameter in fresh)
+        for group in self.optimizer.param_groups:
+            name = group.get("name")
+            if name in aliases:
+                group["lr"] = float(configured.get(aliases[name], self.learning_rate))
+        self.current_stage = stage
+        self.stage_step = 0
 
     def run_stage(self, stage: str, *, steps: int) -> dict[str, object]:
         if stage not in {"stage1", "stage2a", "stage2b", "stage2c", "stage3"} or steps <= 0:
@@ -55,7 +85,28 @@ class UnifiedProgressiveTrainer:
             total.backward()
             gradients = {"inr": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.canonical.parameters()), "film": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.film_encoder.parameters()), "respiratory_sinr": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.respiratory_mbc.parameters()), "cardiac_sinr": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.cardiac_mbc.parameters()), "uncertainty": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.uncertainty.parameters())}
             self.optimizer.step(); losses.append(float(total.detach())); components_last = {key: float(value.detach()) for key, value in components.items()}
-        return {"stage": stage, "steps": steps, "loss_first": losses[0], "loss_last": losses[-1], "loss_components": components_last, "gradient_non_none": gradients}
+            self.global_step += 1; self.stage_step += 1
+            self.metrics.append({"global_step": self.global_step, "stage_step": self.stage_step, "stage": stage, "total": float(total.detach()), **components_last, "learning_rates": [group["lr"] for group in self.optimizer.param_groups], "resp_active_levels": stage_contract(stage).active_respiratory_levels})
+        return {"stage": stage, "steps": steps, "loss_first": losses[0], "loss_last": losses[-1], "loss_mean": sum(losses) / len(losses), "loss_min": min(losses), "loss_max": max(losses), "loss_components": components_last, "gradient_non_none": gradients, "global_step": self.global_step}
+
+    def training_state_dict(self) -> dict[str, object]:
+        if self.optimizer is None or self.current_stage is None:
+            raise RuntimeError("cannot checkpoint before a configured training stage")
+        return {"current_stage": self.current_stage, "global_step": self.global_step, "stage_step": self.stage_step, "optimizer": self.optimizer.state_dict(), "sampler": self.sampler.state_dict(), "metrics": list(self.metrics)}
+
+    def load_training_state_dict(self, state: dict[str, object]) -> None:
+        stage = str(state["current_stage"])
+        order = ("stage1", "stage2a", "stage2b", "stage2c", "stage3")
+        if stage not in order:
+            raise ValueError("checkpoint has unsupported current stage")
+        for name in order[:order.index(stage) + 1]:
+            self._configure_stage(name)
+        assert self.optimizer is not None
+        self.optimizer.load_state_dict(state["optimizer"])  # type: ignore[arg-type]
+        self.sampler.load_state_dict(state["sampler"])  # type: ignore[arg-type]
+        self.global_step = int(state["global_step"])
+        self.stage_step = int(state["stage_step"])
+        self.metrics = list(state.get("metrics", []))
 
     def sample_pixels(self, observation: DynamicObservation) -> torch.Tensor:
         """80/20 cardiac-priority/global sampling in patient-world geometry."""
@@ -79,18 +130,30 @@ class UnifiedProgressiveTrainer:
         target = observation.image[0, pixel_uv[:, 1].long(), pixel_uv[:, 0].long()]
         render = self.model.predict(observation, pixel_uv, stage); prediction = render["predicted_intensity"]
         data = self.model.uncertainty.nll(prediction, target, render["uncertainty"]["variance"]) if stage == "stage3" else (prediction - target).square().mean()
-        image = self.model.canonical.image_regularization(render["intensity_samples"], render["reference_samples_world_mm"], mode="edge")
-        motion = self.model.motion_regularizers(render["scores"])
-        return {"data": data, "image": image, "mbc_normalization": motion["mbc_normalization"], "smooth_resp": motion["smooth_resp"], "smooth_card": motion["smooth_card"]}
+        image = self.model.canonical.image_regularization(render["intensity_samples"], render["reference_samples_world_mm"], mode=self.model.image_regularization_mode, delta=self.model.image_regularization_delta)
+        if stage == "stage1":
+            return {"data": data, "image": image}
+        motion = self.model.motion_regularizers(render["scores"], stage)
+        result = {"data": data, "image": image, "mbc_normalization": motion["mbc_normalization"], "smooth_resp": motion["smooth_resp"]}
+        result.update({key: value for key, value in motion.items() if key not in result})
+        result["resp_score_mean"] = render["scores"]["resp_scores"].mean()
+        result["resp_score_std"] = render["scores"]["resp_scores"].std(unbiased=False)
+        if stage == "stage3":
+            result["smooth_card"] = motion["smooth_card"]
+            result["card_score_mean"] = render["scores"]["card_scores"].mean()
+            result["card_score_std"] = render["scores"]["card_scores"].std(unbiased=False)
+        return result
 
     def _temporal_components(self, stage: str) -> dict[str, torch.Tensor]:
         sequence = self.sampler.temporal_batch(max_items=self.temporal_batch_size)
         if len(sequence) < 3 or self.frequency_prior is None:
             zero = next(self.model.parameters()).sum() * 0.
             return {"zero_mean_score":zero,"cardiac_leakage_in_resp":zero,"respiratory_leakage_in_card":zero}
+        contract = stage_contract(stage)
         scores = [self.model.film_encoder(item.image.unsqueeze(0), center_mm=item.center_mm[None], row_direction=item.row_direction[None], column_direction=item.column_direction[None], normal=item.normal[None], pixel_spacing_mm=item.pixel_spacing_mm[None], slice_thickness_mm=torch.tensor([[item.slice_thickness_mm]], device=item.image.device, dtype=item.image.dtype)) for item in sequence]
-        timestamps = torch.tensor([item.timestamp_s for item in sequence], device=sequence[0].image.device, dtype=sequence[0].image.dtype)
-        resp = torch.cat([score["resp_scores"] for score in scores], 0); card = torch.cat([score["card_scores"] for score in scores], 0)
-        result = {"zero_mean_score":dreme_zero_mean_scores(resp if stage!='stage3' else torch.cat((resp,card),1)), "cardiac_leakage_in_resp":dreme_cardiac_leakage_in_resp(resp,timestamps,self.frequency_prior.cardiac_bands_hz,self.frequency_prior.baseline_bands_hz), "respiratory_leakage_in_card":resp.sum()*0.}
+        timestamps = torch.tensor([item.timestamp_s for item in sequence], device=sequence[0].image.device, dtype=torch.float64)
+        resp = torch.cat([score["resp_scores"][:, :contract.active_respiratory_levels] for score in scores], 0); card = torch.cat([score["card_scores"] for score in scores], 0)
+        prior = self.frequency_prior.for_location(sequence[0].view, sequence[0].slice_id) if hasattr(self.frequency_prior, "for_location") else self.frequency_prior
+        result = {"zero_mean_score":dreme_zero_mean_scores(resp if stage!='stage3' else torch.cat((resp,card),1)), "cardiac_leakage_in_resp":dreme_cardiac_leakage_in_resp(resp,timestamps,prior.cardiac_baseline_pairs), "respiratory_leakage_in_card":resp.sum()*0.}
         if stage == "stage3": result["respiratory_leakage_in_card"] = dreme_respiratory_leakage_in_card(card,timestamps,self.frequency_prior.respiratory_bands_hz)
         return result

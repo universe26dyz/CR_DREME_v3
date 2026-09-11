@@ -54,7 +54,10 @@ def build_initial_reference(
     manifest = Path(manifest_path)
     # Keep every acquired SAX location in the physical stack.  QC only decides
     # whether frames provide supervision, never whether their location exists.
-    dataset = CardioRespDataset(manifest, valid_only=False)
+    # This retained legacy/ablation utility preserves its historical
+    # frame-wise reference semantics; source-first mainline uses per-series
+    # normalization in ``scripts/train_source_first.py`` instead.
+    dataset = CardioRespDataset(manifest, valid_only=False, normalization_mode="per_frame_legacy")
     rows = dataset._rows
     with manifest.open(newline="", encoding="utf-8") as handle:
         original_rows = list(csv.DictReader(handle))

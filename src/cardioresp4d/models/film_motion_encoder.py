@@ -59,6 +59,18 @@ class GeometryFiLMMotionEncoder(nn.Module):
         bands=(2.0**torch.arange(self.position_bands, device=center_mm.device, dtype=center_mm.dtype))*math.pi
         phase = position[..., None] * bands
         position_encoded = torch.cat((position, torch.sin(phase).flatten(-2), torch.cos(phase).flatten(-2)), dim=-1)
-        extent = (self.canonical_upper_world_mm - self.canonical_lower_world_mm).to(center_mm)
-        acquisition = torch.log(torch.cat((pixel_spacing_mm / extent[:2], slice_thickness_mm / extent.mean()), dim=-1).clamp_min(torch.finfo(center_mm.dtype).eps))
+        acquisition = self.acquisition_scalars(center_mm, row_direction, column_direction, normal, pixel_spacing_mm, slice_thickness_mm)
         return torch.cat((position_encoded, row_direction, column_direction, normal, acquisition), dim=-1)
+
+    def acquisition_scalars(self, center_mm: torch.Tensor, row_direction: torch.Tensor, column_direction: torch.Tensor, normal: torch.Tensor, pixel_spacing_mm: torch.Tensor, slice_thickness_mm: torch.Tensor) -> torch.Tensor:
+        """Dimensionless acquisition scale using AABB extent projected on plane axes.
+
+        DICOM pixel index ``u`` moves along IOP row direction with *column*
+        spacing; ``v`` moves along column direction with row spacing.  The
+        same convention is used by ``_pixel_world`` and the PSF adapter.
+        """
+        del center_mm  # kept in the public geometry signature for symmetry.
+        extent = (self.canonical_upper_world_mm - self.canonical_lower_world_mm).to(row_direction)
+        projected = torch.stack(((row_direction.abs() * extent).sum(-1), (column_direction.abs() * extent).sum(-1), (normal.abs() * extent).sum(-1)), dim=-1)
+        physical = torch.stack((pixel_spacing_mm[:, 1], pixel_spacing_mm[:, 0], slice_thickness_mm[:, 0]), dim=-1)
+        return torch.log((physical / projected).clamp_min(torch.finfo(row_direction.dtype).eps))

@@ -7,7 +7,7 @@ name = "cardioresp4d"
 version = "0.1.0"
 description = "Phase 1 data preparation for CardioResp 4D MRI"
 requires-python = ">=3.9"
-dependencies = ["numpy", "pydicom", "PyYAML", "scipy", "matplotlib", "nibabel"]
+dependencies = ["torch>=2.0", "numpy", "pydicom", "PyYAML", "scipy", "matplotlib", "nibabel", "omegaconf", "ipdb", "termcolor"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

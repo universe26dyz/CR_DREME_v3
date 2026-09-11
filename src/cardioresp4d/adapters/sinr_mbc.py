@@ -87,18 +87,33 @@ class RespiratorySINRMBCAdapter(nn.Module):
         if len(logical_control_shapes) != 3:
             raise ValueError("v3 respiratory branch requires exactly three levels")
         self.levels = nn.ModuleList([SINRFFDBasis(lower_world_mm, upper_world_mm, logical_control_shape=shape, cps=cps, hidden_dim=hidden_dim) for shape in logical_control_shapes])
-        self.level_gates = nn.Parameter(torch.zeros(len(self.levels)))
+        # This is schedule state, never a learnable amplitude.  The caller must
+        # still request an explicit active count for formal loss evaluation.
+        self.register_buffer("active_level_count", torch.tensor(0, dtype=torch.long), persistent=True)
 
-    def activate_levels(self, active: int) -> None:
-        """Start newly scheduled levels near zero without altering upstream networks."""
+    def set_active_levels(self, active: int) -> None:
+        """Set non-trainable progressive schedule state without touching SINR."""
         if not 0 <= active <= len(self.levels):
             raise ValueError("invalid active respiratory level count")
-        with torch.no_grad():
-            gates = self.level_gates[:active]
-            gates[gates == 0] = 1e-6
+        self.active_level_count.fill_(int(active))
+
+    def raw_active(self, points_world_mm: torch.Tensor, *, active_levels: int | None = None) -> torch.Tensor:
+        """Evaluate only requested raw (ungated) source-SINR bases.
+
+        The result is ``[B,L,N,xyz]``.  It intentionally has no schedule
+        multiplier: Eq.6 normalizes these physical bases, while FiLM scores
+        produce the time-varying DVF in a separate module.
+        """
+        active = int(self.active_level_count.item()) if active_levels is None else int(active_levels)
+        if not 0 <= active <= len(self.levels):
+            raise ValueError("invalid active respiratory level count")
+        if active == 0:
+            batch, count = points_world_mm.shape[:2]
+            return points_world_mm.new_empty((batch, 0, count, 3))
+        return torch.stack([self.levels[index](points_world_mm) for index in range(active)], dim=1)
 
     def forward(self, points_world_mm: torch.Tensor) -> torch.Tensor:
-        return torch.stack([gate * level(points_world_mm) for gate, level in zip(self.level_gates, self.levels)], dim=1)
+        return self.raw_active(points_world_mm)
 
 
 class CardiacSINRMBCAdapter(nn.Module):

@@ -90,3 +90,22 @@
 
 - 基线 commit: `d947ad71bc84dbe5441117b6c0e0400c39337909`
 - 最终 commit: 待创建。
+
+---
+
+## 2026-09-10 — v3_change3 closure repair
+
+### Baseline
+
+- `2e8975e6d73862feda57bcaf6eeefc8d464ce8db`
+
+### Verified changes
+
+- 统一 Stage1/2a/2b/2c/3 source-first runtime contract、active raw MBC Eq.6、complex paired Eq.8、Phase-1 location-aware frequency evidence、factory/effective config、checkpoint/RNG/metrics 和 CPU preflight。
+- 保留 full acquisition-supported FOV；cardiac box 仅为局部 motion/sampling/QC。
+- 保留 legacy Stage1A/Stage1B/reference 工具，明确不在 source-first mainline。
+
+### Verification
+
+- 本地 `knesvr_torch`：`python -m unittest discover -s tests`，124 passed、1 explicit skip。
+- 本地真实 DYL0709 no-step preflight：PASS；未运行 GPU 或长训练。

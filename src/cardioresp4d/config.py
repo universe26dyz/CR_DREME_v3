@@ -253,6 +253,32 @@ def validate_config(config: AppConfig) -> None:
             raise ValueError("roi cardiac box size must be finite and positive")
 
 
+def validate_manifest_config(config: AppConfig) -> None:
+    """Validate the manifest builder boundary without imposing 3-view pipeline policy.
+
+    The public low-level manifest API is also used by isolated DICOM loader
+    tests and utilities. Full Phase-1 topology remains enforced by
+    ``load_config``/``validate_config`` before the formal pipeline is invoked.
+    """
+    validate_expected_frames_per_slice(config.expected_frames_per_slice)
+    validate_output_path(config.dicom_root, config.results_dir, "project.results_dir")
+    if not config.views or len(set(config.views)) != len(config.views):
+        raise ValueError("manifest views must be non-empty and unique")
+    if not config.manifest_stem or Path(config.manifest_stem).name != config.manifest_stem:
+        raise ValueError("data.manifest_stem must be a filename stem")
+    components = (config.data.inspection_filename, config.geometry.output_subdir, config.frequency.output_subdir,
+                  config.roi.output_subdir, config.reference.output_subdir, config.outlier_qc.output_subdir)
+    if any(not x or Path(x).name != x for x in components):
+        raise ValueError("output filenames/subdirectories must be single path components")
+    if (config.roi.cardiac_box_center_mm is None) != (config.roi.cardiac_box_size_mm is None):
+        raise ValueError("roi cardiac box center and size must be supplied together")
+    if config.roi.cardiac_box_center_mm is not None:
+        if not all(math.isfinite(value) for value in config.roi.cardiac_box_center_mm):
+            raise ValueError("roi cardiac box center must be finite")
+        if not all(math.isfinite(value) and value > 0.0 for value in config.roi.cardiac_box_size_mm or ()):
+            raise ValueError("roi cardiac box size must be finite and positive")
+
+
 def validate_expected_frames_per_slice(value: int) -> None:
     if value != EXPECTED_FRAMES_PER_SLICE:
         raise ValueError(f"expected_frames_per_slice must equal exactly {EXPECTED_FRAMES_PER_SLICE} for Phase 1 v1")

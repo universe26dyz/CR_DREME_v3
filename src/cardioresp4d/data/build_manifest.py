@@ -12,7 +12,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from cardioresp4d.config import AppConfig, load_config, validate_config
+from cardioresp4d.config import AppConfig, load_config, validate_manifest_config
 from cardioresp4d.data.inspect_dataset import scan_dicom_frames
 
 MANIFEST_COLUMNS = (
@@ -25,7 +25,7 @@ SCHEMA_VERSION = 2
 
 def build_manifest(config: AppConfig) -> tuple[Path, Path]:
     """Write canonical pair plus sensitive runtime map; return only canonical paths."""
-    validate_config(config)
+    validate_manifest_config(config)
     frames = scan_dicom_frames(config.dicom_root, config.views,
                                expected_frames_per_slice=config.expected_frames_per_slice,
                                expected_series_per_view=dict(config.data.expected_series_per_view or {}))
@@ -55,7 +55,7 @@ def build_manifest(config: AppConfig) -> tuple[Path, Path]:
 
 def validate_manifest_artifacts(config: AppConfig) -> tuple[Path, Path]:
     """Reject stale, mismatched, incomplete or wrong-root canonical manifests."""
-    validate_config(config)
+    validate_manifest_config(config)
     csv_path, json_path = config.manifest_csv_path, config.manifest_json_path
     if not csv_path.is_file() or not json_path.is_file():
         raise FileNotFoundError("Both canonical manifest CSV and JSON are required")

@@ -66,7 +66,8 @@ class V3Change1ContractsTest(unittest.TestCase):
         self.assertEqual((16, 16, 16), tuple(basis.ffd.img_size))
         resp = RespiratorySINRMBCAdapter(torch.tensor([-8., -8., -8.]), torch.tensor([8., 8., 8.]), hidden_dim=8)
         self.assertEqual([(8, 8, 8), (12, 12, 12), (16, 16, 16)], [x.logical_control_shape for x in resp.levels])
-        self.assertTrue(torch.allclose(resp.level_gates.detach(), torch.zeros(3)))
+        self.assertEqual(0, int(resp.active_level_count))
+        self.assertFalse(any("level_gates" in name for name, _ in resp.named_parameters()))
 
     def test_uncertainty_aggregates_scale_before_squaring(self) -> None:
         uncertainty = NeSVoRDynamicFrameUncertainty(latent_dim=2, n_dynamic_frames=1, frame_embedding_dim=1, width=4, depth=0)

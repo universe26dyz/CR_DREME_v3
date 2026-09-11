@@ -11,8 +11,10 @@ model:
     latent_dim: 16
     width: 64
     depth: 2
+    spatial_scaling: 1.0
   psf: {implementation: nesvor_official, n_samples: 8}
-  uncertainty: {implementation: nesvor_derived, enable_stage: stage3}
+  film: {channels: 64, position_bands: 4}
+  uncertainty: {implementation: nesvor_derived, enable_stage: stage3, frame_embedding_dim: 8, width: 64, depth: 2}
   respiratory_mbc: {implementation: sinr_official, upstream_commit: 1a524ca7ae453b55310595fe957245088a108233, logical_control_shapes: [[8,8,8],[12,12,12],[16,16,16]], cps: 2, hidden_dim: 64}
   cardiac_mbc: {implementation: sinr_official, local_box: true, logical_control_shape: [16,16,16], cps: 2, hidden_dim: 64, taper_mm: 4}
 training:
@@ -23,10 +25,18 @@ training:
   stage2: {respiratory_progressive: true}
   stage3: {cardiac_enabled: true, uncertainty_enabled: true}
   loss_weights: {image: 0.0001, mbc_normalization: 0.00001, smooth_resp: 0.00001, smooth_card: 0.00001, zero_mean_score: 0.00001, cardiac_leakage_in_resp: 0.0001, respiratory_leakage_in_card: 0.0001}
+  image_regularization: {mode: edge, delta: 1.0}
+  optimizer:
+    stage1: {canonical_lr: 0.001}
+    stage2: {canonical_lr: 0.001, film_lr: 0.001, respiratory_mbc_lr: 0.001}
+    stage3: {canonical_lr: 0.001, film_lr: 0.001, respiratory_mbc_lr: 0.001, cardiac_mbc_lr: 0.001, uncertainty_lr: 0.001}
   temporal_auxiliary: {every_steps: 1, mode: full_location_sequence, max_frames: 50, frequency_bands_json: frequency_bands.json}
   frequency_prior: {allow_template_fallback: false}
-  motion_regularization: {evaluation_grid: {mode: fixed_physical, shape: [16,16,16]}}
+  motion_regularization:
+    respiratory_evaluation_grid: {mode: fixed_physical_full_fov, shape: [16,16,16]}
+    cardiac_evaluation_grid: {mode: fixed_physical_cardiac_box, shape: [16,16,16]}
   normalization: {mode: per_series}
+  seed: 0
 domain: {reconstruction_domain: full_acquisition_supported, cardiac_box_is_crop: false}
 coverage: {plane_center_qc: true, psf_aware: true, view_count: true, observation_count: true}
 runtime_status: local_cpu_verified_pending_gpu_real_data

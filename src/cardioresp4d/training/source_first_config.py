@@ -37,6 +37,16 @@ def validate_source_first_config(config: Mapping[str, Any], project_root: str | 
         raise ValueError("v3 formal uncertainty schedule is stage3")
     if training.get("view_balanced") is not True:
         raise ValueError("v3 formal training requires view_balanced = true")
+    if training.get("fixed_location_balanced") is not True:
+        raise ValueError("v3 formal training requires fixed_location_balanced = true")
+    if not isinstance(training.get("seed"), int):
+        raise ValueError("v3 formal training requires integer training.seed")
+    for key in ("psf", "film", "uncertainty", "respiratory_mbc", "cardiac_mbc"):
+        if not isinstance(model.get(key), Mapping):
+            raise ValueError(f"source-first configuration requires model.{key}")
+    regularization = _mapping(training, "motion_regularization")
+    if not isinstance(regularization.get("respiratory_evaluation_grid"), Mapping) or not isinstance(regularization.get("cardiac_evaluation_grid"), Mapping):
+        raise ValueError("v3 formal motion regularization requires separate respiratory and cardiac grids")
 
 
 def validate_source_dependencies() -> None:
@@ -44,6 +54,7 @@ def validate_source_dependencies() -> None:
     from cardioresp4d.adapters.film import FiLMAdapter  # noqa: F401
     from cardioresp4d.adapters.nesvor_inr import NeSVoRCanonicalAdapter  # noqa: F401
     from cardioresp4d.adapters.nesvor_psf import NeSVoRPSFAdapter  # noqa: F401
+    from cardioresp4d.adapters.nesvor_uncertainty import NeSVoRDynamicFrameUncertainty  # noqa: F401
     from cardioresp4d.adapters.sinr_mbc import SINRFFDBasis  # noqa: F401
 
 
