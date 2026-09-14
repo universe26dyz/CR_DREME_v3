@@ -7,7 +7,7 @@ from cardioresp4d.losses.motion_loss import dreme_mbc_normalization, dreme_zero_
 from cardioresp4d.losses.frequency_loss import dreme_cardiac_leakage_in_resp, dreme_respiratory_leakage_in_card
 from .model import SourceFirstDynamicModel
 from .sampler import DynamicObservation, ViewLocationBalancedSampler
-from .stage_contract import stage_contract
+from .stage_contract import progressive_stage_order, stage_contract
 
 
 class UnifiedProgressiveTrainer:
@@ -34,11 +34,18 @@ class UnifiedProgressiveTrainer:
         for name, module in groups.items():
             for parameter in module.parameters():
                 parameter.requires_grad_(name in enabled)
+        if contract.film_train_mode == "card_head_only":
+            # Stage3a intentionally leaves the Stage2c shared FiLM/respiratory
+            # representation immutable while its cardiac output head warms up.
+            for parameter in self.model.film_encoder.parameters():
+                parameter.requires_grad_(False)
+            for parameter in self.model.film_encoder.card.parameters():
+                parameter.requires_grad_(True)
         for index, level in enumerate(self.model.respiratory_mbc.levels):
             for parameter in level.parameters():
-                parameter.requires_grad_("respiratory_mbc" in enabled and index < contract.active_respiratory_levels)
+                parameter.requires_grad_(contract.train_respiratory_mbc and index < contract.active_respiratory_levels)
         self.model.respiratory_mbc.set_active_levels(contract.active_respiratory_levels)
-        stage_key = "stage1" if stage == "stage1" else "stage3" if stage == "stage3" else "stage2"
+        stage_key = "stage2" if stage.startswith("stage2") else stage
         aliases = {"canonical": "canonical_lr", "film": "film_lr", "respiratory_mbc": "respiratory_mbc_lr", "cardiac_mbc": "cardiac_mbc_lr", "uncertainty": "uncertainty_lr"}
         configured = self.optimizer_config.get(stage_key, {})
         active_by_module: dict[str, list[torch.nn.Parameter]] = {}
@@ -65,7 +72,11 @@ class UnifiedProgressiveTrainer:
         self.stage_step = 0
 
     def run_stage(self, stage: str, *, steps: int) -> dict[str, object]:
-        if stage not in {"stage1", "stage2a", "stage2b", "stage2c", "stage3"} or steps <= 0:
+        try:
+            contract = stage_contract(stage)
+        except ValueError as exc:
+            raise ValueError("invalid progressive stage or step count") from exc
+        if steps <= 0:
             raise ValueError("invalid progressive stage or step count")
         self._configure_stage(stage)
         assert self.optimizer is not None
@@ -75,18 +86,18 @@ class UnifiedProgressiveTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             rows = [self._observation_components(observation, stage) for observation in self.sampler.sample_step()]
             components = {key: torch.stack([row[key] for row in rows]).mean() for key in rows[0]}
-            if stage != "stage1" and step % self.temporal_every == 0:
+            if contract.enable_motion and step % self.temporal_every == 0:
                 components.update(self._temporal_components(stage))
             total = components["data"] + self.loss_weights["image"] * components["image"]
-            if stage != "stage1":
+            if contract.enable_motion:
                 total = total + self.loss_weights["mbc_normalization"] * components["mbc_normalization"] + self.loss_weights["smooth_resp"] * components["smooth_resp"] + self.loss_weights["zero_mean_score"] * components.get("zero_mean_score", total * 0.) + self.loss_weights["cardiac_leakage_in_resp"] * components.get("cardiac_leakage_in_resp", total * 0.)
-            if stage == "stage3":
+            if contract.enable_cardiac:
                 total = total + self.loss_weights["smooth_card"] * components["smooth_card"] + self.loss_weights["respiratory_leakage_in_card"] * components.get("respiratory_leakage_in_card", total * 0.)
             total.backward()
             gradients = {"inr": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.canonical.parameters()), "film": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.film_encoder.parameters()), "respiratory_sinr": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.respiratory_mbc.parameters()), "cardiac_sinr": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.cardiac_mbc.parameters()), "uncertainty": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.uncertainty.parameters())}
             self.optimizer.step(); losses.append(float(total.detach())); components_last = {key: float(value.detach()) for key, value in components.items()}
             self.global_step += 1; self.stage_step += 1
-            self.metrics.append({"global_step": self.global_step, "stage_step": self.stage_step, "stage": stage, "total": float(total.detach()), **components_last, "learning_rates": [group["lr"] for group in self.optimizer.param_groups], "resp_active_levels": stage_contract(stage).active_respiratory_levels})
+            self.metrics.append({"global_step": self.global_step, "stage_step": self.stage_step, "stage": stage, "total": float(total.detach()), **components_last, "learning_rates": [group["lr"] for group in self.optimizer.param_groups], "resp_active_levels": contract.active_respiratory_levels})
         return {"stage": stage, "steps": steps, "loss_first": losses[0], "loss_last": losses[-1], "loss_mean": sum(losses) / len(losses), "loss_min": min(losses), "loss_max": max(losses), "loss_components": components_last, "gradient_non_none": gradients, "global_step": self.global_step}
 
     def training_state_dict(self) -> dict[str, object]:
@@ -96,7 +107,9 @@ class UnifiedProgressiveTrainer:
 
     def load_training_state_dict(self, state: dict[str, object]) -> None:
         stage = str(state["current_stage"])
-        order = ("stage1", "stage2a", "stage2b", "stage2c", "stage3")
+        if stage == "stage3":
+            raise ValueError("legacy v3 Stage3 checkpoint is not compatible with v3_change4 schedule; resume from the Stage2c checkpoint")
+        order = progressive_stage_order()
         if stage not in order:
             raise ValueError("checkpoint has unsupported current stage")
         for name in order[:order.index(stage) + 1]:
@@ -129,16 +142,17 @@ class UnifiedProgressiveTrainer:
         pixel_uv = self.sample_pixels(observation)
         target = observation.image[0, pixel_uv[:, 1].long(), pixel_uv[:, 0].long()]
         render = self.model.predict(observation, pixel_uv, stage); prediction = render["predicted_intensity"]
-        data = self.model.uncertainty.nll(prediction, target, render["uncertainty"]["variance"]) if stage == "stage3" else (prediction - target).square().mean()
+        contract = stage_contract(stage)
+        data = self.model.uncertainty.nll(prediction, target, render["uncertainty"]["variance"]) if contract.data_term == "gaussian_nll" else (prediction - target).square().mean()
         image = self.model.canonical.image_regularization(render["intensity_samples"], render["reference_samples_world_mm"], mode=self.model.image_regularization_mode, delta=self.model.image_regularization_delta)
-        if stage == "stage1":
+        if not contract.enable_motion:
             return {"data": data, "image": image}
         motion = self.model.motion_regularizers(render["scores"], stage)
         result = {"data": data, "image": image, "mbc_normalization": motion["mbc_normalization"], "smooth_resp": motion["smooth_resp"]}
         result.update({key: value for key, value in motion.items() if key not in result})
         result["resp_score_mean"] = render["scores"]["resp_scores"].mean()
         result["resp_score_std"] = render["scores"]["resp_scores"].std(unbiased=False)
-        if stage == "stage3":
+        if contract.enable_cardiac:
             result["smooth_card"] = motion["smooth_card"]
             result["card_score_mean"] = render["scores"]["card_scores"].mean()
             result["card_score_std"] = render["scores"]["card_scores"].std(unbiased=False)
@@ -154,6 +168,9 @@ class UnifiedProgressiveTrainer:
         timestamps = torch.tensor([item.timestamp_s for item in sequence], device=sequence[0].image.device, dtype=torch.float64)
         resp = torch.cat([score["resp_scores"][:, :contract.active_respiratory_levels] for score in scores], 0); card = torch.cat([score["card_scores"] for score in scores], 0)
         prior = self.frequency_prior.for_location(sequence[0].view, sequence[0].slice_id) if hasattr(self.frequency_prior, "for_location") else self.frequency_prior
-        result = {"zero_mean_score":dreme_zero_mean_scores(resp if stage!='stage3' else torch.cat((resp,card),1)), "cardiac_leakage_in_resp":dreme_cardiac_leakage_in_resp(resp,timestamps,prior.cardiac_baseline_pairs), "respiratory_leakage_in_card":resp.sum()*0.}
-        if stage == "stage3": result["respiratory_leakage_in_card"] = dreme_respiratory_leakage_in_card(card,timestamps,self.frequency_prior.respiratory_bands_hz)
+        result = {"zero_mean_score":dreme_zero_mean_scores(resp if not contract.enable_cardiac else torch.cat((resp,card),1)), "cardiac_leakage_in_resp":dreme_cardiac_leakage_in_resp(resp,timestamps,prior.cardiac_baseline_pairs), "respiratory_leakage_in_card":resp.sum()*0.}
+        if contract.enable_cardiac:
+            # Phase-1 respiratory occupancy is location-specific when reliable;
+            # using the aggregate here would make Eq.9 suppress the wrong band.
+            result["respiratory_leakage_in_card"] = dreme_respiratory_leakage_in_card(card, timestamps, prior.respiratory_bands_hz)
         return result

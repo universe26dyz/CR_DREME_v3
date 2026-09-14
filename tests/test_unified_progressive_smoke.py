@@ -26,12 +26,12 @@ class UnifiedProgressiveSmokeTest(unittest.TestCase):
         self.assertEqual({"SAX", "2CH", "4CH"}, {item.view for item in selected})
         self.assertTrue(all(item.qc_valid and item.qc_reason not in {"manual_exclusion", "slice_local_scale_absolute"} for item in selected))
 
-    def test_stage3_tiny_pipeline_backpropagates_to_all_source_backed_modules(self) -> None:
+    def test_stage3c_tiny_pipeline_backpropagates_to_all_source_backed_modules(self) -> None:
         observations = [_observation("SAX", "s", 0), _observation("2CH", "c2", 1), _observation("4CH", "c4", 2)]
         sampler = ViewLocationBalancedSampler(observations, seed=1)
         model = SourceFirstDynamicModel(torch.tensor([-10., -10., -10.]), torch.tensor([10., 10., 10.]), cardiac_lower_world_mm=torch.tensor([-5., -5., -5.]), cardiac_upper_world_mm=torch.tensor([5., 5., 5.]), n_dynamic_frames=3, inr_width=8, inr_depth=1, latent_dim=4, motion_hidden_dim=8, respiratory_grid_shapes=((4, 4, 4), (5, 5, 5), (6, 6, 6)), cardiac_grid_shape=(4, 4, 4), psf_samples=2)
         trainer = UnifiedProgressiveTrainer(model, sampler, pixel_samples=4, learning_rate=1e-3)
-        report = trainer.run_stage("stage3", steps=1)
+        report = trainer.run_stage("stage3c", steps=1)
         self.assertTrue(torch.isfinite(torch.tensor(report["loss_last"])))
         self.assertTrue(report["gradient_non_none"]["inr"])
         self.assertTrue(report["gradient_non_none"]["film"])

@@ -92,7 +92,7 @@ class StageContractTest(unittest.TestCase):
         subject.predict(item, torch.tensor([[1., 1.]]), "stage2b")
         self.assertGreater(calls[0], 0); self.assertGreater(calls[1], 0); self.assertEqual(0, calls[2]); self.assertEqual(0, cardiac[0])
         calls[:] = [0, 0, 0]
-        subject.predict(item, torch.tensor([[1., 1.]]), "stage3")
+        subject.predict(item, torch.tensor([[1., 1.]]), "stage3c")
         self.assertTrue(all(value > 0 for value in calls)); self.assertGreater(cardiac[0], 0)
 
     def test_oblique_dicom_plane_and_model_pixel_world_and_projected_extents_agree(self) -> None:

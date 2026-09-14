@@ -109,3 +109,17 @@
 
 - 本地 `knesvr_torch`：`python -m unittest discover -s tests`，124 passed、1 explicit skip。
 - 本地真实 DYL0709 no-step preflight：PASS；未运行 GPU 或长训练。
+
+---
+
+## 2026-09-14 — v3_change4 local priors and Stage3 split
+
+- Phase-1 respiratory/cardiac evidence now resolves independently by
+  `view/slice_id`; Eq.9 consumes the resolved local respiratory band.
+- Formal Stage3 schedule is Stage3a cardiac warm-up, Stage3b joint MSE, and
+  Stage3c uncertainty NLL; legacy `--stage3-steps` and legacy Stage3 resume
+  fail explicitly.
+- Added portable SINR device spacing, CPU checkpoint/RNG loading, nested prior
+  JSON serialization, diagnostic entrypoint, and CUDA-optional regression.
+- CPU verification: 135 tests passed, 2 explicit CUDA skips; no real-data
+  training was run.

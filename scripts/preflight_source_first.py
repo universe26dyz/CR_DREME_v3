@@ -69,7 +69,7 @@ def main() -> None:
     coverage_report = {"plane_center_qc": coverage, "canonical_hole_interpretation": "plane-center coverage zeros are geometry-QC observations, never canonical-volume holes", "psf_aware_coverage_required": bool(config.get("coverage", {}).get("psf_aware", False)), "view_count_required": bool(config.get("coverage", {}).get("view_count", False)), "observation_count_required": bool(config.get("coverage", {}).get("observation_count", False))}
     observations, normalization, normalization_groups = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=config["training"]["normalization"]["mode"])
     prior = load_training_frequency_prior(args.frequency_bands, allow_template_fallback=False)
-    model = build_source_first_model(config, domain, n_dynamic_frames=sum(item.qc_valid for item in observations), device=device).train()
+    model = build_source_first_model(config, domain, n_dynamic_frames=sum(item.qc_valid for item in observations), device=device).to(device).train()
     valid = [item for item in observations if item.qc_valid]
     examples = {item.view: item for item in valid}
     missing = sorted({"SAX", "2CH", "4CH"} - set(examples))
@@ -77,7 +77,7 @@ def main() -> None:
         raise ValueError("preflight lacks valid required views: " + ", ".join(missing))
     no_grad = {}
     with torch.no_grad():
-        for stage in ("stage1", "stage2a", "stage2b", "stage2c", "stage3"):
+        for stage in ("stage1", "stage2a", "stage2b", "stage2c", "stage3a", "stage3b", "stage3c"):
             output = model.predict(examples["SAX"], torch.tensor([[0., 0.]], device=device), stage)
             no_grad[stage] = {"predicted_shape": list(output["predicted_intensity"].shape), "finite": bool(torch.isfinite(output["predicted_intensity"]).all()), "has_uncertainty": "uncertainty" in output}
     locations = _location_report(observations, prior)

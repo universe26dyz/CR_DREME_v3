@@ -101,6 +101,17 @@ was launched, by design: it remains a GPU-server task.
 
 ## v3_change3 closure repair — 2026-09-10
 
+## v3_change4 schedule and local-prior repair — 2026-09-14
+
+Phase-1 respiratory and cardiac candidates are now independently resolved per
+`view/slice_id`, with separate provenance and independently auditable global
+fallback. Eq.9 consumes that resolved local respiratory prior. Stage3 is split
+into Stage3a cardiac-head/MBC warm-up (MSE), Stage3b full joint refinement
+(MSE), and Stage3c uncertainty refinement (Gaussian NLL). The canonical FOV,
+cardiac local box, NUDFT `/N`, Eq.8/Eq.9 weights, source lock and uncertainty
+architecture are unchanged. The portable SINR device, CPU checkpoint RNG, and
+nested frequency-prior JSON report fixes are formal runtime behavior.
+
 The v3_change3 repair moved the formal mainline from masking/fallback behavior
 to explicit runtime contracts. `training/stage_contract.py` owns Stage1,
 Stage2a/b/c and Stage3 call/gradient/regularizer ownership. Stage1 now calls

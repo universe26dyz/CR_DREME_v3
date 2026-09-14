@@ -3,6 +3,12 @@
 > **文档版本：2026-09-09 v3（Source-first NeSVoR + SINR + DREME cardiorespiratory decomposition）**
 >
 > **本版本正式取代 2026-09-08 v2 作为后续实现主规格。**
+
+> **v3_change4 addendum（2026-09-14）**：正式 late schedule 为 Stage3a
+> cardiac warm-up（仅 cardiac MBC 与 FiLM cardiac head，MSE）、Stage3b
+> full cardiorespiratory joint MSE、Stage3c uncertainty Gaussian NLL。Phase-1
+> respiratory/cardiac evidence 分别按 `view/slice_id` 解析；Eq.9 使用该
+> resolved local respiratory prior。
 >
 > 本 v3 的核心变化不是简单调参，而是修正实现策略：
 >

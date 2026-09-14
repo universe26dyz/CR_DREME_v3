@@ -71,10 +71,11 @@ python scripts/preflight_source_first.py \
   --device cpu
 ```
 
-## First GPU real-data validation
+## v3_change4 first GPU real-data validation
 
-After copying this checkout to the GPU host, run only the short Stage1 ->
-Stage2a chain:
+After copying this checkout to the GPU host, resume the existing Stage2c
+checkpoint with Stage3a only, inspect the diagnostic, then run Stage3b only.
+Do not automatically run Stage3c: it is the uncertainty-only refinement stage.
 
 ```bash
 python scripts/train_source_first.py \
@@ -84,9 +85,13 @@ python scripts/train_source_first.py \
   --qc-table /absolute/path/to/results/acquisition_qc/acquisition_qc.csv \
   --canonical-domain /absolute/path/to/results/domain/canonical_domain.json \
   --output-dir /absolute/path/to/results/training/source_first_short \
-  --device cuda --stage1-steps 100 --stage2a-steps 100 \
-  --stage2b-steps 0 --stage2c-steps 0 --stage3-steps 0
+  --device cuda --pixel-samples 256 --seed 0 --resume /absolute/path/to/stage2c/source_first_last.pt \
+  --stage1-steps 0 --stage2a-steps 0 --stage2b-steps 0 --stage2c-steps 0 \
+  --stage3a-steps 100 --stage3b-steps 0 --stage3c-steps 0
 ```
 
+Then inspect the resulting checkpoint with `scripts/diagnose_change4_checkpoint.py`
+and resume that checkpoint with `--stage3a-steps 0 --stage3b-steps 100
+--stage3c-steps 0`. The legacy `--stage3-steps` option is a deprecated error.
 This entrypoint uses individual valid dynamic frames; it never creates or
 loads `initial_reference.nii.gz`, mean slices, Stage1A, or Stage1B.

@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -46,11 +47,15 @@ def main() -> None:
     parser.add_argument("--frequency-bands", type=Path, help="Phase-1 aggregate frequency_bands.json; overrides config-relative path")
     parser.add_argument("--device", default="cuda"); parser.add_argument("--pixel-samples", type=int, default=256)
     parser.add_argument("--stage1-steps", type=int, default=100); parser.add_argument("--stage2a-steps", type=int, default=100)
-    parser.add_argument("--stage2b-steps", type=int, default=0); parser.add_argument("--stage2c-steps", type=int, default=0); parser.add_argument("--stage3-steps", type=int, default=0)
+    parser.add_argument("--stage2b-steps", type=int, default=0); parser.add_argument("--stage2c-steps", type=int, default=0)
+    parser.add_argument("--stage3a-steps", type=int, default=0); parser.add_argument("--stage3b-steps", type=int, default=0); parser.add_argument("--stage3c-steps", type=int, default=0)
+    parser.add_argument("--stage3-steps", type=int, default=0, help="Deprecated; use --stage3a-steps/--stage3b-steps/--stage3c-steps")
     parser.add_argument("--seed", type=int, help="Overrides training.seed and is recorded in the checkpoint/report")
     parser.add_argument("--resume", type=Path, help="Complete source-first checkpoint created by this entry point")
     args = parser.parse_args(); device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available(): parser.error("CUDA requested but unavailable")
+    if args.stage3_steps:
+        parser.error("--stage3-steps is deprecated after v3_change4; use --stage3a-steps / --stage3b-steps / --stage3c-steps")
     with args.source_config.open(encoding="utf-8") as handle: source_config = yaml.safe_load(handle)
     validate_source_first_config(source_config, PROJECT_ROOT)
     validate_source_dependencies()
@@ -65,15 +70,16 @@ def main() -> None:
     prior = load_training_frequency_prior(bands_path, allow_template_fallback=bool(source_config["training"].get("frequency_prior",{}).get("allow_template_fallback",False)))
     trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(observations, seed=seed), pixel_samples=args.pixel_samples, optimizer_config=source_config["training"]["optimizer"], loss_weights=source_config["training"]["loss_weights"], frequency_prior=prior, temporal_every=int(source_config["training"]["temporal_auxiliary"]["every_steps"]), temporal_batch_size=int(source_config["training"]["temporal_auxiliary"]["max_frames"]), cardiac_sampling_fraction=float(source_config["training"]["cardiac_sampling_fraction"]))
     if args.resume is not None:
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         if checkpoint.get("checkpoint_schema") != 1:
             raise ValueError("--resume requires source-first checkpoint_schema=1")
         model.load_state_dict(checkpoint["model"])
         trainer.load_training_state_dict(checkpoint["training_state"])
         restore_rng_state(checkpoint["rng_state"])
-    stages = (("stage1", args.stage1_steps), ("stage2a", args.stage2a_steps), ("stage2b", args.stage2b_steps), ("stage2c", args.stage2c_steps), ("stage3", args.stage3_steps))
-    report = {"stages": {stage: trainer.run_stage(stage, steps=steps) for stage, steps in stages if steps > 0}, "effective_config": {**effective_model_config(model), "optimizer_config": source_config["training"]["optimizer"]}, "normalization_parameters": normalization_parameters, "normalization_groups": normalization_groups, "frequency_prior": prior.__dict__, "source_lock": source_lock, "source_lock_verified": bool(source_lock.get("verified")), "reproducibility": reproducibility, "device": str(device), "torch_version": torch.__version__, "resumed_from": str(args.resume) if args.resume else None}
-    args.output_dir.mkdir(parents=True, exist_ok=True); torch.save({"checkpoint_schema": 1, "model": model.state_dict(), "training_state": trainer.training_state_dict(), "rng_state": capture_rng_state(), "report": report, "frequency_prior": prior.__dict__, "normalization_parameters": normalization_parameters}, args.output_dir / "source_first_last.pt")
+    stages = (("stage1", args.stage1_steps), ("stage2a", args.stage2a_steps), ("stage2b", args.stage2b_steps), ("stage2c", args.stage2c_steps), ("stage3a", args.stage3a_steps), ("stage3b", args.stage3b_steps), ("stage3c", args.stage3c_steps))
+    prior_payload = asdict(prior)
+    report = {"stages": {stage: trainer.run_stage(stage, steps=steps) for stage, steps in stages if steps > 0}, "effective_config": {**effective_model_config(model), "optimizer_config": source_config["training"]["optimizer"]}, "normalization_parameters": normalization_parameters, "normalization_groups": normalization_groups, "frequency_prior": prior_payload, "source_lock": source_lock, "source_lock_verified": bool(source_lock.get("verified")), "reproducibility": reproducibility, "device": str(device), "torch_version": torch.__version__, "resumed_from": str(args.resume) if args.resume else None}
+    args.output_dir.mkdir(parents=True, exist_ok=True); torch.save({"checkpoint_schema": 1, "model": model.state_dict(), "training_state": trainer.training_state_dict(), "rng_state": capture_rng_state(), "report": report, "frequency_prior": prior_payload, "normalization_parameters": normalization_parameters}, args.output_dir / "source_first_last.pt")
     (args.output_dir / "source_first_training_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     (args.output_dir / "effective_config.json").write_text(json.dumps(report["effective_config"], indent=2) + "\n", encoding="utf-8")
     with (args.output_dir / "training_metrics.csv").open("w", newline="", encoding="utf-8") as handle:

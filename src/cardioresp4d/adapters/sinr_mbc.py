@@ -44,7 +44,10 @@ class SINRFFDBasis(nn.Module):
             raise ValueError("logical_control_shape, cps, and hidden_dim must be positive")
         self.dense_evaluation_shape = tuple(logical * spacing for logical, spacing in zip(self.logical_control_shape, self.cps))
         self.padded_control_shape = tuple(int(math.ceil(size / stride)) + 2 for size, stride in zip(self.dense_evaluation_shape, self.cps))
-        self.register_buffer("grid_spacing_mm", (self.upper_world_mm - self.lower_world_mm) / torch.tensor([size - 1 for size in self.dense_evaluation_shape], dtype=torch.float32))
+        # Adapter-only device fix: bounds can be constructed directly on CUDA,
+        # while a bare torch.tensor denominator would otherwise remain on CPU.
+        denominator = self.lower_world_mm.new_tensor([size - 1 for size in self.dense_evaluation_shape])
+        self.register_buffer("grid_spacing_mm", (self.upper_world_mm - self.lower_world_mm) / denominator)
         # DREME/S2V contract: one MBC vector e_i(x)=[e_ix,e_iy,e_iz], not
         # three vectors mixed again by Cartesian scores.
         self.siren = BSplineSiren([3, hidden_dim, hidden_dim, 3])
