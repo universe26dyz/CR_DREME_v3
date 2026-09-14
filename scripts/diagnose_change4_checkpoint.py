@@ -28,6 +28,34 @@ def _summary(value: torch.Tensor) -> dict[str, float]:
     return {"min": float(flat.min()), "median": float(flat.median()), "mean": float(flat.mean()), "p95": float(torch.quantile(flat, .95)), "max": float(flat.max())}
 
 
+def dominant_peak_hz(scores: torch.Tensor, timestamps_s: torch.Tensor, *, minimum_hz: float = .05, maximum_hz: float = 3., samples: int = 512) -> float:
+    """Return the actual mean-channel NUDFT-power maximum, not a band edge."""
+    ordered = timestamps_s.to(dtype=torch.float64).sort().values
+    nyquist = .5 / float((ordered[1:] - ordered[:-1]).median())
+    upper = min(float(maximum_hz), nyquist)
+    if not upper > minimum_hz:
+        raise ValueError("timestamp sampling has no diagnostic frequency range")
+    frequencies = torch.linspace(minimum_hz, upper, samples, device=scores.device, dtype=scores.dtype)
+    power = nonuniform_dft_at_frequencies(scores, timestamps_s, frequencies).abs().square().flatten(1).mean(1)
+    return float(frequencies[power.argmax()].detach().cpu())
+
+
+def _representatives(items: list, count: int) -> list:
+    if not items:
+        return []
+    indices = torch.linspace(0, len(items) - 1, min(count, len(items))).round().long().tolist()
+    return [items[index] for index in dict.fromkeys(indices)]
+
+
+def _cardiac_pixels(model, observation, maximum: int) -> torch.Tensor:
+    height, width = observation.image.shape[-2:]
+    linear = torch.arange(height * width, device=observation.image.device)
+    uv = torch.stack((linear.remainder(width), torch.div(linear, width, rounding_mode="floor")), dim=-1).to(observation.image.dtype)
+    world = model._pixel_world(observation, uv)
+    inside = ((world >= model.cardiac_lower_world_mm.to(world)) & (world <= model.cardiac_upper_world_mm.to(world))).all(-1)
+    return _representatives(list(uv[inside]), maximum) if inside.any() else []
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Read-only v3_change4 checkpoint diagnostic")
     parser.add_argument("--source-config", type=Path, default=PROJECT_ROOT / "configs" / "source_first.yaml")
@@ -49,30 +77,44 @@ def main() -> None:
     if stage == "stage3":
         raise ValueError("legacy v3 Stage3 checkpoint is not compatible with v3_change4 diagnostic; use its Stage2c checkpoint")
     contract = stage_contract(str(stage))
-    probe = valid[0]
-    pixels = torch.tensor([[0., 0.]], device=device)
     with torch.no_grad():
-        render = model.predict(probe, pixels, str(stage))
+        probe = valid[0]
+        render = model.predict(probe, torch.tensor([[0., 0.]], device=device), str(stage))
         motion = model.motion_regularizers(render["scores"], str(stage)) if contract.enable_motion else {}
         motion_stats = {key: float(value.detach().cpu()) for key, value in motion.items() if key.endswith(("rms_mm", "max_mm"))}
         ablation = None
         if contract.enable_cardiac:
-            resp_only = model.predict(probe, pixels, "stage2c")["predicted_intensity"]
-            joint = render["predicted_intensity"]
-            target = probe.image[0, 0, 0]
-            resp_mse, joint_mse = (resp_only - target).square().mean(), (joint - target).square().mean()
-            ablation = {"resp_only_mse": float(resp_mse), "resp_plus_card_mse": float(joint_mse), "relative_mse_improvement_percent": float((resp_mse - joint_mse) / resp_mse.clamp_min(torch.finfo(resp_mse.dtype).eps) * 100.), "mean_absolute_prediction_change": float((joint - resp_only).abs().mean())}
-        grouped = [item for item in valid if item.view == probe.view and item.slice_id == probe.slice_id]
-        frequency = None
-        if len(grouped) >= 3 and contract.enable_motion:
-            times = torch.tensor([item.timestamp_s for item in grouped], dtype=torch.float64, device=device)
-            encoded = [model.film_encoder(item.image.unsqueeze(0), center_mm=item.center_mm[None], row_direction=item.row_direction[None], column_direction=item.column_direction[None], normal=item.normal[None], pixel_spacing_mm=item.pixel_spacing_mm[None], slice_thickness_mm=torch.tensor([[item.slice_thickness_mm]], device=device)) for item in grouped]
-            resp = torch.cat([item["resp_scores"][:, :contract.active_respiratory_levels].mean(dim=(1, 2), keepdim=True) for item in encoded], 0)
-            card = torch.cat([item["card_scores"].mean(dim=(1, 2), keepdim=True) for item in encoded], 0)
-            local = prior.for_location(probe.view, probe.slice_id)
-            resp_freq = resolved_band_frequencies(local.respiratory_bands_hz, times); card_freq = resolved_band_frequencies(local.cardiac_bands_hz, times)
-            amplitude = lambda score, frequencies: float(nonuniform_dft_at_frequencies(score, times, frequencies).abs().mean())
-            frequency = {"resp_target_amp": amplitude(resp, resp_freq), "resp_wrong_amp": amplitude(resp, card_freq), "card_target_amp": amplitude(card, card_freq), "card_wrong_amp": amplitude(card, resp_freq), "resp_peak_hz": resp_freq[0], "card_peak_hz": card_freq[0], "respiratory_source": local.respiratory_source, "cardiac_source": local.cardiac_source}
+            ablation_records = []
+            for view in ("SAX", "2CH", "4CH"):
+                for observation in _representatives([item for item in valid if item.view == view], 10):
+                    pixels = _cardiac_pixels(model, observation, 512)
+                    if not pixels:
+                        continue
+                    pixels = torch.stack(pixels)
+                    resp_only = model.predict(observation, pixels, "stage2c")["predicted_intensity"]
+                    joint = model.predict(observation, pixels, str(stage))["predicted_intensity"]
+                    target = observation.image[0, pixels[:, 1].long(), pixels[:, 0].long()]
+                    ablation_records.append({"view": view, "slice_id": observation.slice_id, "n_pixels": int(pixels.shape[0]), "resp_only_sse": float((resp_only - target).square().sum()), "resp_plus_card_sse": float((joint - target).square().sum()), "absolute_prediction_change_sum": float((joint - resp_only).abs().sum())})
+            count = sum(item["n_pixels"] for item in ablation_records)
+            if count:
+                resp_mse = sum(item["resp_only_sse"] for item in ablation_records) / count; joint_mse = sum(item["resp_plus_card_sse"] for item in ablation_records) / count
+                ablation = {"records": ablation_records, "n_observations": len(ablation_records), "n_pixels": count, "resp_only_mse": resp_mse, "resp_plus_card_mse": joint_mse, "relative_mse_improvement_percent": (resp_mse - joint_mse) / max(resp_mse, torch.finfo(torch.float32).eps) * 100., "mean_absolute_prediction_change": sum(item["absolute_prediction_change_sum"] for item in ablation_records) / count}
+        frequency_records = []
+        if contract.enable_motion:
+            for view in ("SAX", "2CH", "4CH"):
+                locations_for_view = sorted({item.slice_id for item in valid if item.view == view})
+                for slice_id in _representatives(locations_for_view, 3):
+                    grouped = [item for item in valid if item.view == view and item.slice_id == slice_id]
+                    if len(grouped) != 50:
+                        continue
+                    grouped.sort(key=lambda item: item.timestamp_s)
+                    times = torch.tensor([item.timestamp_s for item in grouped], dtype=torch.float64, device=device)
+                    encoded = [model.film_encoder(item.image.unsqueeze(0), center_mm=item.center_mm[None], row_direction=item.row_direction[None], column_direction=item.column_direction[None], normal=item.normal[None], pixel_spacing_mm=item.pixel_spacing_mm[None], slice_thickness_mm=torch.tensor([[item.slice_thickness_mm]], device=device)) for item in grouped]
+                    resp = torch.cat([item["resp_scores"][:, :contract.active_respiratory_levels] for item in encoded], 0); card = torch.cat([item["card_scores"] for item in encoded], 0)
+                    local = prior.for_location(view, slice_id); resp_freq = resolved_band_frequencies(local.respiratory_bands_hz, times); card_freq = resolved_band_frequencies(local.cardiac_bands_hz, times)
+                    amplitude = lambda score, frequencies: float(nonuniform_dft_at_frequencies(score, times, frequencies).abs().mean())
+                    frequency_records.append({"view": view, "slice_id": slice_id, "n_frames": len(grouped), "resp_target_amp": amplitude(resp, resp_freq), "resp_wrong_amp": amplitude(resp, card_freq), "card_target_amp": amplitude(card, card_freq), "card_wrong_amp": amplitude(card, resp_freq), "resp_peak_hz": dominant_peak_hz(resp, times), "card_peak_hz": dominant_peak_hz(card, times), "respiratory_source": local.respiratory_source, "cardiac_source": local.cardiac_source})
+        frequency = {"records": frequency_records, "summary_mean": {key: sum(item[key] for item in frequency_records) / len(frequency_records) for key in ("resp_target_amp", "resp_wrong_amp", "card_target_amp", "card_wrong_amp", "resp_peak_hz", "card_peak_hz")} if frequency_records else None}
         uncertainty = None
         if contract.enable_uncertainty:
             uncertainty = {key: _summary(value) for key, value in render["uncertainty"].items() if key in {"frame_variance", "pixel_scale", "variance"}}
