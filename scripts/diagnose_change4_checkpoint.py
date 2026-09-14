@@ -28,6 +28,17 @@ def _summary(value: torch.Tensor) -> dict[str, float]:
     return {"min": float(flat.min()), "median": float(flat.median()), "mean": float(flat.mean()), "p95": float(torch.quantile(flat, .95)), "max": float(flat.max())}
 
 
+def prepare_read_only_diagnostic_model(model) -> None:
+    """Keep diagnostic modules in eval mode but expose NeSVoR's latent API.
+
+    Pinned NeSVoR emits latent ``z`` for ``return_features=True`` only while
+    its INR is in train mode.  This narrowly restores that upstream API; the
+    diagnostic caller remains inside ``torch.no_grad()`` and never optimizes.
+    """
+    model.eval()
+    model.canonical.inr.train()
+
+
 def dominant_peak_hz(scores: torch.Tensor, timestamps_s: torch.Tensor, *, minimum_hz: float = .05, maximum_hz: float = 3., samples: int = 512) -> float:
     """Return the actual mean-channel NUDFT-power maximum, not a band edge."""
     ordered = timestamps_s.to(dtype=torch.float64).sort().values
@@ -70,7 +81,7 @@ def main() -> None:
     valid = [item for item in observations if item.qc_valid and not is_hard_invalid_reason(item.qc_reason)]
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model = build_source_first_model(config, domain, n_dynamic_frames=len(valid), device=device).to(device)
-    model.load_state_dict(checkpoint["model"]); model.eval()
+    model.load_state_dict(checkpoint["model"]); prepare_read_only_diagnostic_model(model)
     prior = load_training_frequency_prior(args.frequency_bands, allow_template_fallback=False)
     locations = list(prior.locations.values())
     stage = checkpoint.get("training_state", {}).get("current_stage")
