@@ -2,23 +2,58 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from contextlib import contextmanager
 import torch
 from torch import nn
 from ._upstream import add_upstream_to_path
 
 add_upstream_to_path("NeSVoR")
+import nesvor.inr.models as nesvor_models  # noqa: E402
 from nesvor.inr.models import INR, NeSVoR  # noqa: E402
+
+
+def detect_checkpoint_encoding_backend(state_dict: dict[str, torch.Tensor]) -> str:
+    """Identify legacy schema-1 encoding layout without converting weights."""
+    keys = set(state_dict)
+    tinycudann = "canonical.inr.encoding.params" in keys
+    torch_hash = "canonical.inr.encoding.box_offsets" in keys or any(key.startswith("canonical.inr.encoding.embeddings.") for key in keys)
+    if tinycudann and torch_hash:
+        raise ValueError("ambiguous checkpoint canonical encoding backend")
+    if tinycudann:
+        return "tinycudann"
+    if torch_hash:
+        return "torch_hash"
+    raise ValueError("cannot determine checkpoint canonical encoding backend")
+
+
+@contextmanager
+def _upstream_encoding_backend(backend: str):
+    """Temporarily select the pinned upstream constructor backend only."""
+    if backend not in {"torch_hash", "tinycudann"}:
+        raise ValueError("canonical encoding backend must be torch_hash or tinycudann")
+    if backend == "tinycudann" and nesvor_models.USE_TORCH:
+        raise RuntimeError("checkpoint requires tinycudann canonical encoding but tinycudann is unavailable")
+    previous = nesvor_models.USE_TORCH
+    nesvor_models.USE_TORCH = backend == "torch_hash"
+    try:
+        yield
+    finally:
+        nesvor_models.USE_TORCH = previous
 
 
 class NeSVoRCanonicalAdapter(nn.Module):
     """Directly wraps upstream ``INR``; NeSVoR normalises world-mm bounds itself."""
 
-    def __init__(self, bounds_world_mm: torch.Tensor, *, coarsest_resolution: float = 8., finest_resolution: float = 1., level_scale: float = 1.5, n_features_per_level: int = 2, log2_hashmap_size: int = 19, n_features_z: int = 16, width: int = 64, depth: int = 2, spatial_scaling: float = 1.) -> None:
+    def __init__(self, bounds_world_mm: torch.Tensor, *, coarsest_resolution: float = 8., finest_resolution: float = 1., level_scale: float = 1.5, n_features_per_level: int = 2, log2_hashmap_size: int = 19, n_features_z: int = 16, width: int = 64, depth: int = 2, spatial_scaling: float = 1., encoding_backend: str | None = None) -> None:
         super().__init__()
         if bounds_world_mm.shape != (2, 3) or not torch.isfinite(bounds_world_mm).all() or torch.any(bounds_world_mm[1] <= bounds_world_mm[0]):
             raise ValueError("bounds_world_mm must be finite [2,3] lower/upper bounds")
         self.args = Namespace(coarsest_resolution=coarsest_resolution, finest_resolution=finest_resolution, level_scale=level_scale, n_features_per_level=n_features_per_level, log2_hashmap_size=log2_hashmap_size, n_features_z=n_features_z, width=width, depth=depth, dtype=torch.float32, img_reg_autodiff=False)
-        self.inr = INR(bounds_world_mm.detach().clone().to(dtype=torch.float32), self.args, spatial_scaling)
+        self.encoding_backend = ("torch_hash" if nesvor_models.USE_TORCH else "tinycudann") if encoding_backend is None else encoding_backend
+        # Source-first resume needs the checkpoint's exact upstream encoding
+        # layout; this changes construction selection only, never INR maths.
+        with _upstream_encoding_backend(self.encoding_backend):
+            self.inr = INR(bounds_world_mm.detach().clone().to(dtype=torch.float32), self.args, spatial_scaling)
         self.spatial_scaling = float(spatial_scaling)
 
     def forward(self, points_world_mm: torch.Tensor, return_features: bool = False):

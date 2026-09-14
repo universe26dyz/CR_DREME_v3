@@ -16,6 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from cardioresp4d.data.dataset import CardioRespDataset
+from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend
 from cardioresp4d.adapters.source_lock import verify_vendored_source_lock
 from cardioresp4d.frequency.training_prior import load_training_frequency_prior
 from cardioresp4d.geometry.world_geometry import DicomPlane
@@ -63,22 +64,25 @@ def main() -> None:
     with args.canonical_domain.open(encoding="utf-8") as handle: domain = json.load(handle)
     seed = int(source_config["training"].get("seed", 0) if args.seed is None else args.seed)
     reproducibility = set_reproducibility(seed)
-    observations, normalization_parameters, normalization_groups = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=source_config["training"]["normalization"]["mode"])
-    n_dynamic_frames = sum(1 for observation in observations if observation.qc_valid)
-    model = build_source_first_model(source_config, domain, n_dynamic_frames=n_dynamic_frames, device=device).to(device)
-    bands_path = (args.frequency_bands or (args.source_config.parent / source_config["training"]["temporal_auxiliary"]["frequency_bands_json"])).resolve()
-    prior = load_training_frequency_prior(bands_path, allow_template_fallback=bool(source_config["training"].get("frequency_prior",{}).get("allow_template_fallback",False)))
-    trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(observations, seed=seed), pixel_samples=args.pixel_samples, optimizer_config=source_config["training"]["optimizer"], loss_weights=source_config["training"]["loss_weights"], frequency_prior=prior, temporal_every=int(source_config["training"]["temporal_auxiliary"]["every_steps"]), temporal_batch_size=int(source_config["training"]["temporal_auxiliary"]["max_frames"]), cardiac_sampling_fraction=float(source_config["training"]["cardiac_sampling_fraction"]))
+    checkpoint = None; checkpoint_backend = None
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         if checkpoint.get("checkpoint_schema") != 1:
             raise ValueError("--resume requires source-first checkpoint_schema=1")
+        checkpoint_backend = detect_checkpoint_encoding_backend(checkpoint["model"])
+    observations, normalization_parameters, normalization_groups = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=source_config["training"]["normalization"]["mode"])
+    n_dynamic_frames = sum(1 for observation in observations if observation.qc_valid)
+    model = build_source_first_model(source_config, domain, n_dynamic_frames=n_dynamic_frames, device=device, canonical_encoding_backend=checkpoint_backend).to(device)
+    bands_path = (args.frequency_bands or (args.source_config.parent / source_config["training"]["temporal_auxiliary"]["frequency_bands_json"])).resolve()
+    prior = load_training_frequency_prior(bands_path, allow_template_fallback=bool(source_config["training"].get("frequency_prior",{}).get("allow_template_fallback",False)))
+    trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(observations, seed=seed), pixel_samples=args.pixel_samples, optimizer_config=source_config["training"]["optimizer"], loss_weights=source_config["training"]["loss_weights"], frequency_prior=prior, temporal_every=int(source_config["training"]["temporal_auxiliary"]["every_steps"]), temporal_batch_size=int(source_config["training"]["temporal_auxiliary"]["max_frames"]), cardiac_sampling_fraction=float(source_config["training"]["cardiac_sampling_fraction"]))
+    if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
         trainer.load_training_state_dict(checkpoint["training_state"])
         restore_rng_state(checkpoint["rng_state"])
     stages = (("stage1", args.stage1_steps), ("stage2a", args.stage2a_steps), ("stage2b", args.stage2b_steps), ("stage2c", args.stage2c_steps), ("stage3a", args.stage3a_steps), ("stage3b", args.stage3b_steps), ("stage3c", args.stage3c_steps))
     prior_payload = asdict(prior)
-    report = {"stages": {stage: trainer.run_stage(stage, steps=steps) for stage, steps in stages if steps > 0}, "effective_config": {**effective_model_config(model), "optimizer_config": source_config["training"]["optimizer"]}, "normalization_parameters": normalization_parameters, "normalization_groups": normalization_groups, "frequency_prior": prior_payload, "source_lock": source_lock, "source_lock_verified": bool(source_lock.get("verified")), "reproducibility": reproducibility, "device": str(device), "torch_version": torch.__version__, "resumed_from": str(args.resume) if args.resume else None}
+    report = {"stages": {stage: trainer.run_stage(stage, steps=steps) for stage, steps in stages if steps > 0}, "effective_config": {**effective_model_config(model), "optimizer_config": source_config["training"]["optimizer"]}, "canonical_encoding_backend": model.canonical.encoding_backend, "normalization_parameters": normalization_parameters, "normalization_groups": normalization_groups, "frequency_prior": prior_payload, "source_lock": source_lock, "source_lock_verified": bool(source_lock.get("verified")), "reproducibility": reproducibility, "device": str(device), "torch_version": torch.__version__, "resumed_from": str(args.resume) if args.resume else None}
     args.output_dir.mkdir(parents=True, exist_ok=True); torch.save({"checkpoint_schema": 1, "model": model.state_dict(), "training_state": trainer.training_state_dict(), "rng_state": capture_rng_state(), "report": report, "frequency_prior": prior_payload, "normalization_parameters": normalization_parameters}, args.output_dir / "source_first_last.pt")
     (args.output_dir / "source_first_training_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     (args.output_dir / "effective_config.json").write_text(json.dumps(report["effective_config"], indent=2) + "\n", encoding="utf-8")

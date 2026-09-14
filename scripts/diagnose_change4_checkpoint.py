@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from cardioresp4d.frequency.training_prior import load_training_frequency_prior
+from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend
 from cardioresp4d.losses.frequency_loss import nonuniform_dft_at_frequencies, resolved_band_frequencies
 from cardioresp4d.training.build_model import build_source_first_model
 from cardioresp4d.training.runtime_state import is_hard_invalid_reason
@@ -80,7 +81,8 @@ def main() -> None:
     observations, _, _ = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=config["training"]["normalization"]["mode"])
     valid = [item for item in observations if item.qc_valid and not is_hard_invalid_reason(item.qc_reason)]
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model = build_source_first_model(config, domain, n_dynamic_frames=len(valid), device=device).to(device)
+    checkpoint_backend = detect_checkpoint_encoding_backend(checkpoint["model"])
+    model = build_source_first_model(config, domain, n_dynamic_frames=len(valid), device=device, canonical_encoding_backend=checkpoint_backend).to(device)
     model.load_state_dict(checkpoint["model"]); prepare_read_only_diagnostic_model(model)
     prior = load_training_frequency_prior(args.frequency_bands, allow_template_fallback=False)
     locations = list(prior.locations.values())
@@ -130,7 +132,7 @@ def main() -> None:
         if contract.enable_uncertainty:
             uncertainty = {key: _summary(value) for key, value in render["uncertainty"].items() if key in {"frame_variance", "pixel_scale", "variance"}}
     result = {
-        "checkpoint_stage": stage,
+        "checkpoint_stage": stage, "canonical_encoding_backend": model.canonical.encoding_backend,
         "prior_audit": {"number_of_locations": len(locations), "local_respiratory_count": sum(item.respiratory_source == "phase1_per_location" for item in locations), "resp_global_fallback_count": sum(item.respiratory_source == "phase1_global_fallback" for item in locations), "local_cardiac_count": sum(item.cardiac_source == "phase1_per_location" for item in locations), "card_global_fallback_count": sum(item.cardiac_source == "phase1_global_fallback" for item in locations), "prior": asdict(prior)},
         "motion_statistics": motion_stats, "cardiac_ablation": ablation, "frequency_semantics": frequency, "uncertainty": uncertainty,
         "status": "read_only_no_training",
