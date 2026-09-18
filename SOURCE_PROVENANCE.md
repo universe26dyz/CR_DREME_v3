@@ -46,6 +46,13 @@ These files and their existing tests are retained for historical reproduction, a
 
 The supplied local papers were reviewed during this audit. Patient-world DICOM geometry; full-FOV canonical-domain and coverage QC; asynchronous single-frame geometry-conditioned score inference; DREME respiratory/cardiac low-rank organization; true-timestamp frequency leakage penalties; sequential cardiorespiratory pullback; view/location-balanced sampling; and stage orchestration are necessary project adaptations. They are not claimed as direct upstream code reuse.
 
+Change5A adds a project-specific image-domain cardiac target-band concentration
+adaptation. DREME Eq.8/Eq.9 remain source-derived negative crossover
+suppression; the new ratio is not attributed to DREME-MR or S2V-DREME. It uses
+the existing Phase-1 per-location cardiac bands and a timestamp-derived non-DC
+NUDFT grid, including the documented nearest-grid-centre rule for a valid
+narrow Phase-1 band.
+
 ## SINR dependency statement
 
 `vasl12/SINR` is a public research-code repository used as an external pinned

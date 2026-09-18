@@ -4,7 +4,7 @@ from __future__ import annotations
 import torch
 
 from cardioresp4d.losses.motion_loss import dreme_mbc_normalization, dreme_zero_mean_scores
-from cardioresp4d.losses.frequency_loss import dreme_cardiac_leakage_in_resp, dreme_respiratory_leakage_in_card
+from cardioresp4d.losses.frequency_loss import cardiac_target_band_concentration, dreme_cardiac_leakage_in_resp, dreme_respiratory_leakage_in_card
 from .model import SourceFirstDynamicModel
 from .sampler import DynamicObservation, ViewLocationBalancedSampler
 from .stage_contract import progressive_stage_order, stage_contract
@@ -17,7 +17,7 @@ class UnifiedProgressiveTrainer:
             raise ValueError("pixel_samples, learning_rate, and cardiac_sampling_fraction are invalid")
         self.model, self.sampler, self.pixel_samples, self.learning_rate = model, sampler, pixel_samples, learning_rate
         self.optimizer_config = optimizer_config or {}
-        self.loss_weights = {"image": 1e-4, "mbc_normalization": 1e-5, "smooth_resp": 1e-5, "smooth_card": 1e-5, "zero_mean_score": 1e-5, "cardiac_leakage_in_resp": 1e-4, "respiratory_leakage_in_card": 1e-4, **(loss_weights or {})}
+        self.loss_weights = {"image": 1e-4, "mbc_normalization": 1e-5, "smooth_resp": 1e-5, "smooth_card": 1e-5, "zero_mean_score": 1e-5, "cardiac_leakage_in_resp": 1e-4, "respiratory_leakage_in_card": 1e-4, "cardiac_target_concentration": 0., **(loss_weights or {})}
         self.frequency_prior = frequency_prior
         self.temporal_every, self.temporal_batch_size, self.cardiac_sampling_fraction = temporal_every, temporal_batch_size, cardiac_sampling_fraction
         self.optimizer: torch.optim.Optimizer | None = None
@@ -92,7 +92,7 @@ class UnifiedProgressiveTrainer:
             if contract.enable_motion:
                 total = total + self.loss_weights["mbc_normalization"] * components["mbc_normalization"] + self.loss_weights["smooth_resp"] * components["smooth_resp"] + self.loss_weights["zero_mean_score"] * components.get("zero_mean_score", total * 0.) + self.loss_weights["cardiac_leakage_in_resp"] * components.get("cardiac_leakage_in_resp", total * 0.)
             if contract.enable_cardiac:
-                total = total + self.loss_weights["smooth_card"] * components["smooth_card"] + self.loss_weights["respiratory_leakage_in_card"] * components.get("respiratory_leakage_in_card", total * 0.)
+                total = total + self.loss_weights["smooth_card"] * components["smooth_card"] + self.loss_weights["respiratory_leakage_in_card"] * components.get("respiratory_leakage_in_card", total * 0.) + self.loss_weights["cardiac_target_concentration"] * components.get("cardiac_target_concentration", total * 0.)
             total.backward()
             gradients = {"inr": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.canonical.parameters()), "film": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.film_encoder.parameters()), "respiratory_sinr": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.respiratory_mbc.parameters()), "cardiac_sinr": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.cardiac_mbc.parameters()), "uncertainty": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.uncertainty.parameters())}
             self.optimizer.step(); losses.append(float(total.detach())); components_last = {key: float(value.detach()) for key, value in components.items()}
@@ -160,10 +160,13 @@ class UnifiedProgressiveTrainer:
 
     def _temporal_components(self, stage: str) -> dict[str, torch.Tensor]:
         sequence = self.sampler.temporal_batch(max_items=self.temporal_batch_size)
+        contract = stage_contract(stage)
         if len(sequence) < 3 or self.frequency_prior is None:
             zero = next(self.model.parameters()).sum() * 0.
-            return {"zero_mean_score":zero,"cardiac_leakage_in_resp":zero,"respiratory_leakage_in_card":zero}
-        contract = stage_contract(stage)
+            result = {"zero_mean_score":zero,"cardiac_leakage_in_resp":zero,"respiratory_leakage_in_card":zero}
+            if contract.enable_cardiac:
+                result.update({"cardiac_target_concentration": zero, "cardiac_target_fraction": zero, "cardiac_target_power": zero, "cardiac_total_power": zero})
+            return result
         scores = [self.model.film_encoder(item.image.unsqueeze(0), center_mm=item.center_mm[None], row_direction=item.row_direction[None], column_direction=item.column_direction[None], normal=item.normal[None], pixel_spacing_mm=item.pixel_spacing_mm[None], slice_thickness_mm=torch.tensor([[item.slice_thickness_mm]], device=item.image.device, dtype=item.image.dtype)) for item in sequence]
         timestamps = torch.tensor([item.timestamp_s for item in sequence], device=sequence[0].image.device, dtype=torch.float64)
         resp = torch.cat([score["resp_scores"][:, :contract.active_respiratory_levels] for score in scores], 0); card = torch.cat([score["card_scores"] for score in scores], 0)
@@ -173,4 +176,6 @@ class UnifiedProgressiveTrainer:
             # Phase-1 respiratory occupancy is location-specific when reliable;
             # using the aggregate here would make Eq.9 suppress the wrong band.
             result["respiratory_leakage_in_card"] = dreme_respiratory_leakage_in_card(card, timestamps, prior.respiratory_bands_hz)
+            concentration = cardiac_target_band_concentration(card, timestamps, prior.cardiac_bands_hz)
+            result.update({"cardiac_target_concentration": concentration["loss"], "cardiac_target_fraction": concentration["fraction"], "cardiac_target_power": concentration["target_power"], "cardiac_total_power": concentration["total_power"]})
         return result

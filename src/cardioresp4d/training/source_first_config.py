@@ -1,6 +1,7 @@
 """Hard gates for a formal v3 source-first training configuration."""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -41,6 +42,12 @@ def validate_source_first_config(config: Mapping[str, Any], project_root: str | 
         raise ValueError("v3 formal training requires fixed_location_balanced = true")
     if not isinstance(training.get("seed"), int):
         raise ValueError("v3 formal training requires integer training.seed")
+    loss_weights = training.get("loss_weights", {})
+    if not isinstance(loss_weights, Mapping):
+        raise ValueError("training.loss_weights must be a mapping when provided")
+    concentration = loss_weights.get("cardiac_target_concentration", 0.)
+    if isinstance(concentration, bool) or not isinstance(concentration, (int, float)) or not math.isfinite(float(concentration)) or concentration < 0:
+        raise ValueError("training.loss_weights.cardiac_target_concentration must be finite and >= 0")
     for key in ("psf", "film", "uncertainty", "respiratory_mbc", "cardiac_mbc"):
         if not isinstance(model.get(key), Mapping):
             raise ValueError(f"source-first configuration requires model.{key}")

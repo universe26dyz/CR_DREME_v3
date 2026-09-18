@@ -1,0 +1,46 @@
+# v3 Change5A: preserve the Change4 source-first contract, adding only the local cardiac target-band concentration weight.
+model:
+  canonical:
+    implementation: nesvor_official
+    upstream_commit: 2e96a91bdd30174210caea911e03a2778c65adbe
+    coarsest_resolution: 8
+    finest_resolution: 1
+    level_scale: 1.5
+    features_per_level: 2
+    log2_hashmap_size: 19
+    latent_dim: 16
+    width: 64
+    depth: 2
+    spatial_scaling: 1.0
+  psf: {implementation: nesvor_official, n_samples: 8}
+  film: {channels: 64, position_bands: 4}
+  uncertainty: {implementation: nesvor_derived, enable_stage: stage3c, frame_embedding_dim: 8, width: 64, depth: 2}
+  respiratory_mbc: {implementation: sinr_official, upstream_commit: 1a524ca7ae453b55310595fe957245088a108233, logical_control_shapes: [[8,8,8],[12,12,12],[16,16,16]], cps: 2, hidden_dim: 64}
+  cardiac_mbc: {implementation: sinr_official, local_box: true, logical_control_shape: [16,16,16], cps: 2, hidden_dim: 64, taper_mm: 4}
+training:
+  view_balanced: true
+  fixed_location_balanced: true
+  cardiac_sampling_fraction: 0.8
+  stage1: {short_bootstrap: true, motion_enabled: false, uncertainty_enabled: false}
+  stage2: {respiratory_progressive: true}
+  stage3a: {cardiac_warmup: true, uncertainty_enabled: false}
+  stage3b: {joint_cardiorespiratory: true, uncertainty_enabled: false}
+  stage3c: {uncertainty_enabled: true}
+  loss_weights: {image: 0.0001, mbc_normalization: 0.00001, smooth_resp: 0.00001, smooth_card: 0.00001, zero_mean_score: 0.00001, cardiac_leakage_in_resp: 0.0001, respiratory_leakage_in_card: 0.0001, cardiac_target_concentration: 0.001} # Change5A local target-band concentration; Eq.8/Eq.9 unchanged.
+  image_regularization: {mode: edge, delta: 1.0}
+  optimizer:
+    stage1: {canonical_lr: 0.001}
+    stage2: {canonical_lr: 0.001, film_lr: 0.001, respiratory_mbc_lr: 0.001}
+    stage3a: {film_lr: 0.001, cardiac_mbc_lr: 0.001}
+    stage3b: {canonical_lr: 0.001, film_lr: 0.001, respiratory_mbc_lr: 0.001, cardiac_mbc_lr: 0.001}
+    stage3c: {canonical_lr: 0.001, film_lr: 0.001, respiratory_mbc_lr: 0.001, cardiac_mbc_lr: 0.001, uncertainty_lr: 0.001}
+  temporal_auxiliary: {every_steps: 1, mode: full_location_sequence, max_frames: 50, frequency_bands_json: frequency_bands.json}
+  frequency_prior: {allow_template_fallback: false}
+  motion_regularization:
+    respiratory_evaluation_grid: {mode: fixed_physical_full_fov, shape: [16,16,16]}
+    cardiac_evaluation_grid: {mode: fixed_physical_cardiac_box, shape: [16,16,16]}
+  normalization: {mode: per_series}
+  seed: 0
+domain: {reconstruction_domain: full_acquisition_supported, cardiac_box_is_crop: false}
+coverage: {plane_center_qc: true, psf_aware: true, view_count: true, observation_count: true}
+runtime_status: local_cpu_verified_pending_gpu_real_data

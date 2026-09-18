@@ -141,3 +141,16 @@ manifest sidecar plus full Phase-1 QC/domain/frequency artifacts: source lock
 verified, 7200 observations (7150 valid, 50 hard-invalid) validated, 143
 location candidates resolved, and Stage1–Stage3 forwards were finite. No GPU
 or long training was run.
+
+## v3_change5A cardiac target-band concentration — 2026-09-18
+
+Change5A preserves the Change4 model, source-backed adapters, canonical INR,
+PSF, uncertainty schedule, SINR MBCs, sampling, Stage1–Stage3 schedule, and
+DREME Eq.8/Eq.9. It adds only a local Phase-1-cardiac-band target/total NUDFT
+power ratio for Stage3a/b/c. Power is aggregated over all cardiac-score
+channels before the ratio, and the denominator is a timestamp-derived non-DC
+grid. Eq.8/Eq.9 are source-derived negative crossover suppression; Change5A is
+a project-specific image-domain adaptation introduced because Change4 could
+satisfy those suppression losses while cardiac score energy remained in
+low-frequency nuisance bands. `source_first_change5a.yaml` sets the audit
+weight to `0.001`; missing legacy config keys remain zero.

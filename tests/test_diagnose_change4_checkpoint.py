@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 import torch
@@ -40,6 +41,17 @@ class DiagnoseChange4CheckpointTest(unittest.TestCase):
             output = model.predict(observation, torch.tensor([[0., 0.]]), "stage3c")
         self.assertIn("uncertainty", output)
         self.assertTrue(all(torch.equal(old, new) for old, new in zip(before, model.parameters())))
+
+    def test_frequency_record_reports_change5a_concentration_without_mutating_scores(self) -> None:
+        times = torch.arange(50, dtype=torch.float64) * .2
+        card = torch.sin(2 * torch.pi * (6 / 9.8) * times)[:, None, None].repeat(1, 1, 3)
+        resp = torch.sin(2 * torch.pi * .2 * times)[:, None, None].repeat(1, 1, 3)
+        before = card.clone()
+        local = SimpleNamespace(cardiac_bands_hz=[(.60, .63)], respiratory_bands_hz=[(.15, .25)], respiratory_source="phase1_per_location", cardiac_source="phase1_per_location")
+        record = diagnostic.frequency_semantics_record("SAX", "s", resp, card, times, local)
+        self.assertIn("cardiac_target_fraction", record)
+        self.assertIn("cardiac_target_concentration", record)
+        self.assertTrue(torch.equal(before, card))
 
 
 if __name__ == "__main__":

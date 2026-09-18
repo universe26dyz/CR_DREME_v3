@@ -95,3 +95,22 @@ and resume that checkpoint with `--stage3a-steps 0 --stage3b-steps 100
 --stage3c-steps 0`. The legacy `--stage3-steps` option is a deprecated error.
 This entrypoint uses individual valid dynamic frames; it never creates or
 loads `initial_reference.nii.gz`, mean slices, Stage1A, or Stage1B.
+
+## Change5A cardiac target-band concentration ablation
+
+`configs/source_first_change5a.yaml` changes only
+`training.loss_weights.cardiac_target_concentration` to `0.001`.  It evaluates
+each fixed location against its resolved Phase-1 local cardiac band on a
+timestamp-derived non-DC grid, summing all three cardiac-score channel powers
+before the target/total ratio.  A valid narrow band between grid centres uses
+its nearest centre; this is a project-specific image-domain adaptation.
+
+DREME Eq.8/Eq.9 remain source-derived negative crossover suppression.  The
+Change5A concentration term is not attributed to DREME-MR or S2V-DREME: it was
+added after Change4 showed that Eq.9 alone permits cardiac score power in other
+low-frequency nuisance bands.
+
+For the GPU ablation, start both arms from the same Change4 Stage2c checkpoint,
+seed, pixel samples, data/QC/domain and frequency prior. Run Stage3a=100 then
+Stage3b=100 with Stage3c=0; compare weight `0` against `0.001` and do not use a
+previously trained Stage3a/Stage3b checkpoint as the starting point.
