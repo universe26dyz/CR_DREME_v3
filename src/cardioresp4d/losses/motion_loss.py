@@ -46,7 +46,9 @@ def cardiac_pca_waveform_subspace_loss(card_scores: torch.Tensor, target_wavefor
     target = torch.as_tensor(target_waveform, device=scores.device, dtype=scores.dtype).reshape(-1).detach()
     if scores.ndim != 2 or scores.shape[1] != 3 or scores.shape[0] != target.numel():
         raise ValueError("card_scores must be [T,3] or [T,1,3] aligned with target_waveform")
-    zero = scores.sum() * 0.
+    # A skipped non-finite observation must still be a finite, connected
+    # zero-gradient scalar rather than NaN multiplied by zero.
+    zero = scores.nan_to_num().sum() * 0.
     count = scores.new_tensor(float(scores.shape[0]))
     skipped = scores.new_tensor(1.)
     if scores.shape[0] < min_frames or not torch.isfinite(scores).all() or not torch.isfinite(target).all():

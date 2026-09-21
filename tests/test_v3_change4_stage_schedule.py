@@ -62,6 +62,29 @@ class Change4StageScheduleTest(unittest.TestCase):
         for module in (model.canonical, model.respiratory_mbc, model.film_encoder.image, model.film_encoder.film, model.film_encoder.geometry_mlp, model.film_encoder.head, model.film_encoder.resp, model.uncertainty):
             self.assertFalse(any(parameter.grad is not None for parameter in module.parameters()), type(module).__name__)
 
+    def test_stage3a_optimizer_step_does_not_update_frozen_stage2c_parameters(self) -> None:
+        torch.manual_seed(12)
+        model = _model()
+        items = [_item("SAX", 0), _item("2CH", 1), _item("4CH", 2)]
+        trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(items), pixel_samples=1)
+        trainer.run_stage("stage2c", steps=1)
+        frozen = {
+            "canonical": [p.detach().clone() for p in model.canonical.parameters()],
+            "resp": [p.detach().clone() for p in model.respiratory_mbc.parameters()],
+            "shared": [p.detach().clone() for module in (model.film_encoder.image, model.film_encoder.film, model.film_encoder.geometry_mlp, model.film_encoder.head, model.film_encoder.resp) for p in module.parameters()],
+        }
+        trainable = {
+            "card_head": [p.detach().clone() for p in model.film_encoder.card.parameters()],
+            "card_mbc": [p.detach().clone() for p in model.cardiac_mbc.parameters()],
+        }
+        trainer.run_stage("stage3a", steps=1)
+        for name, parameters in (("canonical", model.canonical.parameters()), ("resp", model.respiratory_mbc.parameters())):
+            self.assertTrue(all(torch.equal(before, after) for before, after in zip(frozen[name], parameters)), name)
+        shared = [p for module in (model.film_encoder.image, model.film_encoder.film, model.film_encoder.geometry_mlp, model.film_encoder.head, model.film_encoder.resp) for p in module.parameters()]
+        self.assertTrue(all(torch.equal(before, after) for before, after in zip(frozen["shared"], shared)))
+        self.assertTrue(any(not torch.equal(before, after) for before, after in zip(trainable["card_head"], model.film_encoder.card.parameters())))
+        self.assertTrue(any(not torch.equal(before, after) for before, after in zip(trainable["card_mbc"], model.cardiac_mbc.parameters())))
+
     def test_stage3_data_term_and_full_ownership_follow_contract(self) -> None:
         items = [_item("SAX", 0), _item("2CH", 1), _item("4CH", 2)]
         for stage, expected_nll in (("stage3a", False), ("stage3b", False), ("stage3c", True)):

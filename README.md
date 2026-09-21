@@ -126,3 +126,16 @@ three-dimensional cardiac-score subspace with a differentiable ridge fit and
 an image-derived local surrogate, not ECG ground truth and never a global phase
 label. See [CHANGE5B_SERVER_RUN.md](CHANGE5B_SERVER_RUN.md) for the GPU-only
 Stage3a=1000 protocol.
+
+## Change5C audit-only diagnostics and visualization
+
+`scripts/diagnose_change4_checkpoint.py --all-locations` preserves default
+probe-compatible output and additionally writes complete per-location JSON/CSV
+records, explicit eligibility/skip reasons, grouped summaries, and separately
+named aggregate motion metrics. `scripts/compare_all_location_diagnostics.py`
+performs exact-key paired descriptive comparisons. `scripts/audit_stage3a_loss_gradients.py`
+does no optimizer step and reports raw/configured-weighted gradients. The
+visualization tool exports read-only reprojections and observation-conditioned
+implied 3D dynamics, DVFs, and pullback Jacobians; it never claims globally
+synchronized cardiac cine. See
+[CHANGE5C_AUDIT_DIAGNOSTIC_VIS_SERVER_RUN.md](CHANGE5C_AUDIT_DIAGNOSTIC_VIS_SERVER_RUN.md).

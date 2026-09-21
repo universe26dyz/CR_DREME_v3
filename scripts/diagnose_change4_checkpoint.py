@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from dataclasses import asdict
@@ -23,6 +24,8 @@ from cardioresp4d.training.build_model import build_source_first_model
 from cardioresp4d.training.runtime_state import is_hard_invalid_reason
 from cardioresp4d.training.source_first_config import validate_source_first_config
 from cardioresp4d.training.stage_contract import stage_contract
+from cardioresp4d.diagnostics.checkpoint_metrics import summarize_records
+from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField
 from train_source_first import observations_from_manifest
 
 
@@ -66,7 +69,58 @@ def frequency_semantics_record(view: str, slice_id: str, resp: torch.Tensor, car
         if matched is not None:
             agreement = cardiac_pca_waveform_subspace_loss(card, matched.waveform, ridge=pca_waveform_ridge, min_frames=pca_waveform_min_frames)
             pca = {"cardiac_pca_waveform_r2": float(agreement["r2"]), "cardiac_pca_waveform_loss": float(agreement["loss"]), "cardiac_pca_matched_frames": int(agreement["matched_frame_count"]), "selected_cardiac_pc": matched.selected_pc}
-    return {"view": view, "slice_id": slice_id, "n_frames": int(timestamps_s.numel()), "resp_target_amp": amplitude(resp, resp_freq), "resp_wrong_amp": amplitude(resp, card_freq), "card_target_amp": amplitude(card, card_freq), "card_wrong_amp": amplitude(card, resp_freq), "card_peak_hz": dominant_peak_hz(card, timestamps_s), "resp_peak_hz": dominant_peak_hz(resp, timestamps_s), "card_score_std": float(card.std(unbiased=False)), "cardiac_target_fraction": float(concentration["fraction"]), "cardiac_target_concentration": float(concentration["loss"]), "respiratory_source": local.respiratory_source, "cardiac_source": local.cardiac_source, **pca}
+    card_target, card_wrong = amplitude(card, card_freq), amplitude(card, resp_freq)
+    card_peak, resp_peak = dominant_peak_hz(card, timestamps_s), dominant_peak_hz(resp, timestamps_s)
+    return {"view": view, "slice_id": slice_id, "n_frames": int(timestamps_s.numel()), "n_valid_frames": int(timestamps_s.numel()), "eligible": True, "skip_reason": None, "resp_target_amp": amplitude(resp, resp_freq), "resp_wrong_amp": amplitude(resp, card_freq), "card_target_amp": card_target, "card_wrong_amp": card_wrong, "card_target_over_wrong": card_target / max(card_wrong, torch.finfo(torch.float32).eps), "card_peak_hz": card_peak, "resp_peak_hz": resp_peak, "same_peak_exact": card_peak == resp_peak, "same_peak_within_0.02_hz": abs(card_peak - resp_peak) <= .02, "card_score_mean": float(card.mean()), "card_score_std": float(card.std(unbiased=False)), "cardiac_target_fraction": float(concentration["fraction"]), "cardiac_target_concentration": float(concentration["loss"]), "respiratory_source": local.respiratory_source, "cardiac_source": local.cardiac_source, **pca}
+
+
+def _skip_record(view: str, slice_id: str, count: int, reason: str) -> dict[str, object]:
+    return {"view": view, "slice_id": slice_id, "n_frames": count, "n_valid_frames": count, "eligible": False, "skip_reason": reason, "selected_cardiac_pc": None, "cardiac_pca_waveform_r2": None, "cardiac_pca_waveform_loss": None, "cardiac_pca_matched_frames": 0}
+
+
+def _encode_location(model, observations: list, contract, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ordered = sorted(observations, key=lambda item: item.timestamp_s)
+    times = torch.tensor([item.timestamp_s for item in ordered], dtype=torch.float64, device=device)
+    encoded = [model.film_encoder(item.image.unsqueeze(0), center_mm=item.center_mm[None], row_direction=item.row_direction[None], column_direction=item.column_direction[None], normal=item.normal[None], pixel_spacing_mm=item.pixel_spacing_mm[None], slice_thickness_mm=torch.tensor([[item.slice_thickness_mm]], device=device, dtype=item.image.dtype)) for item in ordered]
+    return (torch.cat([item["resp_scores"][:, :contract.active_respiratory_levels] for item in encoded], 0), torch.cat([item["card_scores"] for item in encoded], 0), times)
+
+
+def all_location_frequency_records(model, observations: list, contract, prior, device: torch.device, *, pca_waveform_prior=None, pca_waveform_ridge: float = 1e-4, pca_waveform_min_frames: int = 8) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str], list] = {}
+    for observation in observations:
+        grouped.setdefault((observation.view, observation.slice_id), []).append(observation)
+    records: list[dict[str, object]] = []
+    for (view, slice_id), observations in sorted(grouped.items()):
+        valid = [item for item in observations if item.qc_valid and not is_hard_invalid_reason(item.qc_reason)]
+        if len(valid) < 3:
+            records.append(_skip_record(view, slice_id, len(valid), "no_qc_valid_frames_hard_invalid_excluded" if not valid else "fewer_than_3_valid_frames")); continue
+        try:
+            local = prior.for_location(view, slice_id)
+            resp, card, times = _encode_location(model, valid, contract, device)
+            records.append(frequency_semantics_record(view, slice_id, resp, card, times, local, pca_waveform_prior=pca_waveform_prior, pca_waveform_ridge=pca_waveform_ridge, pca_waveform_min_frames=pca_waveform_min_frames))
+        except ValueError as exc:
+            records.append(_skip_record(view, slice_id, len(observations), f"unevaluable:{exc}"))
+    return records
+
+
+def _aggregate_motion(model, valid: list, contract, device: torch.device) -> dict[str, object]:
+    magnitudes = {"resp": [], "card": []}
+    for key in sorted({(item.view, item.slice_id) for item in valid}):
+        observation = sorted([item for item in valid if (item.view, item.slice_id) == key], key=lambda item: item.timestamp_s)[0]
+        render = model.predict(observation, torch.tensor([[0., 0.]], device=device), contract.name)
+        if contract.enable_motion:
+            resp_grid, _ = model._physical_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, model.respiratory_smoothness_shape)
+            resp = ScoreWeightedMBCField(model.respiratory_mbc, render["scores"]["resp_scores"])(resp_grid)
+            magnitudes["resp"].append(torch.linalg.vector_norm(resp, dim=-1).reshape(-1))
+            if contract.enable_cardiac:
+                card_grid, _ = model._physical_grid(model.cardiac_lower_world_mm, model.cardiac_upper_world_mm, model.cardiac_smoothness_shape)
+                card = ScoreWeightedMBCField(model.cardiac_mbc, render["scores"]["card_scores"])(card_grid)
+                magnitudes["card"].append(torch.linalg.vector_norm(card, dim=-1).reshape(-1))
+    def stats(prefix: str) -> dict[str, float | None]:
+        magnitude = torch.cat(magnitudes[prefix]) if magnitudes[prefix] else torch.empty(0)
+        if not magnitude.numel(): return {"rms_mm": None, "magnitude_p50_mm": None, "magnitude_p95_mm": None, "magnitude_p99_mm": None, "magnitude_max_mm": None}
+        return {"rms_mm": float(magnitude.square().mean().sqrt()), "magnitude_p50_mm": float(torch.quantile(magnitude, .50)), "magnitude_p95_mm": float(torch.quantile(magnitude, .95)), "magnitude_p99_mm": float(torch.quantile(magnitude, .99)), "magnitude_max_mm": float(magnitude.max())}
+    return {"population": {"n_locations": len({(item.view, item.slice_id) for item in valid}), "n_frames_evaluated": len({(item.view, item.slice_id) for item in valid}), "sampling_rule": "earliest QC-valid non-hard-invalid frame per location", "evaluation_grid_shape": {"respiratory": list(model.respiratory_smoothness_shape), "cardiac": list(model.cardiac_smoothness_shape)}, "physical_domain": "respiratory full canonical world-mm; cardiac local cardiac-box world-mm"}, "respiratory": stats("resp"), "cardiac": stats("card")}
 
 
 def _representatives(items: list, count: int) -> list:
@@ -91,6 +145,8 @@ def main() -> None:
     parser.add_argument("--frequency-bands", type=Path, required=True); parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--qc-table", type=Path, required=True); parser.add_argument("--canonical-domain", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True); parser.add_argument("--device", default="cpu"); parser.add_argument("--output-json", type=Path, required=True)
+    parser.add_argument("--all-locations", action="store_true", help="evaluate every QC-valid location and write full-location outputs")
+    parser.add_argument("--all-locations-dir", type=Path, help="directory for all_location_diagnostic.json and all_location_frequency_semantics.csv")
     args = parser.parse_args(); device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available(): parser.error("CUDA requested but unavailable")
     config = yaml.safe_load(args.source_config.read_text(encoding="utf-8")); validate_source_first_config(config, PROJECT_ROOT)
@@ -152,6 +208,12 @@ def main() -> None:
         uncertainty = None
         if contract.enable_uncertainty:
             uncertainty = {key: _summary(value) for key, value in render["uncertainty"].items() if key in {"frame_variance", "pixel_scale", "variance"}}
+        full_location = None
+        if args.all_locations and contract.enable_motion:
+            records = all_location_frequency_records(model, observations, contract, prior, device, pca_waveform_prior=pca_waveform_prior, pca_waveform_ridge=float(temporal_config.get("pca_waveform_ridge", 1e-4)), pca_waveform_min_frames=int(temporal_config.get("pca_waveform_min_frames", 8)))
+            continuous = ("cardiac_pca_waveform_r2", "cardiac_pca_waveform_loss", "cardiac_target_fraction", "cardiac_target_concentration", "card_target_amp", "card_wrong_amp", "card_target_over_wrong", "resp_target_amp", "resp_wrong_amp", "card_peak_hz", "resp_peak_hz", "card_score_mean", "card_score_std")
+            boolean = ("same_peak_exact", "same_peak_within_0.02_hz")
+            full_location = {"population": "all QC-valid observations excluding hard-invalid frames; all distinct locations retained with structured skips", "records": records, "summary": summarize_records(records, continuous=continuous, boolean=boolean), "aggregate_motion_statistics": _aggregate_motion(model, valid, contract, device)}
     result = {
         "checkpoint_stage": stage, "canonical_encoding_backend": model.canonical.encoding_backend,
         "prior_audit": {"number_of_locations": len(locations), "local_respiratory_count": sum(item.respiratory_source == "phase1_per_location" for item in locations), "resp_global_fallback_count": sum(item.respiratory_source == "phase1_global_fallback" for item in locations), "local_cardiac_count": sum(item.cardiac_source == "phase1_per_location" for item in locations), "card_global_fallback_count": sum(item.cardiac_source == "phase1_global_fallback" for item in locations), "prior": asdict(prior), "pca_waveform_prior": pca_waveform_prior.metadata},
@@ -159,6 +221,16 @@ def main() -> None:
         "status": "read_only_no_training",
         "device": str(device),
     }
+    if full_location is not None:
+        output_dir = args.all_locations_dir or args.output_json.parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+        full_path = output_dir / "all_location_diagnostic.json"
+        csv_path = output_dir / "all_location_frequency_semantics.csv"
+        full_path.write_text(json.dumps(full_location, indent=2) + "\n", encoding="utf-8")
+        keys = sorted({key for record in full_location["records"] for key in record})
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=keys); writer.writeheader(); writer.writerows(full_location["records"])
+        result["all_locations"] = {"json": str(full_path), "csv": str(csv_path), "n_locations": len(full_location["records"])}
     args.output_json.parent.mkdir(parents=True, exist_ok=True); args.output_json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2))
 

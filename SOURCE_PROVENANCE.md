@@ -61,6 +61,12 @@ location's own timestamps. Its `corr²` subspace objective accommodates arbitrar
 PCA sign/scale and the score basis's permutation/rotation ambiguity; it is not
 claimed as ECG ground truth or a DREME/S2V-DREME component.
 
+Change5C is diagnostic-only/read-only code. Full-location spectral metrics,
+paired deltas, loss-gradient reports, direct post-pullback voxel-grid INR
+queries, DVF exports, and finite-difference pullback Jacobians do not alter
+the Change4/5 model or loss definitions. Observation-conditioned volume exports
+are explicitly not globally synchronized physiological cardiac cine.
+
 ## SINR dependency statement
 
 `vasl12/SINR` is a public research-code repository used as an external pinned

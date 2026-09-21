@@ -96,6 +96,22 @@ class PCAWaveformSubspaceLossTest(unittest.TestCase):
         skipped = cardiac_pca_waveform_subspace_loss(self.scores[:5], self.target[:5], min_frames=8)
         self.assertEqual(1., float(skipped["skipped"]))
 
+    def test_arbitrary_orthogonal_rotation_score_scaling_and_degenerate_inputs(self) -> None:
+        rotation, _ = torch.linalg.qr(torch.randn(3, 3))
+        direct = cardiac_pca_waveform_subspace_loss(self.scores, self.target)
+        rotated = cardiac_pca_waveform_subspace_loss(self.scores @ rotation, self.target)
+        scaled = cardiac_pca_waveform_subspace_loss(self.scores * 1e-5, self.target)
+        enlarged = cardiac_pca_waveform_subspace_loss(self.scores * 1e5, self.target)
+        self.assertAlmostEqual(float(direct["r2"]), float(rotated["r2"]), places=5)
+        # The specified additive eps intentionally regularizes near-zero score
+        # energy, so only require high agreement at the small finite scale.
+        self.assertGreater(float(scaled["r2"]), .99)
+        self.assertAlmostEqual(float(direct["r2"]), float(enlarged["r2"]), places=4)
+        for scores, target in ((torch.zeros_like(self.scores), self.target), (self.scores, torch.ones(20)), (torch.full_like(self.scores, float("nan")), self.target)):
+            result = cardiac_pca_waveform_subspace_loss(scores, target)
+            self.assertEqual(1., float(result["skipped"]))
+            self.assertTrue(torch.isfinite(result["loss"]))
+
 
 class Change5BConfigTest(unittest.TestCase):
     def test_change5b_config_and_validation(self) -> None:

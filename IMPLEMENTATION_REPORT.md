@@ -166,3 +166,20 @@ invariant to PCA sign/scale and cardiac-score basis permutations/rotations.
 Missing/unreliable locations receive no global substitute; malformed timestamp
 alignment fails explicitly. Change5B remains project-specific weak supervision,
 not ECG ground truth nor a DREME/S2V-DREME method claim.
+
+## Change5C audit, diagnostics, and visualization — 2026-09-21
+
+`SCIENTIFIC_AUDIT_CHANGE4_CHANGE5.md` records a source-level PASS/PASS WITH
+DOCUMENTED LIMITATION audit of forward motion/PSF, Stage3a ownership,
+Change4, Change5A, Change5B, and historical diagnostics. No material scientific
+blocker was found. A CPU numerical regression proves that a Stage3a optimizer
+step after Stage2c changes only the cardiac FiLM head/cardiac MBC. A small
+non-scientific numerical repair makes PCA nonfinite-input skips finite and
+zero-gradient.
+
+The opt-in all-location diagnostic retains every valid location with a skip
+reason when unevaluable, preserves legacy probe-only motion fields, adds
+aggregate motion naming/population, and writes JSON/CSV. Companion comparison,
+gradient-audit, and visualization CLIs are read-only; server commands are in
+`CHANGE5C_AUDIT_DIAGNOSTIC_VIS_SERVER_RUN.md`. No GPU or real-data result was
+run locally.
