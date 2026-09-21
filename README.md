@@ -114,3 +114,15 @@ For the GPU ablation, start both arms from the same Change4 Stage2c checkpoint,
 seed, pixel samples, data/QC/domain and frequency prior. Run Stage3a=100 then
 Stage3b=100 with Stage3c=0; compare weight `0` against `0.001` and do not use a
 previously trained Stage3a/Stage3b checkpoint as the starting point.
+
+## Change5B per-location PCA waveform weak supervision
+
+`configs/source_first_change5b.yaml` retains Change5A concentration at `0.003`
+and adds `cardiac_pca_waveform: 0.001`. For each fixed `view/slice_id`, it
+loads that location's reliable Phase-1 `selected_pc` (explicitly 1-based),
+strictly matches its own valid timestamps, and weakly supervises the current
+three-dimensional cardiac-score subspace with a differentiable ridge fit and
+`corr²`. This is sign-, scale-, permutation-, and rotation-insensitive; it is
+an image-derived local surrogate, not ECG ground truth and never a global phase
+label. See [CHANGE5B_SERVER_RUN.md](CHANGE5B_SERVER_RUN.md) for the GPU-only
+Stage3a=1000 protocol.

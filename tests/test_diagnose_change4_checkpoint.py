@@ -48,9 +48,14 @@ class DiagnoseChange4CheckpointTest(unittest.TestCase):
         resp = torch.sin(2 * torch.pi * .2 * times)[:, None, None].repeat(1, 1, 3)
         before = card.clone()
         local = SimpleNamespace(cardiac_bands_hz=[(.60, .63)], respiratory_bands_hz=[(.15, .25)], respiratory_source="phase1_per_location", cardiac_source="phase1_per_location")
-        record = diagnostic.frequency_semantics_record("SAX", "s", resp, card, times, local)
+        pca_prior = SimpleNamespace(match=lambda view, slice_id, requested, **kwargs: SimpleNamespace(waveform=torch.sin(2 * torch.pi * .6 * requested), selected_pc=2))
+        record = diagnostic.frequency_semantics_record("SAX", "s", resp, card, times, local, pca_waveform_prior=pca_prior)
         self.assertIn("cardiac_target_fraction", record)
         self.assertIn("cardiac_target_concentration", record)
+        self.assertIn("cardiac_pca_waveform_r2", record)
+        self.assertIn("cardiac_pca_waveform_loss", record)
+        self.assertIn("cardiac_pca_matched_frames", record)
+        self.assertEqual(2, record["selected_cardiac_pc"])
         self.assertTrue(torch.equal(before, card))
 
 

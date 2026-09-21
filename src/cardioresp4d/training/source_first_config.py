@@ -48,12 +48,23 @@ def validate_source_first_config(config: Mapping[str, Any], project_root: str | 
     concentration = loss_weights.get("cardiac_target_concentration", 0.)
     if isinstance(concentration, bool) or not isinstance(concentration, (int, float)) or not math.isfinite(float(concentration)) or concentration < 0:
         raise ValueError("training.loss_weights.cardiac_target_concentration must be finite and >= 0")
+    pca_waveform = loss_weights.get("cardiac_pca_waveform", 0.)
+    if isinstance(pca_waveform, bool) or not isinstance(pca_waveform, (int, float)) or not math.isfinite(float(pca_waveform)) or pca_waveform < 0:
+        raise ValueError("training.loss_weights.cardiac_pca_waveform must be finite and >= 0")
     for key in ("psf", "film", "uncertainty", "respiratory_mbc", "cardiac_mbc"):
         if not isinstance(model.get(key), Mapping):
             raise ValueError(f"source-first configuration requires model.{key}")
     regularization = _mapping(training, "motion_regularization")
     if not isinstance(regularization.get("respiratory_evaluation_grid"), Mapping) or not isinstance(regularization.get("cardiac_evaluation_grid"), Mapping):
         raise ValueError("v3 formal motion regularization requires separate respiratory and cardiac grids")
+    temporal_auxiliary = training.get("temporal_auxiliary", {})
+    if not isinstance(temporal_auxiliary, Mapping):
+        raise ValueError("training.temporal_auxiliary must be a mapping when provided")
+    ridge, min_frames = temporal_auxiliary.get("pca_waveform_ridge", 1e-4), temporal_auxiliary.get("pca_waveform_min_frames", 8)
+    if isinstance(ridge, bool) or not isinstance(ridge, (int, float)) or not math.isfinite(float(ridge)) or ridge < 0:
+        raise ValueError("training.temporal_auxiliary.pca_waveform_ridge must be finite and >= 0")
+    if isinstance(min_frames, bool) or not isinstance(min_frames, int) or min_frames < 3:
+        raise ValueError("training.temporal_auxiliary.pca_waveform_min_frames must be integer >= 3")
     for name in ("stage3a", "stage3b", "stage3c"):
         if not isinstance(training.get(name), Mapping):
             raise ValueError(f"v3_change4 source-first configuration requires training.{name}")

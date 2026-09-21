@@ -53,6 +53,14 @@ the existing Phase-1 per-location cardiac bands and a timestamp-derived non-DC
 NUDFT grid, including the documented nearest-grid-centre rule for a valid
 narrow Phase-1 band.
 
+Change5B adds a separate project-specific image-domain adaptation: per-location
+Phase-1 PCA cardiac waveform weak supervision. It reuses no external model or
+new upstream source: the selected 1-based temporal PC is an image-derived,
+fixed-slice surrogate loaded from Phase-1 output and aligned only by that
+location's own timestamps. Its `corr²` subspace objective accommodates arbitrary
+PCA sign/scale and the score basis's permutation/rotation ambiguity; it is not
+claimed as ECG ground truth or a DREME/S2V-DREME component.
+
 ## SINR dependency statement
 
 `vasl12/SINR` is a public research-code repository used as an external pinned

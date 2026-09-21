@@ -154,3 +154,15 @@ a project-specific image-domain adaptation introduced because Change4 could
 satisfy those suppression losses while cardiac score energy remained in
 low-frequency nuisance bands. `source_first_change5a.yaml` sets the audit
 weight to `0.001`; missing legacy config keys remain zero.
+
+## v3_change5B per-location PCA waveform weak supervision — 2026-09-21
+
+Change5B adds no model architecture or trainable projection. A cached provider
+reads each reliable Phase-1 location's explicitly 1-based `selected_pc` from
+its own `pca_psd.npz`, strictly matches only the sampler's valid timestamps,
+and applies a differentiable ridge best-linear projection from `[T,3]` cardiac
+scores to that fixed image-derived waveform. The loss is `1-corr²`, making it
+invariant to PCA sign/scale and cardiac-score basis permutations/rotations.
+Missing/unreliable locations receive no global substitute; malformed timestamp
+alignment fails explicitly. Change5B remains project-specific weak supervision,
+not ECG ground truth nor a DREME/S2V-DREME method claim.
