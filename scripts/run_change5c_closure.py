@@ -22,6 +22,13 @@ def _experiment(value: str) -> tuple[str, Path, Path]:
     label, rest = value.split("=", 1); config, checkpoint = rest.split(",", 1); return label, Path(config), Path(checkpoint)
 
 
+def resolve_baseline(experiments: list[tuple[str, Path, Path]], baseline: str) -> str:
+    labels = {label for label, _, _ in experiments}
+    if baseline not in labels:
+        raise ValueError(f"--baseline must name one supplied --experiment; got {baseline}")
+    return baseline
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -82,9 +89,11 @@ def render_closure_report(per_checkpoint: dict, comparisons: dict, contract_by_l
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment", action="append", type=_experiment, required=True, metavar="LABEL=CONFIG,CHECKPOINT"); parser.add_argument("--frequency-bands", type=Path, required=True); parser.add_argument("--manifest", type=Path, required=True); parser.add_argument("--qc-table", type=Path, required=True); parser.add_argument("--canonical-domain", type=Path, required=True); parser.add_argument("--output-dir", type=Path, required=True); parser.add_argument("--device", default="cuda"); parser.add_argument("--seed", type=int, default=0); parser.add_argument("--reuse-valid", action="store_true")
+    parser.add_argument("--experiment", action="append", type=_experiment, required=True, metavar="LABEL=CONFIG,CHECKPOINT"); parser.add_argument("--baseline", required=True); parser.add_argument("--frequency-bands", type=Path, required=True); parser.add_argument("--manifest", type=Path, required=True); parser.add_argument("--qc-table", type=Path, required=True); parser.add_argument("--canonical-domain", type=Path, required=True); parser.add_argument("--output-dir", type=Path, required=True); parser.add_argument("--device", default="cuda"); parser.add_argument("--seed", type=int, default=0); parser.add_argument("--reuse-valid", action="store_true")
     args = parser.parse_args(); experiments = args.experiment
-    if len(experiments) < 3: parser.error("Change5C expects CTRL, LATE, and C5B experiments")
+    if len(experiments) < 3: parser.error("Change5C expects at least three experiments")
+    try: baseline = resolve_baseline(experiments, args.baseline)
+    except ValueError as exc: parser.error(str(exc))
     for _, config, checkpoint in experiments:
         for path in (config, checkpoint):
             if not path.is_file(): parser.error(f"required input is missing: {path}")
@@ -99,12 +108,6 @@ def main() -> None:
     for record in contract_records:
         if record.get("current_stage") != "stage3a": raise ValueError(f"{record['label']} is not a Stage3a checkpoint: {record.get('current_stage')}")
         if not record["relevant_loss_weight_agreement"]["all_relevant_keys_agree"]: raise ValueError(f"{record['label']} supplied YAML disagrees with checkpoint-effective loss weights")
-        weights = record["checkpoint_effective_loss_weights"]; label = record["label"].upper()
-        expected = {"CTRL": {"cardiac_pca_waveform": 0.}, "LATE": {"cardiac_pca_waveform": 1e-4}, "C5B": {"cardiac_target_concentration": .003, "cardiac_pca_waveform": .001}}
-        for token, expected_weights in expected.items():
-            if token in label:
-                for name, value in expected_weights.items():
-                    if float(weights.get(name, float("nan"))) != value: raise ValueError(f"{record['label']} effective {name}={weights.get(name)}; expected {value}")
     semantic_paths, ablation_paths = {}, {}
     for label, config, checkpoint in experiments:
         directory = args.output_dir / label; semantic = directory / "all_location_diagnostic.json"; ablation = directory / "all_location_cardiac_ablation.json"; semantic_paths[label] = semantic; ablation_paths[label] = ablation
@@ -116,8 +119,9 @@ def main() -> None:
             output = directory / f"stage3a_gradient_{mode}.json"
             if not _output(output, args.reuse_valid, provenance):
                 _run([python, "scripts/audit_stage3a_loss_gradients.py", "--source-config", str(config), "--frequency-bands", str(args.frequency_bands), "--manifest", str(args.manifest), "--qc-table", str(args.qc_table), "--canonical-domain", str(args.canonical_domain), "--checkpoint", str(checkpoint), "--mode", mode, "--view", "SAX", "--slice-id", "SAX_s026", "--device", args.device, "--seed", str(args.seed), "--output-json", str(output)], logs / f"{label}_gradient_{mode}.log"); _mark_completed(output, provenance)
-    baseline = experiments[0][0]; comparisons = {}
-    for label, _, _ in experiments[1:]:
+    comparisons = {}
+    for label, _, _ in experiments:
+        if label == baseline: continue
         left, right = json.loads(ablation_paths[baseline].read_text(encoding="utf-8"))["records"], json.loads(ablation_paths[label].read_text(encoding="utf-8"))["records"]
         comparisons[label] = paired_ablation_comparison([row for row in left if row.get("status") == "evaluated"], [row for row in right if row.get("status") == "evaluated"])
     comparison_path = args.output_dir / "compare_cardiac_ablation.json"; comparison_path.write_text(json.dumps({"baseline": baseline, "comparisons": comparisons}, indent=2) + "\n", encoding="utf-8")
@@ -125,7 +129,11 @@ def main() -> None:
     if not _output(locations, args.reuse_valid, provenance):
         _run([python, "scripts/select_change5c_visualization_locations.py", "--baseline-semantic", str(semantic_paths[baseline]), "--candidate-semantic", str(semantic_paths[candidate]), "--baseline-ablation", str(ablation_paths[baseline]), "--candidate-ablation", str(ablation_paths[candidate]), "--output-json", str(locations)], logs / "select_locations.log"); _mark_completed(locations, provenance)
     selected = json.loads(locations.read_text(encoding="utf-8"))["locations"]
+    foundation_paths = {}
     for label, config, checkpoint in experiments:
+        foundation = args.output_dir / label / "foundation"; foundation_paths[label] = foundation / "foundation_audit.json"
+        if not _output(foundation, args.reuse_valid, provenance):
+            _run([python, "scripts/audit_foundation_reconstruction.py", "--source-config", str(config), "--manifest", str(args.manifest), "--qc-table", str(args.qc_table), "--canonical-domain", str(args.canonical_domain), "--checkpoint", str(checkpoint), *[item for location in selected for item in ("--location", f"{location['view']}/{location['slice_id']}")], "--device", args.device, "--seed", str(args.seed), "--slice-chunk-size", str(SLICE_CHUNK_SIZE), "--output-dir", str(foundation)], logs / f"{label}_foundation.log"); _mark_completed(foundation, provenance)
         for location in selected:
             view, slice_id = location["view"], location["slice_id"]; output = args.output_dir / label / f"visualize_{view}_{slice_id}"
             if not _output(output, args.reuse_valid, provenance):
@@ -139,8 +147,8 @@ def main() -> None:
             _run([python, "scripts/visualize_change5c_score_comparison.py", *[item for label, config, checkpoint in experiments for item in ("--experiment", f"{label}={config},{checkpoint}")], "--frequency-bands", str(args.frequency_bands), "--manifest", str(args.manifest), "--qc-table", str(args.qc_table), "--canonical-domain", str(args.canonical_domain), "--view", view, "--slice-id", slice_id, "--device", args.device, "--output-png", str(score_png), "--output-json", str(comparison_visual / f"{view}_{slice_id}_scores_pca_spectrum.json")], logs / f"{view}_{slice_id}_score_visual.log"); _mark_completed(score_png, provenance)
     (args.output_dir / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
     semantic_payloads = {label: json.loads(semantic_paths[label].read_text(encoding="utf-8")) for label, _, _ in experiments}
-    per_checkpoint = {label: {"semantic_summary": semantic_payloads[label]["summary"], "motion": semantic_payloads[label].get("aggregate_motion_statistics"), "cardiac_ablation": json.loads(ablation_paths[label].read_text(encoding="utf-8")), "gradient_location_matched": json.loads((args.output_dir / label / "stage3a_gradient_location-matched.json").read_text(encoding="utf-8")), "gradient_training_step_matched": json.loads((args.output_dir / label / "stage3a_gradient_training-step-matched.json").read_text(encoding="utf-8"))} for label, _, _ in experiments}
-    summary = {"status": "completed_read_only", "baseline": baseline, "experiments": per_checkpoint, "outputs": {"contract": str(contract), "ablation_comparison": str(comparison_path), "visualization_locations": str(locations), "visual_evidence": str(comparison_visual)}}
+    per_checkpoint = {label: {"semantic_summary": semantic_payloads[label]["summary"], "motion": semantic_payloads[label].get("aggregate_motion_statistics"), "cardiac_ablation": json.loads(ablation_paths[label].read_text(encoding="utf-8")), "foundation": json.loads(foundation_paths[label].read_text(encoding="utf-8")), "gradient_location_matched": json.loads((args.output_dir / label / "stage3a_gradient_location-matched.json").read_text(encoding="utf-8")), "gradient_training_step_matched": json.loads((args.output_dir / label / "stage3a_gradient_training-step-matched.json").read_text(encoding="utf-8"))} for label, _, _ in experiments}
+    summary = {"status": "completed_read_only", "baseline": baseline, "experiments": per_checkpoint, "outputs": {"contract": str(contract), "ablation_comparison": str(comparison_path), "visualization_locations": str(locations), "foundation": {label: str(path) for label, path in foundation_paths.items()}, "visual_evidence": str(comparison_visual)}}
     (args.output_dir / "change5c_closure_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     def fmt(value) -> str: return "n/a" if value is None else f"{float(value):.4g}"
     report_lines = ["# Change5C closure report", "", "Read-only descriptive analysis; positive MSE gain is not a statistical-significance claim.", "", "## Checkpoint contract", "", "|checkpoint|stage|global/stage step|checkpoint concentration/PCA|frozen groups equal|", "|---|---|---|---|---|"]

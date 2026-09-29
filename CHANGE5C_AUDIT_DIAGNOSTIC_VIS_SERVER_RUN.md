@@ -101,7 +101,7 @@ for LABEL in CTRL_2000 CTRL_2500 LATE_1e4 EARLY_5B_2500; do
       --source-config ${CFG} --manifest ${MANIFEST} --qc-table ${QC} \
       --canonical-domain ${DOMAIN} --checkpoint ${CKPT} --view ${VIEW} \
       --slice-id ${SLICE} --device cuda --frames 12 --grid-shape 64 64 64 \
-      --chunk-size 65536 --seed 0 --output-dir ${OUT}/${LABEL}/visualize_${VIEW}_${SLICE}
+      --slice-chunk-size 1024 --volume-chunk-size 65536 --seed 0 --output-dir ${OUT}/${LABEL}/visualize_${VIEW}_${SLICE}
   done
 done
 ```

@@ -22,8 +22,20 @@ from cardioresp4d.diagnostics.change5c import (  # noqa: E402
     stable_diagnostic_seed,
 )
 
+sys.path.insert(0, str(ROOT / "scripts"))
+import run_change5c_closure as closure  # noqa: E402
+
 
 class Change5CHotfixTest(unittest.TestCase):
+    def test_explicit_baseline_can_be_any_label_not_first_experiment(self) -> None:
+        resolver = getattr(closure, "resolve_baseline", None)
+        self.assertIsNotNone(resolver)
+        if resolver is None:
+            return
+        experiments = [("C5A_W003_2500", Path("a"), Path("a.pt")), ("C4_NEGONLY_2500", Path("c4"), Path("c4.pt")), ("C5B_1E3_2500", Path("b"), Path("b.pt"))]
+        self.assertEqual("C4_NEGONLY_2500", resolver(experiments, "C4_NEGONLY_2500"))
+        with self.assertRaises(ValueError): resolver(experiments, "missing")
+
     def test_psf_seed_is_stable_and_experiment_label_independent(self) -> None:
         first = stable_diagnostic_seed(7, "SAX", "SAX_s026", 42, purpose="psf")
         self.assertEqual(first, stable_diagnostic_seed(7, "SAX", "SAX_s026", 42, purpose="psf"))

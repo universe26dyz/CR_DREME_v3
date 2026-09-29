@@ -183,3 +183,24 @@ aggregate motion naming/population, and writes JSON/CSV. Companion comparison,
 gradient-audit, and visualization CLIs are read-only; server commands are in
 `CHANGE5C_AUDIT_DIAGNOSTIC_VIS_SERVER_RUN.md`. No GPU or real-data result was
 run locally.
+
+## Change4 foundation audit and C4_NEGONLY — 2026-09-29
+
+### Code-level conclusion
+
+The observed blur/weak cardiac effect cannot be attributed to semantic losses from existing outputs alone. The new read-only foundation audit isolates, on the same timestamp-ordered fixed location and deterministic PSF realization: canonical-direct, canonical+PSF, Resp-only, Resp+Card, acquired residuals, and temporal structure. It does not perform optimization or alter a checkpoint. Actual scientific conclusions remain pending the prescribed GPU-server audits.
+
+`C4_NEGONLY_2500` is the matched control: it preserves `source_first.yaml` runtime semantics and keeps only Eq. 8/Eq. 9-style negative crossover active. The subsequent C4 Stage3b rescue tests the separate frozen-foundation hypothesis without changing C5A/C5B.
+
+### Interpretation after the server runs
+
+1. Blurry canonical-direct indicates insufficient anatomy/foundation learning.
+2. Clear canonical-direct but degraded canonical+PSF points to PSF, geometry, or rendering.
+3. Acceptable PSF but degraded Resp-only points to respiratory field, score, or composition.
+4. Acceptable Resp-only but only speckled Resp+Card-minus-Resp points to cardiac representation or identifiability.
+5. C4 outperforming C5A/C5B implicates the project-specific target/PCA supervision.
+6. Poor C4 Stage3a but improved C4 Stage3b implicates frozen canonical/respiratory modules or insufficient joint refinement.
+7. Poor C4 Stage3b together with blurry canonical-direct means stop semantic-loss sweeps and revisit Stage1/Stage2 convergence.
+8. Clear anatomy in all arms but failed cardiac temporal variation keeps image-domain cardiac identifiability and score-to-MBC coupling as the next question.
+
+All temporal comparisons are within one `view/slice_id`, sorted by real timestamp; output volumes remain observation-conditioned and are not globally synchronized physiological cine.
