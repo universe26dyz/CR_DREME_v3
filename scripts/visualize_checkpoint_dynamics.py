@@ -40,13 +40,13 @@ def _motion_for(model, observation, stage: str):
     return SequentialPullbackMotion(resp, card), SequentialPullbackMotion(resp, _Zero()), scores
 
 
-def _slice_prediction(model, observation, stage: str, *, seed: int, chunk: int) -> torch.Tensor:
+def _slice_prediction(model, observation, stage: str, *, seed: int, slice_chunk_size: int) -> torch.Tensor:
     height, width = observation.image.shape[-2:]; linear = torch.arange(height * width, device=observation.image.device)
     pixels = torch.stack((linear.remainder(width), torch.div(linear, width, rounding_mode="floor")), -1).to(observation.image.dtype)
     outputs = []
     psf_seed = stable_diagnostic_seed(seed, observation.view, observation.slice_id, observation.dynamic_frame_id, purpose="psf")
     with diagnostic_rng(psf_seed, observation.image.device):
-        for start in range(0, len(pixels), chunk): outputs.append(model.predict(observation, pixels[start:start + chunk], stage)["predicted_intensity"])
+        for start in range(0, len(pixels), slice_chunk_size): outputs.append(model.predict(observation, pixels[start:start + slice_chunk_size], stage)["predicted_intensity"])
     return torch.cat(outputs).reshape(height, width)
 
 
@@ -68,7 +68,7 @@ def main() -> None:
     parser.add_argument("--source-config", type=Path, default=PROJECT_ROOT / "configs" / "source_first.yaml")
     parser.add_argument("--manifest", type=Path, required=True); parser.add_argument("--qc-table", type=Path, required=True); parser.add_argument("--canonical-domain", type=Path, required=True); parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--view", required=True); parser.add_argument("--slice-id", required=True); parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--device", default="cpu"); parser.add_argument("--frames", type=int, default=12); parser.add_argument("--grid-shape", type=int, nargs=3, default=(64, 64, 64)); parser.add_argument("--chunk-size", type=int, default=65536); parser.add_argument("--seed", type=int, default=0); parser.add_argument("--intensity-vmin", type=float); parser.add_argument("--intensity-vmax", type=float); parser.add_argument("--residual-vmax", type=float); parser.add_argument("--effect-vmax", type=float)
+    parser.add_argument("--device", default="cpu"); parser.add_argument("--frames", type=int, default=12); parser.add_argument("--grid-shape", type=int, nargs=3, default=(64, 64, 64)); parser.add_argument("--slice-chunk-size", type=int, default=1024); parser.add_argument("--volume-chunk-size", type=int, default=65536); parser.add_argument("--seed", type=int, default=0); parser.add_argument("--intensity-vmin", type=float); parser.add_argument("--intensity-vmax", type=float); parser.add_argument("--residual-vmax", type=float); parser.add_argument("--effect-vmax", type=float)
     args = parser.parse_args(); device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available(): parser.error("CUDA requested but unavailable")
     config = yaml.safe_load(args.source_config.read_text(encoding="utf-8")); validate_source_first_config(config, PROJECT_ROOT)
@@ -83,13 +83,13 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True); rows = []
     with torch.no_grad():
         for index, observation in enumerate(chosen):
-            acquired = observation.image[0].detach().cpu(); resp = _slice_prediction(model, observation, "stage2c", seed=args.seed, chunk=args.chunk_size); joint = _slice_prediction(model, observation, stage, seed=args.seed, chunk=args.chunk_size); psf_seed = stable_diagnostic_seed(args.seed, observation.view, observation.slice_id, observation.dynamic_frame_id, purpose="psf")
+            acquired = observation.image[0].detach().cpu(); resp = _slice_prediction(model, observation, "stage2c", seed=args.seed, slice_chunk_size=args.slice_chunk_size); joint = _slice_prediction(model, observation, stage, seed=args.seed, slice_chunk_size=args.slice_chunk_size); psf_seed = stable_diagnostic_seed(args.seed, observation.view, observation.slice_id, observation.dynamic_frame_id, purpose="psf")
             np.savez_compressed(args.output_dir / f"reprojection_{index:03d}.npz", acquired=acquired.numpy(), resp_only=resp.cpu().numpy(), resp_plus_card=joint.cpu().numpy(), timestamp_s=observation.timestamp_s, dynamic_frame_id=observation.dynamic_frame_id, psf_seed=psf_seed)
             _save_png(args.output_dir / f"reprojection_{index:03d}.png", [acquired.numpy(), resp.cpu().numpy(), joint.cpu().numpy(), (acquired - resp.cpu()).abs().numpy(), (acquired - joint.cpu()).abs().numpy(), (joint - resp.cpu()).abs().numpy()], ["Acquired 2D", "Resp-only", "Resp+Card", "|Acquired - Resp|", "|Acquired - Resp+Card|", "|Resp+Card - Resp|"], intensity_window=None if args.intensity_vmin is None or args.intensity_vmax is None else (args.intensity_vmin, args.intensity_vmax), residual_vmax=args.residual_vmax, effect_vmax=args.effect_vmax)
             rows.append({"frame": index, "timestamp_s": observation.timestamp_s, "dynamic_frame_id": int(observation.dynamic_frame_id), "psf_seed": psf_seed, "resp_only_mse": float((acquired - resp.cpu()).square().mean()), "resp_plus_card_mse": float((acquired - joint.cpu()).square().mean())})
-        grid, spacing = world_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, tuple(args.grid_shape)); canonical_reference, _ = chunked_canonical_query(model.canonical, None, grid, chunk_size=args.chunk_size); dynamic, resp_dynamic, dvf, jacobians = [], [], [], []
+        grid, spacing = world_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, tuple(args.grid_shape)); canonical_reference, _ = chunked_canonical_query(model.canonical, None, grid, chunk_size=args.volume_chunk_size); dynamic, resp_dynamic, dvf, jacobians = [], [], [], []
         for index, observation in enumerate(chosen):
-            motion, resp_motion, scores = _motion_for(model, observation, stage); volume, reference = chunked_canonical_query(model.canonical, motion, grid, chunk_size=args.chunk_size); resp_volume, _ = chunked_canonical_query(model.canonical, resp_motion, grid, chunk_size=args.chunk_size); total = pullback_displacement(grid, reference)
+            motion, resp_motion, scores = _motion_for(model, observation, stage); volume, reference = chunked_canonical_query(model.canonical, motion, grid, chunk_size=args.volume_chunk_size); resp_volume, _ = chunked_canonical_query(model.canonical, resp_motion, grid, chunk_size=args.volume_chunk_size); total = pullback_displacement(grid, reference)
             motion_data = motion(grid.reshape(1, -1, 3)) if motion is not None else {"cardiac_dvf_mm": torch.zeros_like(grid.reshape(1, -1, 3)), "respiratory_dvf_mm": torch.zeros_like(grid.reshape(1, -1, 3)), "reference_points_mm": grid.reshape(1, -1, 3)}
             determinant = jacobian_determinant(reference, spacing); dynamic.append(volume.cpu()); jacobians.append(determinant.cpu()); dvf.append(total.cpu())
             resp_dynamic.append(resp_volume.cpu()); np.savez_compressed(args.output_dir / f"dvf_{index:03d}.npz", observation_world_mm=grid.cpu().numpy(), reference_world_mm=reference.cpu().numpy(), cardiac_center_world_mm=((model.cardiac_lower_world_mm + model.cardiac_upper_world_mm) / 2).cpu().numpy(), cardiac_dvf_mm=motion_data["cardiac_dvf_mm"].reshape(*args.grid_shape, 3).cpu().numpy(), respiratory_dvf_mm=motion_data["respiratory_dvf_mm"].reshape(*args.grid_shape, 3).cpu().numpy(), total_dvf_mm=total.cpu().numpy(), jacobian_observation_to_reference=determinant.cpu().numpy())

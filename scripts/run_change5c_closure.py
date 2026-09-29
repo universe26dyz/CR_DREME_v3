@@ -13,6 +13,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from cardioresp4d.diagnostics.change5c import paired_ablation_comparison, provenance_matches
 
+SLICE_CHUNK_SIZE = 1024
+VOLUME_CHUNK_SIZE = 65536
+
 
 def _experiment(value: str) -> tuple[str, Path, Path]:
     if "=" not in value or "," not in value.split("=", 1)[1]: raise argparse.ArgumentTypeError("--experiment must be LABEL=CONFIG,CHECKPOINT")
@@ -24,6 +27,14 @@ def _sha256(path: Path) -> str:
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""): digest.update(block)
     return digest.hexdigest()
+
+
+def closure_sampling_metadata() -> dict:
+    return {"gradient_pixel_samples": 256, "ablation_frames_per_location": 5, "ablation_max_cardiac_pixels": 512, "visualization": {"slice_chunk_size": SLICE_CHUNK_SIZE, "volume_chunk_size": VOLUME_CHUNK_SIZE}}
+
+
+def visualization_command(python: str, config: Path, manifest: Path, qc_table: Path, canonical_domain: Path, checkpoint: Path, view: str, slice_id: str, device: str, seed: int, output: Path) -> list[str]:
+    return [python, "scripts/visualize_checkpoint_dynamics.py", "--source-config", str(config), "--manifest", str(manifest), "--qc-table", str(qc_table), "--canonical-domain", str(canonical_domain), "--checkpoint", str(checkpoint), "--view", view, "--slice-id", slice_id, "--device", device, "--seed", str(seed), "--slice-chunk-size", str(SLICE_CHUNK_SIZE), "--volume-chunk-size", str(VOLUME_CHUNK_SIZE), "--output-dir", str(output)]
 
 
 def _run(command: list[str], log: Path) -> None:
@@ -80,7 +91,7 @@ def main() -> None:
     for path in (args.frequency_bands, args.manifest, args.qc_table, args.canonical_domain):
         if not path.is_file(): parser.error(f"required common input is missing: {path}")
     args.output_dir.mkdir(parents=True, exist_ok=True); logs = args.output_dir / "logs"; python = sys.executable
-    provenance = {"git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT, text=True).strip(), "seed": args.seed, "sampling": {"gradient_pixel_samples": 256, "ablation_frames_per_location": 5, "ablation_max_cardiac_pixels": 512}, "inputs": {"frequency_bands_sha256": _sha256(args.frequency_bands), "manifest_sha256": _sha256(args.manifest), "qc_table_sha256": _sha256(args.qc_table), "canonical_domain_sha256": _sha256(args.canonical_domain), "experiments": [{"label": label, "config_sha256": _sha256(config), "checkpoint_sha256": _sha256(checkpoint)} for label, config, checkpoint in experiments]}}
+    provenance = {"git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT, text=True).strip(), "seed": args.seed, "sampling": closure_sampling_metadata(), "inputs": {"frequency_bands_sha256": _sha256(args.frequency_bands), "manifest_sha256": _sha256(args.manifest), "qc_table_sha256": _sha256(args.qc_table), "canonical_domain_sha256": _sha256(args.canonical_domain), "experiments": [{"label": label, "config_sha256": _sha256(config), "checkpoint_sha256": _sha256(checkpoint)} for label, config, checkpoint in experiments]}}
     contract = args.output_dir / "checkpoint_contract_audit.json"
     if not _output(contract, args.reuse_valid, provenance):
         _run([python, "scripts/audit_checkpoint_contract.py", *[item for label, config, checkpoint in experiments for item in ("--experiment", f"{label}={config},{checkpoint}")], "--output-json", str(contract)], logs / "checkpoint_contract_audit.log"); _mark_completed(contract, provenance)
@@ -118,7 +129,7 @@ def main() -> None:
         for location in selected:
             view, slice_id = location["view"], location["slice_id"]; output = args.output_dir / label / f"visualize_{view}_{slice_id}"
             if not _output(output, args.reuse_valid, provenance):
-                _run([python, "scripts/visualize_checkpoint_dynamics.py", "--source-config", str(config), "--manifest", str(args.manifest), "--qc-table", str(args.qc_table), "--canonical-domain", str(args.canonical_domain), "--checkpoint", str(checkpoint), "--view", view, "--slice-id", slice_id, "--device", args.device, "--seed", str(args.seed), "--output-dir", str(output)], logs / f"{label}_{view}_{slice_id}_visual.log"); _mark_completed(output, provenance)
+                _run(visualization_command(python, config, args.manifest, args.qc_table, args.canonical_domain, checkpoint, view, slice_id, args.device, args.seed, output), logs / f"{label}_{view}_{slice_id}_visual.log"); _mark_completed(output, provenance)
     comparison_visual = args.output_dir / "visual_comparison"
     if not _output(comparison_visual, args.reuse_valid, provenance):
         _run([python, "scripts/visualize_change5c_comparison.py", *[item for label, _, _ in experiments for item in ("--input", f"{label}={args.output_dir / label}")], "--locations-json", str(locations), "--output-dir", str(comparison_visual)], logs / "visual_comparison.log"); _mark_completed(comparison_visual, provenance)
