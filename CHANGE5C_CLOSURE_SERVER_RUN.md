@@ -7,14 +7,14 @@ does not train or modify checkpoints, and writes verbose progress to `logs/`.
 ```bash
 cd /data/dengyz/code/CR_DREME_v3
 git fetch origin && git checkout dev/cardioresp4d && git pull --ff-only origin dev/cardioresp4d
-conda activate svr4d
+conda activate cr_dreme
 
 PHASE1=/data/dengyz/dataset/CR_DREME_v3/v1/phase1
 FREQ=${PHASE1}/frequency/frequency_bands.json
 MANIFEST=${PHASE1}/dicom_manifest.csv
 QC=${PHASE1}/acquisition_qc/acquisition_qc.csv
 DOMAIN=${PHASE1}/canonical_domain/canonical_domain.json
-OUT=/data/dengyz/dataset/CR_DREME_v3/change5c_closure
+OUT=/data/dengyz/dataset/CR_DREME_v3/change5c_closure_final
 
 CTRL_CKPT=/REPLACE/with/CTRL_2500/source_first_last.pt
 CTRL_CFG=/REPLACE/with/CTRL_2500/source_first.yaml

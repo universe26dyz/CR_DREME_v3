@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src")); sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend
-from cardioresp4d.diagnostics.change5c import choose_representative_indices, cosine_similarity, deterministic_pixel_indices, l2_norm
+from cardioresp4d.diagnostics.change5c import choose_representative_indices, cosine_similarity, deterministic_pixel_indices, diagnostic_rng, l2_norm, stable_diagnostic_seed
 from cardioresp4d.frequency.pca_waveform_prior import PCAWaveformPrior
 from cardioresp4d.frequency.training_prior import load_training_frequency_prior
 from cardioresp4d.training.build_model import build_source_first_model
@@ -131,7 +131,11 @@ def _deterministic_components(trainer: UnifiedProgressiveTrainer, data_frames: l
     trainer.sample_pixels = lambda observation: deterministic_sample_pixels(trainer, observation, seed=seed + int(observation.dynamic_frame_id))  # type: ignore[method-assign]
     trainer.sampler.temporal_batch = lambda *, max_items: temporal_frames[:max_items]  # type: ignore[method-assign]
     try:
-        rows = [trainer._observation_components(item, "stage3a") for item in data_frames]
+        rows = []
+        for item in data_frames:
+            psf_seed = stable_diagnostic_seed(seed, item.view, item.slice_id, item.dynamic_frame_id, purpose="psf")
+            with diagnostic_rng(psf_seed, item.image.device):
+                rows.append(trainer._observation_components(item, "stage3a"))
         components = {name: torch.stack([row[name] for row in rows]).mean() for name in rows[0]}
         components.update(trainer._temporal_components("stage3a"))
         return components
@@ -144,11 +148,26 @@ def _gradient_summary(components: dict[str, torch.Tensor], trainer: UnifiedProgr
     loss_names = ("data", *REGULARIZATION, *SEMANTIC)
     losses = {name: components[name] for name in loss_names if name in components}
     vectors = collect_loss_gradients(losses, weights, modules, combined={"semantic_aux": SEMANTIC, "regularization_aux": REGULARIZATION, "total": tuple(losses)})
-    result = {name: {module: {"l2_norm": l2_norm(vector)} for module, vector in grouped.items()} for name, grouped in vectors.items()}
+    result = {}
+    for name, grouped in vectors.items():
+        combined = name in {"semantic_aux", "regularization_aux", "total"}
+        result[name] = {module: ({"combined_l2_norm": l2_norm(vector)} if combined else {"raw_l2_norm": l2_norm(vector), "weighted_l2_norm": abs(float(weights.get(name, 1.))) * l2_norm(vector), "configured_weight": float(weights.get(name, 1.))}) for module, vector in grouped.items()}
     pairs = (("data", "cardiac_target_concentration"), ("data", "cardiac_pca_waveform"), ("data", "zero_mean_score"), ("cardiac_target_concentration", "cardiac_pca_waveform"), ("data", "semantic_aux"), ("data", "total"))
     result["cosine_similarity"] = {"cardiac_film_head": {f"{left}_vs_{right}": cosine_similarity(vectors[left]["cardiac_film_head"], vectors[right]["cardiac_film_head"]) for left, right in pairs if left in vectors and right in vectors}, "undefined_policy": "null means at least one vector has zero L2 norm"}
+    for module in ("cardiac_film_head", "cardiac_mbc"):
+        data_norm = l2_norm(vectors["data"][module]) if "data" in vectors else 0.
+        result.setdefault("combined_ratios", {})[module] = {"semantic_aux_to_data_norm_ratio": None if data_norm == 0. or "semantic_aux" not in vectors else l2_norm(vectors["semantic_aux"][module]) / data_norm, "regularization_aux_to_data_norm_ratio": None if data_norm == 0. or "regularization_aux" not in vectors else l2_norm(vectors["regularization_aux"][module]) / data_norm}
     result["configured_weights"] = weights
     return result
+
+
+def _step_summary(audits: list[dict]) -> dict:
+    def summarize(values: list[float]) -> dict[str, float | None]:
+        if not values: return {"mean": None, "median": None, "q25": None, "q75": None, "min": None, "max": None}
+        value = torch.tensor(values, dtype=torch.float64); return {"mean": float(value.mean()), "median": float(value.median()), "q25": float(torch.quantile(value, .25)), "q75": float(torch.quantile(value, .75)), "min": float(value.min()), "max": float(value.max())}
+    ratios = {name: summarize([float(audit["combined_ratios"]["cardiac_film_head"][name]) for audit in audits if audit.get("combined_ratios", {}).get("cardiac_film_head", {}).get(name) is not None]) for name in ("semantic_aux_to_data_norm_ratio", "regularization_aux_to_data_norm_ratio")}
+    cosines = {name: summarize([float(audit["cosine_similarity"]["cardiac_film_head"][name]) for audit in audits if audit.get("cosine_similarity", {}).get("cardiac_film_head", {}).get(name) is not None]) for name in ("data_vs_semantic_aux", "data_vs_total", "data_vs_cardiac_target_concentration", "data_vs_cardiac_pca_waveform", "data_vs_zero_mean_score", "cardiac_target_concentration_vs_cardiac_pca_waveform")}
+    return {"cardiac_film_head_ratios": ratios, "cardiac_film_head_cosines": cosines}
 
 
 def _data_norm_distribution(trainer: UnifiedProgressiveTrainer, data: list, temporal: list, *, seed: int, modules: dict[str, list[torch.nn.Parameter]]) -> dict[str, float]:
@@ -193,10 +212,10 @@ def main() -> None:
         for step in range(args.pseudo_steps):
             data = trainer.sampler.sample_step(); temporal = trainer.sampler.temporal_batch(max_items=trainer.temporal_batch_size)
             selections.append({"step": step, "data_frames": [_describe(item) for item in data], "temporal_frames": [_describe(item) for item in temporal]})
-            audit = _gradient_summary(_deterministic_components(trainer, data, temporal, seed=args.seed + step * 100003), trainer, modules)
-            audits.append(audit | {"data_gradient_distribution_cardiac_film_head": _data_norm_distribution(trainer, data, temporal, seed=args.seed + step * 100003, modules=modules)})
-    leakage = any(value.get("frozen_modules", {}).get("l2_norm", 0.) > 0. for audit in audits for value in audit.values() if isinstance(value, dict))
-    payload = {"status": "read_only_no_optimizer_step", "stage": "stage3a", "mode": args.mode, "seed": args.seed, "pixel_selection_policy": {"pixel_samples": args.pixel_samples, "cardiac_sampling_fraction": trainer.cardiac_sampling_fraction, "semantics": "deterministic training-equivalent cardiac-priority/global sampling with replacement"}, "selections": selections, "audits": audits, "frozen_modules_have_gradients": leakage, "cross_checkpoint_contract": "With identical manifest/config/seed, serialized frame IDs and sampled pixel policy are identical across checkpoints."}
+            audit = _gradient_summary(_deterministic_components(trainer, data, temporal, seed=args.seed), trainer, modules)
+            audits.append(audit | {"data_gradient_distribution_cardiac_film_head": _data_norm_distribution(trainer, data, temporal, seed=args.seed, modules=modules)})
+    leakage = any(value.get("frozen_modules", {}).get("raw_l2_norm", value.get("frozen_modules", {}).get("combined_l2_norm", 0.)) > 0. for audit in audits for value in audit.values() if isinstance(value, dict))
+    payload = {"status": "read_only_no_optimizer_step", "stage": "stage3a", "mode": args.mode, "seed": args.seed, "pixel_selection_policy": {"pixel_samples": args.pixel_samples, "cardiac_sampling_fraction": trainer.cardiac_sampling_fraction, "semantics": "deterministic training-equivalent cardiac-priority/global sampling with replacement"}, "psf_seed_policy": {"seed_identity": "global seed + view + slice_id + dynamic_frame_id", "purpose": "psf", "rng_isolation": "torch.random.fork_rng CPU/CUDA", "cross_checkpoint_pairing": "experiment label is excluded"}, "selections": selections, "audits": audits, "training_step_aggregate": _step_summary(audits) if args.mode == "training-step-matched" else None, "frozen_modules_have_gradients": leakage, "cross_checkpoint_contract": "With identical manifest/config/seed, serialized frame IDs, pixels, and PSF realization are identical across checkpoints."}
     args.output_json.parent.mkdir(parents=True, exist_ok=True); args.output_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"mode": args.mode, "audit_units": len(audits), "output": str(args.output_json)}, indent=2))
 

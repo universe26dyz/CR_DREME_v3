@@ -2,9 +2,40 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import contextmanager
+import hashlib
+import random
 from typing import Iterable
 
 import torch
+
+
+def stable_diagnostic_seed(global_seed: int, view: str, slice_id: str, dynamic_frame_id: int, *, purpose: str) -> int:
+    """Stable, label-independent per-frame diagnostic RNG seed."""
+    payload = f"change5c|{global_seed}|{view}|{slice_id}|{dynamic_frame_id}|{purpose}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**63 - 1)
+
+
+def paired_reconstruction_seeds(global_seed: int, experiment_label: str, view: str, slice_id: str, dynamic_frame_id: int) -> tuple[int, int]:
+    """Return the identical PSF seed for resp-only/joint; label is intentionally ignored."""
+    del experiment_label
+    seed = stable_diagnostic_seed(global_seed, view, slice_id, dynamic_frame_id, purpose="psf")
+    return seed, seed
+
+
+@contextmanager
+def diagnostic_rng(seed: int, device: torch.device):
+    """Isolate CPU/CUDA RNG around one diagnostic forward without upstream changes."""
+    python_state = random.getstate()
+    cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=cuda_devices, enabled=True):
+        torch.manual_seed(seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed(seed)
+        try:
+            yield
+        finally:
+            random.setstate(python_state)
 
 
 def choose_representative_indices(length: int, count: int) -> list[int]:
@@ -74,6 +105,18 @@ def aggregate_ablation(records: Iterable[dict], *, tolerance: float = 1e-8) -> d
             "relative_mse_improvement_percent": _quantiles(gains), "mean_abs_joint_minus_resp": _quantiles(effects)}
 
 
+def aggregate_ablation_by_view(records: Iterable[dict], *, tolerance: float = 1e-8) -> dict[str, dict]:
+    grouped: defaultdict[str, list[dict]] = defaultdict(list)
+    for record in records:
+        grouped[record["view"]].append(record)
+    result = {}
+    for view, rows in sorted(grouped.items()):
+        summary = aggregate_ablation(rows, tolerance=tolerance)
+        summary.update({name: _quantiles([float(row[name]) for row in rows if row.get(name) is not None]) for name in ("resp_only_mse", "resp_plus_card_mse", "resp_only_mae", "resp_plus_card_mae")})
+        result[view] = summary
+    return result
+
+
 def _key(record: dict) -> str:
     return f"{record['view']}/{record['slice_id']}"
 
@@ -115,3 +158,39 @@ def select_visualization_locations(baseline_semantic: Iterable[dict], candidate_
         for label, row in (("largest_c5b_reconstruction_gain", max(rows, key=lambda item: float(item["relative_mse_improvement_percent"]))), ("largest_c5b_reconstruction_loss", min(rows, key=lambda item: float(item["relative_mse_improvement_percent"]))), ("largest_cardiac_effect", max(rows, key=lambda item: float(item.get("mean_abs_joint_minus_resp") or 0.))), ("near_zero_cardiac_effect", min(rows, key=lambda item: float(item.get("mean_abs_joint_minus_resp") or 0.)))):
             reasons[(row["view"], row["slice_id"])].append(label)
     return [{"view": view, "slice_id": slice_id, "reasons": value} for (view, slice_id), value in sorted(reasons.items())]
+
+
+def select_visualization_locations_paired(baseline_semantic: Iterable[dict], candidate_semantic: Iterable[dict], baseline_ablation: Iterable[dict], candidate_ablation: Iterable[dict], *, fixed: Iterable[tuple[str, str]] = ()) -> dict:
+    """Select valid fixed locations plus paired CTRL→C5B semantic/reconstruction extremes."""
+    baseline_semantic = {_key(row): row for row in baseline_semantic if row.get("cardiac_pca_waveform_r2") is not None}
+    candidate_semantic = {_key(row): row for row in candidate_semantic if row.get("cardiac_pca_waveform_r2") is not None}
+    baseline_ablation = {_key(row): row for row in baseline_ablation if row.get("relative_mse_improvement_percent") is not None}
+    candidate_ablation = {_key(row): row for row in candidate_ablation if row.get("relative_mse_improvement_percent") is not None}
+    valid = set(baseline_semantic) & set(candidate_semantic) & set(baseline_ablation) & set(candidate_ablation)
+    reasons: defaultdict[tuple[str, str], list[str]] = defaultdict(list); omitted = []
+    for view, slice_id in fixed:
+        key = f"{view}/{slice_id}"
+        if key in valid: reasons[(view, slice_id)].append("fixed_representative")
+        else: omitted.append({"view": view, "slice_id": slice_id, "reason": "fixed_location_not_valid_in_all_inputs"})
+    if valid:
+        pca_delta = lambda key: float(candidate_semantic[key]["cardiac_pca_waveform_r2"]) - float(baseline_semantic[key]["cardiac_pca_waveform_r2"])
+        reconstruction_delta = lambda key: float(candidate_ablation[key]["relative_mse_improvement_percent"]) - float(baseline_ablation[key]["relative_mse_improvement_percent"])
+        effect = lambda key: float(candidate_ablation[key].get("mean_abs_joint_minus_resp") or 0.)
+        for label, key in (("largest_c5b_pca_r2_improvement_vs_ctrl", max(valid, key=pca_delta)), ("largest_c5b_pca_r2_deterioration_vs_ctrl", min(valid, key=pca_delta)), ("largest_c5b_reconstruction_gain_improvement_vs_ctrl", max(valid, key=reconstruction_delta)), ("largest_c5b_reconstruction_gain_deterioration_vs_ctrl", min(valid, key=reconstruction_delta)), ("largest_c5b_cardiac_effect", max(valid, key=effect)), ("near_zero_c5b_cardiac_effect", min(valid, key=effect))):
+            view, slice_id = key.split("/", 1); reasons[(view, slice_id)].append(label)
+    return {"locations": [{"view": view, "slice_id": slice_id, "reasons": labels} for (view, slice_id), labels in sorted(reasons.items())], "omitted_fixed": omitted, "paired_valid_location_keys": sorted(valid)}
+
+
+def provenance_matches(expected: dict, actual: dict | None) -> bool:
+    """A reusable output needs an explicit successful completion and exact provenance."""
+    return bool(actual and actual.get("completion") is True and all(actual.get(key) == value for key, value in expected.items()))
+
+
+def world_to_grid_index(center_world_mm: torch.Tensor, lower_world_mm: torch.Tensor, upper_world_mm: torch.Tensor, shape: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Nearest bounded voxel index for a patient-world point on a regular world grid."""
+    fraction = (center_world_mm - lower_world_mm) / (upper_world_mm - lower_world_mm)
+    return tuple(int(torch.clamp(torch.round(value * (count - 1)), 0, count - 1)) for value, count in zip(fraction, shape))
+
+
+def quiver_subsample_indices(length: int, maximum: int) -> list[int]:
+    return choose_representative_indices(length, maximum)

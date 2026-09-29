@@ -16,6 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src")); sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend
+from cardioresp4d.diagnostics.change5c import diagnostic_rng, stable_diagnostic_seed
 from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField, SequentialPullbackMotion
 from cardioresp4d.training.build_model import build_source_first_model
 from cardioresp4d.training.runtime_state import is_hard_invalid_reason
@@ -43,8 +44,9 @@ def _slice_prediction(model, observation, stage: str, *, seed: int, chunk: int) 
     height, width = observation.image.shape[-2:]; linear = torch.arange(height * width, device=observation.image.device)
     pixels = torch.stack((linear.remainder(width), torch.div(linear, width, rounding_mode="floor")), -1).to(observation.image.dtype)
     outputs = []
-    torch.manual_seed(seed)
-    for start in range(0, len(pixels), chunk): outputs.append(model.predict(observation, pixels[start:start + chunk], stage)["predicted_intensity"])
+    psf_seed = stable_diagnostic_seed(seed, observation.view, observation.slice_id, observation.dynamic_frame_id, purpose="psf")
+    with diagnostic_rng(psf_seed, observation.image.device):
+        for start in range(0, len(pixels), chunk): outputs.append(model.predict(observation, pixels[start:start + chunk], stage)["predicted_intensity"])
     return torch.cat(outputs).reshape(height, width)
 
 
@@ -80,20 +82,20 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True); rows = []
     with torch.no_grad():
         for index, observation in enumerate(chosen):
-            acquired = observation.image[0].detach().cpu(); resp = _slice_prediction(model, observation, "stage2c", seed=args.seed + index, chunk=args.chunk_size); joint = _slice_prediction(model, observation, stage, seed=args.seed + index, chunk=args.chunk_size)
-            np.savez_compressed(args.output_dir / f"reprojection_{index:03d}.npz", acquired=acquired.numpy(), resp_only=resp.cpu().numpy(), resp_plus_card=joint.cpu().numpy(), timestamp_s=observation.timestamp_s)
+            acquired = observation.image[0].detach().cpu(); resp = _slice_prediction(model, observation, "stage2c", seed=args.seed, chunk=args.chunk_size); joint = _slice_prediction(model, observation, stage, seed=args.seed, chunk=args.chunk_size); psf_seed = stable_diagnostic_seed(args.seed, observation.view, observation.slice_id, observation.dynamic_frame_id, purpose="psf")
+            np.savez_compressed(args.output_dir / f"reprojection_{index:03d}.npz", acquired=acquired.numpy(), resp_only=resp.cpu().numpy(), resp_plus_card=joint.cpu().numpy(), timestamp_s=observation.timestamp_s, dynamic_frame_id=observation.dynamic_frame_id, psf_seed=psf_seed)
             _save_png(args.output_dir / f"reprojection_{index:03d}.png", [acquired.numpy(), resp.cpu().numpy(), joint.cpu().numpy(), (acquired - resp.cpu()).abs().numpy(), (acquired - joint.cpu()).abs().numpy(), (joint - resp.cpu()).abs().numpy()], ["Acquired 2D", "Resp-only", "Resp+Card", "|Acquired - Resp|", "|Acquired - Resp+Card|", "|Resp+Card - Resp|"], intensity_window=None if args.intensity_vmin is None or args.intensity_vmax is None else (args.intensity_vmin, args.intensity_vmax), residual_vmax=args.residual_vmax, effect_vmax=args.effect_vmax)
-            rows.append({"frame": index, "timestamp_s": observation.timestamp_s, "resp_only_mse": float((acquired - resp.cpu()).square().mean()), "resp_plus_card_mse": float((acquired - joint.cpu()).square().mean())})
+            rows.append({"frame": index, "timestamp_s": observation.timestamp_s, "dynamic_frame_id": int(observation.dynamic_frame_id), "psf_seed": psf_seed, "resp_only_mse": float((acquired - resp.cpu()).square().mean()), "resp_plus_card_mse": float((acquired - joint.cpu()).square().mean())})
         grid, spacing = world_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, tuple(args.grid_shape)); canonical_reference, _ = chunked_canonical_query(model.canonical, None, grid, chunk_size=args.chunk_size); dynamic, resp_dynamic, dvf, jacobians = [], [], [], []
         for index, observation in enumerate(chosen):
             motion, resp_motion, scores = _motion_for(model, observation, stage); volume, reference = chunked_canonical_query(model.canonical, motion, grid, chunk_size=args.chunk_size); resp_volume, _ = chunked_canonical_query(model.canonical, resp_motion, grid, chunk_size=args.chunk_size); total = pullback_displacement(grid, reference)
             motion_data = motion(grid.reshape(1, -1, 3)) if motion is not None else {"cardiac_dvf_mm": torch.zeros_like(grid.reshape(1, -1, 3)), "respiratory_dvf_mm": torch.zeros_like(grid.reshape(1, -1, 3)), "reference_points_mm": grid.reshape(1, -1, 3)}
             determinant = jacobian_determinant(reference, spacing); dynamic.append(volume.cpu()); jacobians.append(determinant.cpu()); dvf.append(total.cpu())
-            resp_dynamic.append(resp_volume.cpu()); np.savez_compressed(args.output_dir / f"dvf_{index:03d}.npz", observation_world_mm=grid.cpu().numpy(), reference_world_mm=reference.cpu().numpy(), cardiac_dvf_mm=motion_data["cardiac_dvf_mm"].reshape(*args.grid_shape, 3).cpu().numpy(), respiratory_dvf_mm=motion_data["respiratory_dvf_mm"].reshape(*args.grid_shape, 3).cpu().numpy(), total_dvf_mm=total.cpu().numpy(), jacobian_observation_to_reference=determinant.cpu().numpy())
+            resp_dynamic.append(resp_volume.cpu()); np.savez_compressed(args.output_dir / f"dvf_{index:03d}.npz", observation_world_mm=grid.cpu().numpy(), reference_world_mm=reference.cpu().numpy(), cardiac_center_world_mm=((model.cardiac_lower_world_mm + model.cardiac_upper_world_mm) / 2).cpu().numpy(), cardiac_dvf_mm=motion_data["cardiac_dvf_mm"].reshape(*args.grid_shape, 3).cpu().numpy(), respiratory_dvf_mm=motion_data["respiratory_dvf_mm"].reshape(*args.grid_shape, 3).cpu().numpy(), total_dvf_mm=total.cpu().numpy(), jacobian_observation_to_reference=determinant.cpu().numpy())
         joint_dynamic = torch.stack(dynamic); resp_dynamic_tensor = torch.stack(resp_dynamic)
         np.savez_compressed(args.output_dir / "conditioned_dynamic_4d.npz", canonical_reference=canonical_reference.cpu().numpy(), resp_only_implied_4d=resp_dynamic_tensor.numpy(), conditioned_dynamic_4d=joint_dynamic.numpy(), cardiac_effect_4d=(joint_dynamic - resp_dynamic_tensor).numpy(), total_dvf_mm=torch.stack(dvf).numpy(), jacobian_observation_to_reference=torch.stack(jacobians).numpy(), world_grid_mm=grid.cpu().numpy(), spacing_mm=spacing.cpu().numpy())
     with (args.output_dir / "reprojection_metrics.csv").open("w", newline="", encoding="utf-8") as handle: writer = csv.DictWriter(handle, fieldnames=rows[0]); writer.writeheader(); writer.writerows(rows)
-    (args.output_dir / "README.txt").write_text("Read-only observation-conditioned implied 3D dynamics. Frames from different locations are not a shared physiological phase. DVFs and Jacobians are observation-to-reference pullback fields in mm; positive Jacobian values do not establish diffeomorphism. PCA sign/amplitude are arbitrary; training uses local corr² subspace agreement.\n", encoding="utf-8")
+    (args.output_dir / "README.txt").write_text("Read-only observation-conditioned implied 3D dynamics. Resp-only and resp+card predictions use the identical isolated PSF RNG realization derived from global seed + view + slice_id + dynamic_frame_id; experiment label is excluded. Frames from different locations are not a shared physiological phase. DVFs and Jacobians are observation-to-reference pullback fields in mm; positive Jacobian values do not establish diffeomorphism. PCA sign/amplitude are arbitrary; training uses local corr² subspace agreement.\n", encoding="utf-8")
     print(json.dumps({"status": "read_only_no_training", "location": f"{args.view}/{args.slice_id}", "frames": len(chosen), "output": str(args.output_dir)}, indent=2))
 
 
