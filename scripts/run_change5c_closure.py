@@ -50,6 +50,25 @@ def _mark_completed(path: Path, provenance: dict) -> None:
     completion.write_text(json.dumps({**provenance, "completion": True}, indent=2) + "\n", encoding="utf-8")
 
 
+def render_closure_report(per_checkpoint: dict, comparisons: dict, contract_by_label: dict, baseline: str) -> str:
+    """Render the gradient section from the loss-first audit JSON contract."""
+    del comparisons, contract_by_label, baseline
+    lines = []
+    for label, payload in per_checkpoint.items():
+        location_audit = payload["gradient_location_matched"]["audits"][0]
+        head_data = location_audit["data"]["cardiac_film_head"]["raw_l2_norm"]
+        head_semantic = location_audit["semantic_aux"]["cardiac_film_head"]["combined_l2_norm"]
+        mbc_data = location_audit["data"]["cardiac_mbc"]["raw_l2_norm"]
+        mbc_total = location_audit["total"]["cardiac_mbc"]["combined_l2_norm"]
+        concentration = location_audit.get("cardiac_target_concentration", {}).get("cardiac_mbc", {}).get("raw_l2_norm")
+        pca = location_audit.get("cardiac_pca_waveform", {}).get("cardiac_mbc", {}).get("raw_l2_norm")
+        ratio = location_audit["combined_ratios"]["cardiac_film_head"]["semantic_aux_to_data_norm_ratio"]
+        cosine = location_audit["cosine_similarity"]["cardiac_film_head"].get("data_vs_semantic_aux")
+        lines.append(f"- **{label} location-matched:** head data={head_data:.4g}, semantic={head_semantic:.4g}, ratio={ratio}, cos(data,semantic)={cosine}; MBC data={mbc_data:.4g}, total={mbc_total:.4g}, direct concentration/PCA raw={concentration}/{pca}.")
+        lines.append(f"- **{label} training-step aggregate:** `{payload['gradient_training_step_matched']['training_step_aggregate']}`")
+    return "\n".join(lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment", action="append", type=_experiment, required=True, metavar="LABEL=CONFIG,CHECKPOINT"); parser.add_argument("--frequency-bands", type=Path, required=True); parser.add_argument("--manifest", type=Path, required=True); parser.add_argument("--qc-table", type=Path, required=True); parser.add_argument("--canonical-domain", type=Path, required=True); parser.add_argument("--output-dir", type=Path, required=True); parser.add_argument("--device", default="cuda"); parser.add_argument("--seed", type=int, default=0); parser.add_argument("--reuse-valid", action="store_true")
@@ -126,10 +145,7 @@ def main() -> None:
         report_lines.append(f"|{label}|{pair('cardiac_pca_waveform_r2')}|{pair('cardiac_target_fraction')}|{pair('card_target_over_wrong')}|{pair('card_score_std')}|{boolean['same_peak_exact']['count']}/{boolean['same_peak_within_0.02_hz']['count']}|{fmt(ablation['relative_mse_improvement_percent']['mean'])}/{fmt(ablation['relative_mse_improvement_percent']['median'])}|{ablation['n_positive_gain']}/{ablation['n_negative_gain']}/{ablation['n_zero_gain']}|{fmt(ablation['mean_abs_joint_minus_resp']['mean'])}/{fmt(ablation['mean_abs_joint_minus_resp']['median'])}|")
         report_lines.extend([f"- {label} per view: `{payload['cardiac_ablation']['per_view']}`"])
     report_lines.extend(["", "## Paired reconstruction changes", "", f"Baseline: `{baseline}`. `{json.dumps(comparisons)}`", "", "## Gradient competition", ""])
-    for label, payload in per_checkpoint.items():
-        location_audit = payload["gradient_location_matched"]["audits"][0]; head = location_audit["cardiac_film_head"]; mbc = location_audit["cardiac_mbc"]; cosine = location_audit["cosine_similarity"]["cardiac_film_head"]
-        report_lines.append(f"- **{label} location-matched:** head data={head['data']['raw_l2_norm']:.4g}, semantic={head['semantic_aux']['combined_l2_norm']:.4g}, ratio={location_audit['combined_ratios']['cardiac_film_head']['semantic_aux_to_data_norm_ratio']}, cos(data,semantic)={cosine.get('data_vs_semantic_aux')}; MBC data={mbc['data']['raw_l2_norm']:.4g}, total={mbc['total']['combined_l2_norm']:.4g}, direct concentration/PCA raw={mbc.get('cardiac_target_concentration',{}).get('raw_l2_norm')}/{mbc.get('cardiac_pca_waveform',{}).get('raw_l2_norm')}.")
-        report_lines.append(f"- **{label} training-step aggregate:** `{payload['gradient_training_step_matched']['training_step_aggregate']}`")
+    report_lines.extend(render_closure_report(per_checkpoint, comparisons, contract_by_label, baseline).splitlines())
     report_lines.extend(["", "## Motion, Jacobian, and visual evidence", "", "Selected-frame cardiac DVF RMS/p95/max and Jacobian min/p01/median/p99/max/fraction<=0 are annotated in each `*_dvf_jacobian.png`.", "- `visual_comparison/*_comparison.png` and optional GIF: fixed-scale reprojection/cardiac-effect cine/contact sheets.", "- `visual_comparison/*_scores_pca_spectrum.png`: true-timestamp score/PCA/NUDFT/band evidence.", "- `visual_comparison/*_dvf_jacobian.png`: cardiac DVF magnitude + quiver and cardiac-centered Jacobian plane.", "- `visual_comparison/*_cardiac_effect_3d.png`: cardiac-centered orthogonal resp-only/joint/effect planes.", "", "Observation-conditioned implied 3D dynamics are not globally synchronized physiological cine."])
     (args.output_dir / "change5c_closure_report.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2))

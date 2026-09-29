@@ -69,7 +69,7 @@ def main() -> None:
         frequency = output["frequencies"].numpy(); axes[row, 2].plot(frequency, output["card_spectrum"].numpy(), label="cardiac NUDFT"); axes[row, 2].plot(frequency, output["resp_spectrum"].numpy(), label="respiratory NUDFT")
         for low, high in output["card_bands"]: axes[row, 2].axvspan(low, high, color="tab:red", alpha=.12)
         for low, high in output["resp_bands"]: axes[row, 2].axvspan(low, high, color="tab:blue", alpha=.10)
-        record = output["record"]; axes[row, 2].set_title(f"NUDFT bands; PCA R²={record['cardiac_pca_waveform_r2']}; target frac={record['cardiac_target_fraction']:.3g}; target/wrong={record['card_target_over_wrong']:.3g}; std={record['card_score_std']:.3g}"); axes[row, 2].legend(fontsize=7)
+        record = output["record"]; axes[row, 2].axvline(record["card_peak_hz"], color="tab:red", linestyle="--", label=f"card dominant peak {record['card_peak_hz']:.3g} Hz"); axes[row, 2].axvline(record["resp_peak_hz"], color="tab:blue", linestyle=":", label=f"resp dominant peak {record['resp_peak_hz']:.3g} Hz"); axes[row, 2].set_title(f"NUDFT bands; PCA R²={record['cardiac_pca_waveform_r2']}; target frac={record['cardiac_target_fraction']:.3g}; target/wrong={record['card_target_over_wrong']:.3g}; std={record['card_score_std']:.3g}"); axes[row, 2].legend(fontsize=7)
         axes[row, 0].set_ylabel(output["label"])
     figure.suptitle(f"{args.view}/{args.slice_id}: true timestamps; PCA sign/scale are arbitrary")
     figure.tight_layout(); args.output_png.parent.mkdir(parents=True, exist_ok=True); figure.savefig(args.output_png, dpi=150); plt.close(figure)

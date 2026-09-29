@@ -25,6 +25,18 @@ class CheckpointContractHotfixTest(unittest.TestCase):
         self.assertFalse(agreement["all_relevant_keys_agree"])
         self.assertFalse(agreement["by_key"]["cardiac_pca_waveform"]["agree"])
 
+    def test_omitted_yaml_pca_weight_defaults_to_checkpoint_zero(self) -> None:
+        checkpoint_defaults = {"cardiac_target_concentration": 0., "cardiac_pca_waveform": 0., "respiratory_leakage_in_card": 1e-4, "cardiac_leakage_in_resp": 1e-4, "zero_mean_score": 1e-5, "smooth_card": 1e-5, "mbc_normalization": 1e-5}
+        self.assertTrue(relevant_weight_agreement(checkpoint_defaults, {})["all_relevant_keys_agree"])
+
+    def test_omitted_yaml_concentration_weight_defaults_to_checkpoint_zero(self) -> None:
+        checkpoint_defaults = {"cardiac_target_concentration": 0., "cardiac_pca_waveform": 0., "respiratory_leakage_in_card": 1e-4, "cardiac_leakage_in_resp": 1e-4, "zero_mean_score": 1e-5, "smooth_card": 1e-5, "mbc_normalization": 1e-5}
+        self.assertTrue(relevant_weight_agreement(checkpoint_defaults, {})["all_relevant_keys_agree"])
+
+    def test_non_default_yaml_weight_still_disagrees(self) -> None:
+        agreement = relevant_weight_agreement({"cardiac_pca_waveform": 0.}, {"cardiac_pca_waveform": .001})
+        self.assertFalse(agreement["all_relevant_keys_agree"])
+
 
 if __name__ == "__main__":
     unittest.main()

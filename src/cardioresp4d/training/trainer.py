@@ -10,6 +10,14 @@ from .sampler import DynamicObservation, ViewLocationBalancedSampler
 from .stage_contract import progressive_stage_order, stage_contract
 
 
+DEFAULT_LOSS_WEIGHTS = {"image": 1e-4, "mbc_normalization": 1e-5, "smooth_resp": 1e-5, "smooth_card": 1e-5, "zero_mean_score": 1e-5, "cardiac_leakage_in_resp": 1e-4, "respiratory_leakage_in_card": 1e-4, "cardiac_target_concentration": 0., "cardiac_pca_waveform": 0.}
+
+
+def effective_loss_weights(loss_weights: dict[str, float] | None) -> dict[str, float]:
+    """The one authoritative loss-weight default/override merge used by trainer and audits."""
+    return {**DEFAULT_LOSS_WEIGHTS, **(loss_weights or {})}
+
+
 class UnifiedProgressiveTrainer:
     """Stage-aware optimizer, losses, sampling and true-timestamp score auxiliary."""
     def __init__(self, model: SourceFirstDynamicModel, sampler: ViewLocationBalancedSampler, *, pixel_samples: int = 256, learning_rate: float = 1e-3, optimizer_config: dict[str, dict[str, float]] | None = None, loss_weights: dict[str, float] | None = None, frequency_prior=None, pca_waveform_prior=None, pca_waveform_ridge: float = 1e-4, pca_waveform_min_frames: int = 8, temporal_every: int = 1, temporal_batch_size: int = 50, cardiac_sampling_fraction: float = .8) -> None:
@@ -17,7 +25,7 @@ class UnifiedProgressiveTrainer:
             raise ValueError("pixel_samples, learning_rate, and cardiac_sampling_fraction are invalid")
         self.model, self.sampler, self.pixel_samples, self.learning_rate = model, sampler, pixel_samples, learning_rate
         self.optimizer_config = optimizer_config or {}
-        self.loss_weights = {"image": 1e-4, "mbc_normalization": 1e-5, "smooth_resp": 1e-5, "smooth_card": 1e-5, "zero_mean_score": 1e-5, "cardiac_leakage_in_resp": 1e-4, "respiratory_leakage_in_card": 1e-4, "cardiac_target_concentration": 0., "cardiac_pca_waveform": 0., **(loss_weights or {})}
+        self.loss_weights = effective_loss_weights(loss_weights)
         self.frequency_prior = frequency_prior
         self.pca_waveform_prior, self.pca_waveform_ridge, self.pca_waveform_min_frames = pca_waveform_prior, pca_waveform_ridge, pca_waveform_min_frames
         self.temporal_every, self.temporal_batch_size, self.cardiac_sampling_fraction = temporal_every, temporal_batch_size, cardiac_sampling_fraction

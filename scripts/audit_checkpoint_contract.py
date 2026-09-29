@@ -5,10 +5,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import torch
 import yaml
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from cardioresp4d.training.trainer import effective_loss_weights
 
 
 GROUPS = {
@@ -30,7 +34,8 @@ def checkpoint_effective_loss_weights(checkpoint: dict) -> dict[str, float]:
 
 
 def relevant_weight_agreement(checkpoint_weights: dict[str, float], supplied_weights: dict[str, float]) -> dict:
-    by_key = {key: {"checkpoint_effective": checkpoint_weights.get(key), "supplied_config": supplied_weights.get(key), "agree": key in checkpoint_weights and key in supplied_weights and float(checkpoint_weights[key]) == float(supplied_weights[key])} for key in RELEVANT_LOSS_KEYS}
+    supplied_effective = effective_loss_weights(supplied_weights)
+    by_key = {key: {"checkpoint_effective": checkpoint_weights.get(key), "supplied_config_effective": supplied_effective.get(key), "agree": key in checkpoint_weights and float(checkpoint_weights[key]) == float(supplied_effective[key])} for key in RELEVANT_LOSS_KEYS}
     return {"by_key": by_key, "all_relevant_keys_agree": all(value["agree"] for value in by_key.values())}
 
 
