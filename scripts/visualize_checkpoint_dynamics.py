@@ -50,6 +50,11 @@ def _slice_prediction(model, observation, stage: str, *, seed: int, slice_chunk_
     return torch.cat(outputs).reshape(height, width)
 
 
+def _reprojection_export_tensors(acquired: torch.Tensor, resp: torch.Tensor, joint: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    resp_cpu, joint_cpu = resp.detach().cpu(), joint.detach().cpu()
+    return resp_cpu, joint_cpu, (acquired - resp_cpu).abs(), (acquired - joint_cpu).abs(), (joint_cpu - resp_cpu).abs()
+
+
 def _save_png(path: Path, images: list[np.ndarray], titles: list[str], *, intensity_window: tuple[float, float] | None = None, residual_vmax: float | None = None, effect_vmax: float | None = None) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -84,9 +89,10 @@ def main() -> None:
     with torch.no_grad():
         for index, observation in enumerate(chosen):
             acquired = observation.image[0].detach().cpu(); resp = _slice_prediction(model, observation, "stage2c", seed=args.seed, slice_chunk_size=args.slice_chunk_size); joint = _slice_prediction(model, observation, stage, seed=args.seed, slice_chunk_size=args.slice_chunk_size); psf_seed = stable_diagnostic_seed(args.seed, observation.view, observation.slice_id, observation.dynamic_frame_id, purpose="psf")
-            np.savez_compressed(args.output_dir / f"reprojection_{index:03d}.npz", acquired=acquired.numpy(), resp_only=resp.cpu().numpy(), resp_plus_card=joint.cpu().numpy(), timestamp_s=observation.timestamp_s, dynamic_frame_id=observation.dynamic_frame_id, psf_seed=psf_seed)
-            _save_png(args.output_dir / f"reprojection_{index:03d}.png", [acquired.numpy(), resp.cpu().numpy(), joint.cpu().numpy(), (acquired - resp.cpu()).abs().numpy(), (acquired - joint.cpu()).abs().numpy(), (joint - resp.cpu()).abs().numpy()], ["Acquired 2D", "Resp-only", "Resp+Card", "|Acquired - Resp|", "|Acquired - Resp+Card|", "|Resp+Card - Resp|"], intensity_window=None if args.intensity_vmin is None or args.intensity_vmax is None else (args.intensity_vmin, args.intensity_vmax), residual_vmax=args.residual_vmax, effect_vmax=args.effect_vmax)
-            rows.append({"frame": index, "timestamp_s": observation.timestamp_s, "dynamic_frame_id": int(observation.dynamic_frame_id), "psf_seed": psf_seed, "resp_only_mse": float((acquired - resp.cpu()).square().mean()), "resp_plus_card_mse": float((acquired - joint.cpu()).square().mean())})
+            resp_cpu, joint_cpu, resp_residual, joint_residual, cardiac_effect = _reprojection_export_tensors(acquired, resp, joint)
+            np.savez_compressed(args.output_dir / f"reprojection_{index:03d}.npz", acquired=acquired.numpy(), resp_only=resp_cpu.numpy(), resp_plus_card=joint_cpu.numpy(), timestamp_s=observation.timestamp_s, dynamic_frame_id=observation.dynamic_frame_id, psf_seed=psf_seed)
+            _save_png(args.output_dir / f"reprojection_{index:03d}.png", [acquired.numpy(), resp_cpu.numpy(), joint_cpu.numpy(), resp_residual.numpy(), joint_residual.numpy(), cardiac_effect.numpy()], ["Acquired 2D", "Resp-only", "Resp+Card", "|Acquired - Resp|", "|Acquired - Resp+Card|", "|Resp+Card - Resp|"], intensity_window=None if args.intensity_vmin is None or args.intensity_vmax is None else (args.intensity_vmin, args.intensity_vmax), residual_vmax=args.residual_vmax, effect_vmax=args.effect_vmax)
+            rows.append({"frame": index, "timestamp_s": observation.timestamp_s, "dynamic_frame_id": int(observation.dynamic_frame_id), "psf_seed": psf_seed, "resp_only_mse": float(resp_residual.square().mean()), "resp_plus_card_mse": float(joint_residual.square().mean())})
         grid, spacing = world_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, tuple(args.grid_shape)); canonical_reference, _ = chunked_canonical_query(model.canonical, None, grid, chunk_size=args.volume_chunk_size); dynamic, resp_dynamic, dvf, jacobians = [], [], [], []
         for index, observation in enumerate(chosen):
             motion, resp_motion, scores = _motion_for(model, observation, stage); volume, reference = chunked_canonical_query(model.canonical, motion, grid, chunk_size=args.volume_chunk_size); resp_volume, _ = chunked_canonical_query(model.canonical, resp_motion, grid, chunk_size=args.volume_chunk_size); total = pullback_displacement(grid, reference)

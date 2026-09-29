@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +54,22 @@ class _VisualizationModel(_PredictModel):
 
 
 class Change5CVisualizationChunkingTest(unittest.TestCase):
+    def test_reprojection_export_tensors_normalize_predictions_before_residuals(self) -> None:
+        export_tensors = getattr(dynamics, "_reprojection_export_tensors", None)
+        self.assertIsNotNone(export_tensors)
+        if export_tensors is None:
+            return
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        acquired = torch.tensor([[1., 2.]])
+        resp, joint = torch.tensor([[.5, 2.5]], device=device), torch.tensor([[1.5, 1.5]], device=device)
+        resp_cpu, joint_cpu, resp_residual, joint_residual, cardiac_effect = export_tensors(acquired, resp, joint)
+        for tensor in (resp_cpu, joint_cpu, resp_residual, joint_residual, cardiac_effect):
+            self.assertEqual("cpu", tensor.device.type)
+            self.assertIsInstance(tensor.numpy(), np.ndarray)
+        self.assertTrue(torch.equal(resp_residual, torch.tensor([[.5, .5]])))
+        self.assertTrue(torch.equal(joint_residual, torch.tensor([[.5, .5]])))
+        self.assertTrue(torch.equal(cardiac_effect, torch.tensor([[1., 1.]])))
+
     def test_slice_prediction_bounds_chunks_and_preserves_pixel_order(self) -> None:
         observation, model = _Observation(), _PredictModel()
         output = dynamics._slice_prediction(model, observation, "stage2c", seed=7, slice_chunk_size=3)
