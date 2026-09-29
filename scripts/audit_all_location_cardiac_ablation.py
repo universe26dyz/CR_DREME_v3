@@ -18,7 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src")); sys.path.insert(0, str(PROJECT_RO
 from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend
 from cardioresp4d.diagnostics.change5c import aggregate_ablation, aggregate_ablation_by_view, choose_representative_indices, diagnostic_rng, paired_reconstruction_seeds
 from cardioresp4d.training.build_model import build_source_first_model
-from cardioresp4d.training.runtime_state import is_hard_invalid_reason
+from cardioresp4d.training.runtime_state import checkpoint_compatible_dynamic_frame_count, is_hard_invalid_reason
 from cardioresp4d.training.source_first_config import validate_source_first_config
 from train_source_first import observations_from_manifest
 
@@ -61,7 +61,8 @@ def main() -> None:
     domain = json.loads(args.canonical_domain.read_text(encoding="utf-8")); observations, _, _ = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=config["training"]["normalization"]["mode"])
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False); stage = str(checkpoint.get("training_state", {}).get("current_stage", "stage3a"))
     if stage != "stage3a": parser.error(f"Change5C requires Stage3a checkpoint, got {stage}")
-    model = build_source_first_model(config, domain, n_dynamic_frames=len(observations), device=device, canonical_encoding_backend=detect_checkpoint_encoding_backend(checkpoint["model"])).to(device); model.load_state_dict(checkpoint["model"]); model.eval(); model.canonical.inr.train()
+    n_dynamic_frames = checkpoint_compatible_dynamic_frame_count(checkpoint, observations)
+    model = build_source_first_model(config, domain, n_dynamic_frames=n_dynamic_frames, device=device, canonical_encoding_backend=detect_checkpoint_encoding_backend(checkpoint["model"])).to(device); model.load_state_dict(checkpoint["model"]); model.eval(); model.canonical.inr.train()
     grouped: dict[tuple[str, str], list] = defaultdict(list)
     for observation in observations:
         grouped[(observation.view, observation.slice_id)].append(observation)

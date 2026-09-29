@@ -23,7 +23,7 @@ from cardioresp4d.frequency.pca_waveform_prior import PCAWaveformPrior
 from cardioresp4d.geometry.world_geometry import DicomPlane
 from cardioresp4d.training.sampler import DynamicObservation, ViewLocationBalancedSampler
 from cardioresp4d.training.build_model import build_source_first_model, effective_model_config
-from cardioresp4d.training.runtime_state import capture_rng_state, is_hard_invalid_reason, restore_rng_state, set_reproducibility, validate_dynamic_frame_rows
+from cardioresp4d.training.runtime_state import capture_rng_state, checkpoint_compatible_dynamic_frame_count, is_hard_invalid_reason, restore_rng_state, set_reproducibility, validate_dynamic_frame_rows
 from cardioresp4d.training.source_first_config import validate_source_dependencies, validate_source_first_config
 from cardioresp4d.training.trainer import UnifiedProgressiveTrainer
 
@@ -72,7 +72,7 @@ def main() -> None:
             raise ValueError("--resume requires source-first checkpoint_schema=1")
         checkpoint_backend = detect_checkpoint_encoding_backend(checkpoint["model"])
     observations, normalization_parameters, normalization_groups = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=source_config["training"]["normalization"]["mode"])
-    n_dynamic_frames = sum(1 for observation in observations if observation.qc_valid)
+    n_dynamic_frames = checkpoint_compatible_dynamic_frame_count(checkpoint, observations)
     model = build_source_first_model(source_config, domain, n_dynamic_frames=n_dynamic_frames, device=device, canonical_encoding_backend=checkpoint_backend).to(device)
     bands_path = (args.frequency_bands or (args.source_config.parent / source_config["training"]["temporal_auxiliary"]["frequency_bands_json"])).resolve()
     prior = load_training_frequency_prior(bands_path, allow_template_fallback=bool(source_config["training"].get("frequency_prior",{}).get("allow_template_fallback",False)))

@@ -18,7 +18,7 @@ from cardioresp4d.adapters.source_lock import verify_vendored_source_lock
 from cardioresp4d.frequency.training_prior import load_training_frequency_prior
 from cardioresp4d.losses.frequency_loss import resolved_band_frequencies
 from cardioresp4d.training.build_model import build_source_first_model, effective_model_config
-from cardioresp4d.training.runtime_state import is_hard_invalid_reason, set_reproducibility
+from cardioresp4d.training.runtime_state import is_hard_invalid_reason, set_reproducibility, training_dynamic_frame_count
 from cardioresp4d.training.source_first_config import validate_source_dependencies, validate_source_first_config
 from train_source_first import observations_from_manifest
 
@@ -69,7 +69,7 @@ def main() -> None:
     coverage_report = {"plane_center_qc": coverage, "canonical_hole_interpretation": "plane-center coverage zeros are geometry-QC observations, never canonical-volume holes", "psf_aware_coverage_required": bool(config.get("coverage", {}).get("psf_aware", False)), "view_count_required": bool(config.get("coverage", {}).get("view_count", False)), "observation_count_required": bool(config.get("coverage", {}).get("observation_count", False))}
     observations, normalization, normalization_groups = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=config["training"]["normalization"]["mode"])
     prior = load_training_frequency_prior(args.frequency_bands, allow_template_fallback=False)
-    model = build_source_first_model(config, domain, n_dynamic_frames=sum(item.qc_valid for item in observations), device=device).to(device).train()
+    model = build_source_first_model(config, domain, n_dynamic_frames=training_dynamic_frame_count(observations), device=device).to(device).train()
     valid = [item for item in observations if item.qc_valid]
     examples = {item.view: item for item in valid}
     missing = sorted({"SAX", "2CH", "4CH"} - set(examples))

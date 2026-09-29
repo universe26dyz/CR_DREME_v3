@@ -21,7 +21,7 @@ from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend
 from cardioresp4d.losses.frequency_loss import cardiac_target_band_concentration, nonuniform_dft_at_frequencies, resolved_band_frequencies
 from cardioresp4d.losses.motion_loss import cardiac_pca_waveform_subspace_loss
 from cardioresp4d.training.build_model import build_source_first_model
-from cardioresp4d.training.runtime_state import is_hard_invalid_reason
+from cardioresp4d.training.runtime_state import checkpoint_compatible_dynamic_frame_count, is_hard_invalid_reason
 from cardioresp4d.training.source_first_config import validate_source_first_config
 from cardioresp4d.training.stage_contract import stage_contract
 from cardioresp4d.diagnostics.checkpoint_metrics import summarize_records
@@ -155,7 +155,8 @@ def main() -> None:
     valid = [item for item in observations if item.qc_valid and not is_hard_invalid_reason(item.qc_reason)]
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     checkpoint_backend = detect_checkpoint_encoding_backend(checkpoint["model"])
-    model = build_source_first_model(config, domain, n_dynamic_frames=len(valid), device=device, canonical_encoding_backend=checkpoint_backend).to(device)
+    n_dynamic_frames = checkpoint_compatible_dynamic_frame_count(checkpoint, observations)
+    model = build_source_first_model(config, domain, n_dynamic_frames=n_dynamic_frames, device=device, canonical_encoding_backend=checkpoint_backend).to(device)
     model.load_state_dict(checkpoint["model"]); prepare_read_only_diagnostic_model(model)
     prior = load_training_frequency_prior(args.frequency_bands, allow_template_fallback=False)
     temporal_config = config["training"].get("temporal_auxiliary", {})

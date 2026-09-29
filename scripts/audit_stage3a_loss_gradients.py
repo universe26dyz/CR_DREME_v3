@@ -18,7 +18,7 @@ from cardioresp4d.diagnostics.change5c import choose_representative_indices, cos
 from cardioresp4d.frequency.pca_waveform_prior import PCAWaveformPrior
 from cardioresp4d.frequency.training_prior import load_training_frequency_prior
 from cardioresp4d.training.build_model import build_source_first_model
-from cardioresp4d.training.runtime_state import is_hard_invalid_reason
+from cardioresp4d.training.runtime_state import checkpoint_compatible_dynamic_frame_count, is_hard_invalid_reason
 from cardioresp4d.training.sampler import ViewLocationBalancedSampler
 from cardioresp4d.training.source_first_config import validate_source_first_config
 from cardioresp4d.training.trainer import UnifiedProgressiveTrainer
@@ -101,7 +101,8 @@ def legacy_main() -> None:
     observations, _, _ = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=config["training"]["normalization"]["mode"])
     valid = [item for item in observations if item.qc_valid and not is_hard_invalid_reason(item.qc_reason)]
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model = build_source_first_model(config, domain, n_dynamic_frames=len(valid), device=device, canonical_encoding_backend=detect_checkpoint_encoding_backend(checkpoint["model"])).to(device)
+    n_dynamic_frames = checkpoint_compatible_dynamic_frame_count(checkpoint, observations)
+    model = build_source_first_model(config, domain, n_dynamic_frames=n_dynamic_frames, device=device, canonical_encoding_backend=detect_checkpoint_encoding_backend(checkpoint["model"])).to(device)
     model.load_state_dict(checkpoint["model"])
     selected = [item for item in valid if (args.view is None or item.view == args.view) and (args.slice_id is None or item.slice_id == args.slice_id)]
     if len(selected) < 3: parser.error("selected location has fewer than three QC-valid non-hard-invalid frames")
@@ -193,7 +194,8 @@ def main() -> None:
     domain = json.loads(args.canonical_domain.read_text(encoding="utf-8")); observations, _, _ = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=config["training"]["normalization"]["mode"])
     valid = [item for item in observations if item.qc_valid and not is_hard_invalid_reason(item.qc_reason)]
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model = build_source_first_model(config, domain, n_dynamic_frames=len(valid), device=device, canonical_encoding_backend=detect_checkpoint_encoding_backend(checkpoint["model"])).to(device); model.load_state_dict(checkpoint["model"])
+    n_dynamic_frames = checkpoint_compatible_dynamic_frame_count(checkpoint, observations)
+    model = build_source_first_model(config, domain, n_dynamic_frames=n_dynamic_frames, device=device, canonical_encoding_backend=detect_checkpoint_encoding_backend(checkpoint["model"])).to(device); model.load_state_dict(checkpoint["model"])
     auxiliary = config["training"].get("temporal_auxiliary", {})
     trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(valid, seed=args.seed), pixel_samples=args.pixel_samples, frequency_prior=load_training_frequency_prior(args.frequency_bands, allow_template_fallback=False), pca_waveform_prior=PCAWaveformPrior.load(args.frequency_bands, strict=False), pca_waveform_ridge=float(auxiliary.get("pca_waveform_ridge", 1e-4)), pca_waveform_min_frames=int(auxiliary.get("pca_waveform_min_frames", 8)), temporal_every=int(auxiliary.get("every_steps", 1)), temporal_batch_size=int(auxiliary.get("max_frames", 50)), cardiac_sampling_fraction=float(config["training"].get("cardiac_sampling_fraction", .8)), loss_weights=config["training"]["loss_weights"])
     trainer._configure_stage("stage3a")

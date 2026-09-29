@@ -3,12 +3,41 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 import torch
 
 HARD_INVALID_REASONS = frozenset({"slice_local_scale_absolute", "manual_exclusion"})
+
+
+def training_dynamic_frame_count(observations: Iterable[object]) -> int:
+    """Exact dynamic-frame capacity contract used by source-first training."""
+    return sum(1 for observation in observations if observation.qc_valid)
+
+
+def validate_checkpoint_dynamic_frame_capacity(checkpoint: Mapping[str, Any], current_qc_valid_count: int) -> int | None:
+    """Reject manifest/QC versus serialized uncertainty-capacity mismatches before load."""
+    state = checkpoint.get("model", {})
+    log_var, embedding = state.get("uncertainty.log_var_frame"), state.get("uncertainty.frame_embedding.weight")
+    if log_var is None and embedding is None:
+        return None
+    if log_var is None or embedding is None:
+        raise ValueError("checkpoint uncertainty capacity is incomplete: expected log_var_frame and frame_embedding.weight")
+    log_capacity, embedding_capacity = int(log_var.shape[0]), int(embedding.shape[0])
+    if log_capacity != embedding_capacity:
+        raise ValueError(f"checkpoint uncertainty capacity disagrees: log_var_frame = {log_capacity}, frame_embedding.weight = {embedding_capacity}")
+    if log_capacity != current_qc_valid_count:
+        raise ValueError(f"checkpoint dynamic-frame capacity = {log_capacity}; current QC-valid dynamic-frame count = {current_qc_valid_count}")
+    return log_capacity
+
+
+def checkpoint_compatible_dynamic_frame_count(checkpoint: Mapping[str, Any] | None, observations: Iterable[object]) -> int:
+    """Derive and validate diagnostic model capacity before checkpoint loading."""
+    count = training_dynamic_frame_count(observations)
+    if checkpoint is not None:
+        validate_checkpoint_dynamic_frame_capacity(checkpoint, count)
+    return count
 
 
 def qc_reason_tokens(reason: object) -> frozenset[str]:

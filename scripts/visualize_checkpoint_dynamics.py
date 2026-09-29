@@ -19,7 +19,7 @@ from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend
 from cardioresp4d.diagnostics.change5c import diagnostic_rng, stable_diagnostic_seed
 from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField, SequentialPullbackMotion
 from cardioresp4d.training.build_model import build_source_first_model
-from cardioresp4d.training.runtime_state import is_hard_invalid_reason
+from cardioresp4d.training.runtime_state import checkpoint_compatible_dynamic_frame_count, is_hard_invalid_reason
 from cardioresp4d.training.source_first_config import validate_source_first_config
 from cardioresp4d.training.stage_contract import stage_contract
 from cardioresp4d.visualization.dynamics import chunked_canonical_query, jacobian_determinant, pullback_displacement, world_grid
@@ -78,7 +78,8 @@ def main() -> None:
     chosen = [valid[index] for index in torch.linspace(0, len(valid) - 1, min(args.frames, len(valid))).round().long().tolist()]
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False); stage = str(checkpoint.get("training_state", {}).get("current_stage", "stage3a"))
     if stage not in ("stage2a", "stage2b", "stage2c", "stage3a", "stage3b", "stage3c"): parser.error(f"unsupported checkpoint stage {stage}")
-    model = build_source_first_model(config, domain, n_dynamic_frames=len(observations), device=device, canonical_encoding_backend=detect_checkpoint_encoding_backend(checkpoint["model"])).to(device); model.load_state_dict(checkpoint["model"]); model.eval(); model.canonical.inr.train()
+    n_dynamic_frames = checkpoint_compatible_dynamic_frame_count(checkpoint, observations)
+    model = build_source_first_model(config, domain, n_dynamic_frames=n_dynamic_frames, device=device, canonical_encoding_backend=detect_checkpoint_encoding_backend(checkpoint["model"])).to(device); model.load_state_dict(checkpoint["model"]); model.eval(); model.canonical.inr.train()
     args.output_dir.mkdir(parents=True, exist_ok=True); rows = []
     with torch.no_grad():
         for index, observation in enumerate(chosen):

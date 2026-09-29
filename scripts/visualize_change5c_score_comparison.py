@@ -18,7 +18,7 @@ from cardioresp4d.frequency.pca_waveform_prior import PCAWaveformPrior
 from cardioresp4d.frequency.training_prior import load_training_frequency_prior
 from cardioresp4d.losses.frequency_loss import nonuniform_dft_at_frequencies
 from cardioresp4d.training.build_model import build_source_first_model
-from cardioresp4d.training.runtime_state import is_hard_invalid_reason
+from cardioresp4d.training.runtime_state import checkpoint_compatible_dynamic_frame_count, is_hard_invalid_reason
 from cardioresp4d.training.source_first_config import validate_source_first_config
 from cardioresp4d.training.stage_contract import stage_contract
 from diagnose_change4_checkpoint import _encode_location, frequency_semantics_record
@@ -51,7 +51,8 @@ def main() -> None:
         selected = sorted([item for item in observations if item.qc_valid and not is_hard_invalid_reason(item.qc_reason) and item.view == args.view and item.slice_id == args.slice_id], key=lambda item: item.timestamp_s)
         if len(selected) < 3: parser.error(f"{label}: selected location has fewer than three valid frames")
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False); stage = str(checkpoint["training_state"]["current_stage"]); contract = stage_contract(stage)
-        model = build_source_first_model(config, domain, n_dynamic_frames=len(observations), device=device, canonical_encoding_backend=detect_checkpoint_encoding_backend(checkpoint["model"])).to(device); model.load_state_dict(checkpoint["model"]); model.eval()
+        n_dynamic_frames = checkpoint_compatible_dynamic_frame_count(checkpoint, observations)
+        model = build_source_first_model(config, domain, n_dynamic_frames=n_dynamic_frames, device=device, canonical_encoding_backend=detect_checkpoint_encoding_backend(checkpoint["model"])).to(device); model.load_state_dict(checkpoint["model"]); model.eval()
         with torch.no_grad():
             resp, card, timestamps = _encode_location(model, selected, contract, device)
         local = prior.for_location(args.view, args.slice_id); record = frequency_semantics_record(args.view, args.slice_id, resp, card, timestamps, local, pca_waveform_prior=pca, pca_waveform_ridge=float(config["training"].get("temporal_auxiliary", {}).get("pca_waveform_ridge", 1e-4)), pca_waveform_min_frames=int(config["training"].get("temporal_auxiliary", {}).get("pca_waveform_min_frames", 8)))
