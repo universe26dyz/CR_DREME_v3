@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from cardioresp4d.training.model import SourceFirstDynamicModel  # noqa: E402
 from cardioresp4d.training.sampler import DynamicObservation, ViewLocationBalancedSampler  # noqa: E402
+from cardioresp4d.training.stage_contract import paperaligned_segment  # noqa: E402
 from cardioresp4d.training.trainer import UnifiedProgressiveTrainer  # noqa: E402
 
 
@@ -41,6 +42,20 @@ class Change4ResumeTest(unittest.TestCase):
         trainer = UnifiedProgressiveTrainer(_model(), ViewLocationBalancedSampler(_rows()), pixel_samples=1)
         with self.assertRaisesRegex(ValueError, "legacy v3 Stage3 checkpoint"):
             trainer.load_training_state_dict({"current_stage": "stage3", "global_step": 400, "stage_step": 100, "optimizer": {}, "sampler": {}, "metrics": []})
+
+    def test_segment_checkpoint_records_progress_and_resumes_without_replaying(self) -> None:
+        first = UnifiedProgressiveTrainer(_model(), ViewLocationBalancedSampler(_rows()), pixel_samples=1)
+        s1a = paperaligned_segment("s1a")
+        first.run_stage(s1a.stage, steps=1, segment=s1a)
+        state = first.training_state_dict()
+        self.assertEqual("s1a", state["current_segment"])
+        self.assertEqual(1, state["segment_step"])
+        resumed = UnifiedProgressiveTrainer(_model(), ViewLocationBalancedSampler(_rows()), pixel_samples=1)
+        resumed.load_training_state_dict(state)
+        s1b = paperaligned_segment("s1b")
+        report = resumed.run_stage(s1b.stage, steps=1, segment=s1b)
+        self.assertEqual(2, report["global_step"])
+        self.assertEqual("s1b", report["segment"])
 
 
 if __name__ == "__main__":

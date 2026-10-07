@@ -7,7 +7,7 @@ from cardioresp4d.losses.motion_loss import cardiac_pca_waveform_subspace_loss, 
 from cardioresp4d.losses.frequency_loss import cardiac_target_band_concentration, dreme_cardiac_leakage_in_resp, dreme_respiratory_leakage_in_card
 from .model import SourceFirstDynamicModel
 from .sampler import DynamicObservation, ViewLocationBalancedSampler
-from .stage_contract import progressive_stage_order, stage_contract
+from .stage_contract import StageSegment, progressive_stage_order, stage_contract
 
 
 DEFAULT_LOSS_WEIGHTS = {"image": 1e-4, "mbc_normalization": 1e-5, "smooth_resp": 1e-5, "smooth_card": 1e-5, "zero_mean_score": 1e-5, "cardiac_leakage_in_resp": 1e-4, "respiratory_leakage_in_card": 1e-4, "cardiac_target_concentration": 0., "cardiac_pca_waveform": 0.}
@@ -18,12 +18,24 @@ def effective_loss_weights(loss_weights: dict[str, float] | None) -> dict[str, f
     return {**DEFAULT_LOSS_WEIGHTS, **(loss_weights or {})}
 
 
+def accumulate_mean_loss_backward(losses: list[torch.Tensor], *, normalizer: int | None = None) -> torch.Tensor:
+    """Backpropagate a mean without retaining every observation graph."""
+    if not losses:
+        raise ValueError("at least one observation loss is required")
+    count = len(losses) if normalizer is None else normalizer
+    if count <= 0:
+        raise ValueError("loss normalizer must be positive")
+    for loss in losses:
+        (loss / count).backward()
+    return torch.stack([loss.detach() for loss in losses]).mean()
+
+
 class UnifiedProgressiveTrainer:
     """Stage-aware optimizer, losses, sampling and true-timestamp score auxiliary."""
-    def __init__(self, model: SourceFirstDynamicModel, sampler: ViewLocationBalancedSampler, *, pixel_samples: int = 256, learning_rate: float = 1e-3, optimizer_config: dict[str, dict[str, float]] | None = None, loss_weights: dict[str, float] | None = None, frequency_prior=None, pca_waveform_prior=None, pca_waveform_ridge: float = 1e-4, pca_waveform_min_frames: int = 8, temporal_every: int = 1, temporal_batch_size: int = 50, cardiac_sampling_fraction: float = .8) -> None:
-        if pixel_samples <= 0 or learning_rate <= 0 or not 0 <= cardiac_sampling_fraction <= 1:
-            raise ValueError("pixel_samples, learning_rate, and cardiac_sampling_fraction are invalid")
-        self.model, self.sampler, self.pixel_samples, self.learning_rate = model, sampler, pixel_samples, learning_rate
+    def __init__(self, model: SourceFirstDynamicModel, sampler: ViewLocationBalancedSampler, *, pixel_samples: int = 256, observations_per_update: int = 3, learning_rate: float = 1e-3, optimizer_config: dict[str, dict[str, float]] | None = None, loss_weights: dict[str, float] | None = None, frequency_prior=None, pca_waveform_prior=None, pca_waveform_ridge: float = 1e-4, pca_waveform_min_frames: int = 8, temporal_every: int = 1, temporal_batch_size: int = 50, cardiac_sampling_fraction: float = .8) -> None:
+        if pixel_samples <= 0 or observations_per_update < 3 or learning_rate <= 0 or not 0 <= cardiac_sampling_fraction <= 1:
+            raise ValueError("pixel_samples, observations_per_update, learning_rate, or cardiac_sampling_fraction are invalid")
+        self.model, self.sampler, self.pixel_samples, self.observations_per_update, self.learning_rate = model, sampler, pixel_samples, observations_per_update, learning_rate
         self.optimizer_config = optimizer_config or {}
         self.loss_weights = effective_loss_weights(loss_weights)
         self.frequency_prior = frequency_prior
@@ -32,17 +44,23 @@ class UnifiedProgressiveTrainer:
         self.optimizer: torch.optim.Optimizer | None = None
         self._optimizer_parameter_ids: set[int] = set()
         self.current_stage: str | None = None
+        self.current_segment: str | None = None
         self.global_step = 0
         self.stage_step = 0
+        self.segment_step = 0
+        self.stage_cumulative_steps: dict[str, int] = {}
         self.metrics: list[dict[str, object]] = []
 
-    def _configure_stage(self, stage: str) -> None:
+    def _configure_stage(self, stage: str, *, segment: StageSegment | None = None) -> None:
         contract = stage_contract(stage)
+        if segment is not None and segment.stage != stage:
+            raise ValueError(f"segment {segment.name} does not belong to {stage}")
+        train_canonical = contract.train_canonical if segment is None or segment.train_canonical is None else segment.train_canonical
         groups = {"canonical": self.model.canonical, "film": self.model.film_encoder, "respiratory_mbc": self.model.respiratory_mbc, "cardiac_mbc": self.model.cardiac_mbc, "uncertainty": self.model.uncertainty}
         enabled = contract.trainable_modules
         for name, module in groups.items():
             for parameter in module.parameters():
-                parameter.requires_grad_(name in enabled)
+                parameter.requires_grad_(name in enabled and (name != "canonical" or train_canonical))
         if contract.film_train_mode == "card_head_only":
             # Stage3a intentionally leaves the Stage2c shared FiLM/respiratory
             # representation immutable while its cardiac output head warms up.
@@ -54,7 +72,7 @@ class UnifiedProgressiveTrainer:
             for parameter in level.parameters():
                 parameter.requires_grad_(contract.train_respiratory_mbc and index < contract.active_respiratory_levels)
         self.model.respiratory_mbc.set_active_levels(contract.active_respiratory_levels)
-        stage_key = "stage2" if stage.startswith("stage2") else stage
+        stage_key = segment.optimizer_key if segment is not None else ("stage2" if stage.startswith("stage2") else stage)
         aliases = {"canonical": "canonical_lr", "film": "film_lr", "respiratory_mbc": "respiratory_mbc_lr", "cardiac_mbc": "cardiac_mbc_lr", "uncertainty": "uncertainty_lr"}
         configured = self.optimizer_config.get(stage_key, {})
         active_by_module: dict[str, list[torch.nn.Parameter]] = {}
@@ -77,48 +95,73 @@ class UnifiedProgressiveTrainer:
             name = group.get("name")
             if name in aliases:
                 group["lr"] = float(configured.get(aliases[name], self.learning_rate))
-        self.current_stage = stage
+        self.current_stage, self.current_segment = stage, segment.name if segment is not None else stage
         self.stage_step = 0
+        self.segment_step = 0
+        self.stage_cumulative_steps.setdefault(stage, 0)
 
-    def run_stage(self, stage: str, *, steps: int) -> dict[str, object]:
+    def _base_loss(self, components: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
+        contract = stage_contract(stage)
+        total = components["data"] + self.loss_weights["image"] * components["image"]
+        if contract.enable_motion:
+            total = total + self.loss_weights["mbc_normalization"] * components["mbc_normalization"] + self.loss_weights["smooth_resp"] * components["smooth_resp"]
+        if contract.enable_cardiac:
+            total = total + self.loss_weights["smooth_card"] * components["smooth_card"]
+        return total
+
+    def _temporal_loss(self, components: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
+        contract = stage_contract(stage)
+        if not contract.enable_motion:
+            return next(self.model.parameters()).sum() * 0.
+        total = self.loss_weights["zero_mean_score"] * components["zero_mean_score"] + self.loss_weights["cardiac_leakage_in_resp"] * components["cardiac_leakage_in_resp"]
+        if contract.enable_cardiac:
+            total = total + self.loss_weights["respiratory_leakage_in_card"] * components["respiratory_leakage_in_card"] + self.loss_weights["cardiac_target_concentration"] * components.get("cardiac_target_concentration", total * 0.)
+        if stage == "stage3a":
+            total = total + self.loss_weights["cardiac_pca_waveform"] * components.get("cardiac_pca_waveform", total * 0.)
+        return total
+
+    def run_stage(self, stage: str, *, steps: int, segment: StageSegment | None = None) -> dict[str, object]:
         try:
             contract = stage_contract(stage)
         except ValueError as exc:
             raise ValueError("invalid progressive stage or step count") from exc
         if steps <= 0:
             raise ValueError("invalid progressive stage or step count")
-        self._configure_stage(stage)
+        self._configure_stage(stage, segment=segment)
         assert self.optimizer is not None
         losses: list[float] = []; components_last: dict[str, float] = {}; gradients: dict[str, bool] = {}; scalar_trace: list[dict[str, float | int]] = []
         self.model.train()
         for step in range(steps):
             self.optimizer.zero_grad(set_to_none=True)
-            rows = [self._observation_components(observation, stage) for observation in self.sampler.sample_step()]
-            components = {key: torch.stack([row[key] for row in rows]).mean() for key in rows[0]}
+            rows = []
+            for observation in self.sampler.sample_step(observations_per_update=self.observations_per_update):
+                components = self._observation_components(observation, stage)
+                accumulate_mean_loss_backward([self._base_loss(components, stage)], normalizer=self.observations_per_update)
+                rows.append({key: float(value.detach()) for key, value in components.items()})
+            components_last = {key: sum(row[key] for row in rows) / len(rows) for key in rows[0]}
+            base_loss = sum(float(self._base_loss({key: torch.tensor(value) for key, value in row.items()}, stage)) for row in rows) / len(rows)
+            temporal_loss = 0.
             if contract.enable_motion and step % self.temporal_every == 0:
-                components.update(self._temporal_components(stage))
-            total = components["data"] + self.loss_weights["image"] * components["image"]
-            if contract.enable_motion:
-                total = total + self.loss_weights["mbc_normalization"] * components["mbc_normalization"] + self.loss_weights["smooth_resp"] * components["smooth_resp"] + self.loss_weights["zero_mean_score"] * components.get("zero_mean_score", total * 0.) + self.loss_weights["cardiac_leakage_in_resp"] * components.get("cardiac_leakage_in_resp", total * 0.)
-            if contract.enable_cardiac:
-                total = total + self.loss_weights["smooth_card"] * components["smooth_card"] + self.loss_weights["respiratory_leakage_in_card"] * components.get("respiratory_leakage_in_card", total * 0.) + self.loss_weights["cardiac_target_concentration"] * components.get("cardiac_target_concentration", total * 0.)
-            if stage == "stage3a":
-                total = total + self.loss_weights["cardiac_pca_waveform"] * components.get("cardiac_pca_waveform", total * 0.)
-            total.backward()
+                temporal = self._temporal_components(stage)
+                temporal_total = self._temporal_loss(temporal, stage)
+                if temporal_total.requires_grad:
+                    temporal_total.backward()
+                temporal_loss = float(temporal_total.detach())
+                components_last.update({key: float(value.detach()) for key, value in temporal.items()})
             gradients = {"inr": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.canonical.parameters()), "film": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.film_encoder.parameters()), "respiratory_sinr": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.respiratory_mbc.parameters()), "cardiac_sinr": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.cardiac_mbc.parameters()), "uncertainty": any(p.grad is not None and torch.isfinite(p.grad).all() for p in self.model.uncertainty.parameters())}
-            self.optimizer.step(); losses.append(float(total.detach())); components_last = {key: float(value.detach()) for key, value in components.items()}
-            self.global_step += 1; self.stage_step += 1
-            self.metrics.append({"global_step": self.global_step, "stage_step": self.stage_step, "stage": stage, "total": float(total.detach()), **components_last, "learning_rates": [group["lr"] for group in self.optimizer.param_groups], "resp_active_levels": contract.active_respiratory_levels})
+            self.optimizer.step(); total_value = base_loss + temporal_loss; losses.append(total_value)
+            self.global_step += 1; self.stage_step += 1; self.segment_step += 1; self.stage_cumulative_steps[stage] += 1
+            self.metrics.append({"global_step": self.global_step, "stage_step": self.stage_step, "segment_step": self.segment_step, "stage_cumulative_step": self.stage_cumulative_steps[stage], "stage": stage, "segment": self.current_segment, "total": total_value, **components_last, "learning_rates": [group["lr"] for group in self.optimizer.param_groups], "resp_active_levels": contract.active_respiratory_levels})
             if self.stage_step % 50 == 0 or step == steps - 1:
-                trace = {"stage_step": self.stage_step, "global_step": self.global_step, "total_loss": float(total.detach())}
+                trace = {"stage_step": self.stage_step, "global_step": self.global_step, "total_loss": total_value}
                 trace.update({key: components_last[key] for key in ("data", "cardiac_target_concentration", "cardiac_target_fraction", "cardiac_pca_waveform", "cardiac_pca_waveform_r2", "card_score_std") if key in components_last})
                 scalar_trace.append(trace)
-        return {"stage": stage, "steps": steps, "loss_first": losses[0], "loss_last": losses[-1], "loss_mean": sum(losses) / len(losses), "loss_min": min(losses), "loss_max": max(losses), "loss_components": components_last, "scalar_trace": scalar_trace, "gradient_non_none": gradients, "global_step": self.global_step}
+        return {"stage": stage, "segment": self.current_segment, "steps": steps, "loss_first": losses[0], "loss_last": losses[-1], "loss_mean": sum(losses) / len(losses), "loss_min": min(losses), "loss_max": max(losses), "loss_components": components_last, "scalar_trace": scalar_trace, "gradient_non_none": gradients, "global_step": self.global_step, "segment_step": self.segment_step, "stage_cumulative_step": self.stage_cumulative_steps[stage]}
 
     def training_state_dict(self) -> dict[str, object]:
         if self.optimizer is None or self.current_stage is None:
             raise RuntimeError("cannot checkpoint before a configured training stage")
-        return {"current_stage": self.current_stage, "global_step": self.global_step, "stage_step": self.stage_step, "optimizer": self.optimizer.state_dict(), "sampler": self.sampler.state_dict(), "metrics": list(self.metrics)}
+        return {"current_stage": self.current_stage, "current_segment": self.current_segment, "global_step": self.global_step, "stage_step": self.stage_step, "segment_step": self.segment_step, "stage_cumulative_steps": dict(self.stage_cumulative_steps), "optimizer": self.optimizer.state_dict(), "sampler": self.sampler.state_dict(), "metrics": list(self.metrics)}
 
     def load_training_state_dict(self, state: dict[str, object]) -> None:
         stage = str(state["current_stage"])
@@ -132,8 +175,11 @@ class UnifiedProgressiveTrainer:
         assert self.optimizer is not None
         self.optimizer.load_state_dict(state["optimizer"])  # type: ignore[arg-type]
         self.sampler.load_state_dict(state["sampler"])  # type: ignore[arg-type]
+        self.current_segment = str(state.get("current_segment", stage))
         self.global_step = int(state["global_step"])
         self.stage_step = int(state["stage_step"])
+        self.segment_step = int(state.get("segment_step", self.stage_step))
+        self.stage_cumulative_steps = {str(key): int(value) for key, value in state.get("stage_cumulative_steps", {stage: self.stage_step}).items()}
         self.metrics = list(state.get("metrics", []))
 
     def sample_pixels(self, observation: DynamicObservation) -> torch.Tensor:

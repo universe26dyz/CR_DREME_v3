@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src")); sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend
-from cardioresp4d.diagnostics.change5c import choose_representative_indices
+from cardioresp4d.diagnostics.change5c import choose_representative_indices, stable_diagnostic_seed
 from cardioresp4d.diagnostics.foundation import cardiac_intersection, foundation_predictions, image_metrics, temporal_metrics, temporal_std_map
 from cardioresp4d.training.build_model import build_source_first_model
 from cardioresp4d.training.runtime_state import checkpoint_compatible_dynamic_frame_count, is_hard_invalid_reason
@@ -101,9 +101,10 @@ def main() -> None:
             valid = sorted([item for item in observations if item.qc_valid and not is_hard_invalid_reason(item.qc_reason) and item.view == view and item.slice_id == slice_id], key=lambda item: item.timestamp_s)
             if len(valid) < 2: parser.error(f"{view}/{slice_id} needs at least two QC-valid non-hard-invalid frames")
             chosen = [valid[index] for index in choose_representative_indices(len(valid), min(args.frames, len(valid)))]
+            shared_psf_seed = stable_diagnostic_seed(args.seed, view, slice_id, 0, purpose="foundation_temporal_psf")
             frame_payloads, frame_metrics, mask = [], [], None
             for frame, observation in enumerate(chosen):
-                prediction = foundation_predictions(model, observation, joint_stage=joint_stage, seed=args.seed, slice_chunk_size=args.slice_chunk_size)
+                prediction = foundation_predictions(model, observation, joint_stage=joint_stage, seed=args.seed, psf_seed=shared_psf_seed, slice_chunk_size=args.slice_chunk_size)
                 acquired = observation.image[0].detach().cpu(); prediction = {name: value.detach().cpu() for name, value in prediction.items()}
                 mask = cardiac_intersection(model, observation).detach().cpu()
                 metrics = {"acquired": image_metrics(acquired, acquired, mask), **{name: image_metrics(acquired, value, mask) for name, value in prediction.items()}}
@@ -134,7 +135,7 @@ def main() -> None:
             _plot_temporal_std(args.output_dir / f"{safe}_temporal_std.png", stacks, view=view, slice_id=slice_id)
             all_locations.append({"view": view, "slice_id": slice_id, "selected_frames": [{"timestamp_s": frame["timestamp_s"], "dynamic_frame_id": frame["dynamic_frame_id"]} for frame in frame_payloads], "cardiac_intersection_pixels": int(mask.sum()), "per_frame": frame_metrics, "temporal": temporal})
     warning = "Checkpoint is the documented short source-first foundation (Stage2c global_step=400, stage_step=100); this audit reports it without drawing a convergence conclusion." if checkpoint_stage == "stage2c" and int(state.get("global_step", -1)) == 400 else None
-    payload = {"status": "read_only_no_optimizer_step", "checkpoint": str(args.checkpoint), "checkpoint_stage": checkpoint_stage, "global_step": state.get("global_step"), "stage_step": state.get("stage_step"), "joint_render_stage": joint_stage, "joint_stage_note": "Stage2c checkpoint has no trained cardiac branch; Resp+Card is reported as Resp-only." if joint_stage == "stage2c" else "Resp+Card uses the checkpoint's Stage3 semantics.", "foundation_warning": warning, "seed": args.seed, "slice_chunk_size": args.slice_chunk_size, "psf_pairing": "Each PSF-bearing branch resets the same stable per-observation seed; chunk iteration remains inside one RNG context.", "locations": all_locations}
+    payload = {"status": "read_only_no_optimizer_step", "checkpoint": str(args.checkpoint), "checkpoint_stage": checkpoint_stage, "global_step": state.get("global_step"), "stage_step": state.get("stage_step"), "joint_render_stage": joint_stage, "joint_stage_note": "Stage2c checkpoint has no trained cardiac branch; Resp+Card is reported as Resp-only." if joint_stage == "stage2c" else "Resp+Card uses the checkpoint's Stage3 semantics.", "foundation_warning": warning, "seed": args.seed, "slice_chunk_size": args.slice_chunk_size, "psf_pairing": "Each fixed view/slice temporal comparison uses one shared stable PSF realization; every PSF-bearing branch resets that same seed with chunk iteration inside one RNG context.", "locations": all_locations}
     (args.output_dir / "foundation_audit.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     fields = sorted({key for row in csv_rows for key in row})
     with (args.output_dir / "foundation_audit.csv").open("w", newline="", encoding="utf-8") as handle:

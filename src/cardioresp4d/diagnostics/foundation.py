@@ -20,14 +20,14 @@ def _chunked(pixels: torch.Tensor, chunk_size: int, render: Callable[[torch.Tens
     return torch.cat([render(pixels[start:start + chunk_size]) for start in range(0, len(pixels), chunk_size)])
 
 
-def foundation_predictions(model, observation, *, joint_stage: str, seed: int, slice_chunk_size: int = 1024) -> dict[str, torch.Tensor]:
+def foundation_predictions(model, observation, *, joint_stage: str, seed: int, psf_seed: int | None = None, slice_chunk_size: int = 1024) -> dict[str, torch.Tensor]:
     """Render matched direct, PSF, respiratory, and joint slice predictions."""
     height, width = observation.image.shape[-2:]
     pixels = slice_pixels(observation)
     points = model._pixel_world(observation, pixels)
     direct = _chunked(pixels, slice_chunk_size, lambda chunk: model.canonical(model._pixel_world(observation, chunk)))
     resolution = torch.tensor([observation.pixel_spacing_mm[1], observation.pixel_spacing_mm[0], observation.slice_thickness_mm], device=points.device, dtype=points.dtype)
-    psf_seed = stable_diagnostic_seed(seed, observation.view, observation.slice_id, observation.dynamic_frame_id, purpose="psf")
+    psf_seed = stable_diagnostic_seed(seed, observation.view, observation.slice_id, observation.dynamic_frame_id, purpose="psf") if psf_seed is None else psf_seed
 
     def canonical_psf(chunk: torch.Tensor) -> torch.Tensor:
         centers = model._pixel_world(observation, chunk)

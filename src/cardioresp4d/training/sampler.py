@@ -44,14 +44,20 @@ class ViewLocationBalancedSampler:
             grouped[observation.view.upper()][observation.slice_id].append(observation)
         missing = [view for view in _VIEWS if not grouped[view]]
         if missing: raise ValueError("view-balanced sampler lacks valid observations for " + ", ".join(missing))
-        self._grouped = grouped; self._rng = random.Random(seed)
+        self._grouped = grouped; self._rng = random.Random(seed); self._update_index = 0
 
-    def sample_step(self) -> list[DynamicObservation]:
+    def sample_step(self, *, observations_per_update: int = 3) -> list[DynamicObservation]:
+        if observations_per_update < len(_VIEWS):
+            raise ValueError("observations_per_update must include every required view")
+        base, remainder = divmod(observations_per_update, len(_VIEWS))
+        extras = {_VIEWS[(self._update_index + index) % len(_VIEWS)] for index in range(remainder)}
         selected: list[DynamicObservation] = []
         for view in _VIEWS:
             locations = sorted(self._grouped[view])
-            location = self._rng.choice(locations)
-            selected.append(self._rng.choice(self._grouped[view][location]))
+            for _ in range(base + int(view in extras)):
+                location = self._rng.choice(locations)
+                selected.append(self._rng.choice(self._grouped[view][location]))
+        self._update_index += 1
         return selected
 
     def temporal_batch(self, *, max_items: int) -> list[DynamicObservation]:
@@ -69,7 +75,8 @@ class ViewLocationBalancedSampler:
         return [ordered[index] for index in indices]
 
     def state_dict(self) -> dict:
-        return {"python_random_state": self._rng.getstate()}
+        return {"python_random_state": self._rng.getstate(), "update_index": self._update_index}
 
     def load_state_dict(self, state: dict) -> None:
         self._rng.setstate(state["python_random_state"])
+        self._update_index = int(state.get("update_index", 0))

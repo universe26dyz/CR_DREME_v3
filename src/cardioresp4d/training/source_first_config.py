@@ -40,6 +40,9 @@ def validate_source_first_config(config: Mapping[str, Any], project_root: str | 
         raise ValueError("v3 formal training requires view_balanced = true")
     if training.get("fixed_location_balanced") is not True:
         raise ValueError("v3 formal training requires fixed_location_balanced = true")
+    observations_per_update = training.get("observations_per_update", 3)
+    if isinstance(observations_per_update, bool) or not isinstance(observations_per_update, int) or observations_per_update < 3:
+        raise ValueError("training.observations_per_update must be an integer >= 3")
     if not isinstance(training.get("seed"), int):
         raise ValueError("v3 formal training requires integer training.seed")
     loss_weights = training.get("loss_weights", {})

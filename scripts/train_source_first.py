@@ -25,6 +25,7 @@ from cardioresp4d.training.sampler import DynamicObservation, ViewLocationBalanc
 from cardioresp4d.training.build_model import build_source_first_model, effective_model_config
 from cardioresp4d.training.runtime_state import capture_rng_state, checkpoint_compatible_dynamic_frame_count, is_hard_invalid_reason, restore_rng_state, set_reproducibility, validate_dynamic_frame_rows
 from cardioresp4d.training.source_first_config import validate_source_dependencies, validate_source_first_config
+from cardioresp4d.training.stage_contract import paperaligned_segment
 from cardioresp4d.training.trainer import UnifiedProgressiveTrainer
 
 
@@ -41,6 +42,11 @@ def observations_from_manifest(manifest: Path, qc_table: Path, device: torch.dev
     return observations, dataset.normalization_parameters, dataset.normalization_group_report
 
 
+def optional_pca_waveform_prior(loss_weights: dict, frequency_bands: Path):
+    """Avoid loading the Change5B-only prior when its effective C4 weight is zero."""
+    return PCAWaveformPrior.load(frequency_bands) if float(loss_weights.get("cardiac_pca_waveform", 0.)) > 0 else None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="v3 source-first unified Stage1 -> Stage2a real-data validation")
     parser.add_argument("--source-config", type=Path, default=PROJECT_ROOT / "configs" / "source_first.yaml")
@@ -52,6 +58,8 @@ def main() -> None:
     parser.add_argument("--stage2b-steps", type=int, default=0); parser.add_argument("--stage2c-steps", type=int, default=0)
     parser.add_argument("--stage3a-steps", type=int, default=0); parser.add_argument("--stage3b-steps", type=int, default=0); parser.add_argument("--stage3c-steps", type=int, default=0)
     parser.add_argument("--stage3-steps", type=int, default=0, help="Deprecated; use --stage3a-steps/--stage3b-steps/--stage3c-steps")
+    parser.add_argument("--segment", help="Formal paper-aligned C4 segment name; executes its fixed stage and update count")
+    parser.add_argument("--observations-per-update", type=int, help="Overrides training.observations_per_update")
     parser.add_argument("--seed", type=int, help="Overrides training.seed and is recorded in the checkpoint/report")
     parser.add_argument("--resume", type=Path, help="Complete source-first checkpoint created by this entry point")
     args = parser.parse_args(); device = torch.device(args.device)
@@ -77,15 +85,18 @@ def main() -> None:
     bands_path = (args.frequency_bands or (args.source_config.parent / source_config["training"]["temporal_auxiliary"]["frequency_bands_json"])).resolve()
     prior = load_training_frequency_prior(bands_path, allow_template_fallback=bool(source_config["training"].get("frequency_prior",{}).get("allow_template_fallback",False)))
     temporal_config = source_config["training"]["temporal_auxiliary"]
-    pca_waveform_prior = PCAWaveformPrior.load(bands_path) if float(source_config["training"]["loss_weights"].get("cardiac_pca_waveform", 0.)) > 0 else None
-    trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(observations, seed=seed), pixel_samples=args.pixel_samples, optimizer_config=source_config["training"]["optimizer"], loss_weights=source_config["training"]["loss_weights"], frequency_prior=prior, pca_waveform_prior=pca_waveform_prior, pca_waveform_ridge=float(temporal_config.get("pca_waveform_ridge", 1e-4)), pca_waveform_min_frames=int(temporal_config.get("pca_waveform_min_frames", 8)), temporal_every=int(temporal_config["every_steps"]), temporal_batch_size=int(temporal_config["max_frames"]), cardiac_sampling_fraction=float(source_config["training"]["cardiac_sampling_fraction"]))
+    pca_waveform_prior = optional_pca_waveform_prior(source_config["training"]["loss_weights"], bands_path)
+    observations_per_update = int(source_config["training"].get("observations_per_update", 3) if args.observations_per_update is None else args.observations_per_update)
+    trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(observations, seed=seed), pixel_samples=args.pixel_samples, observations_per_update=observations_per_update, optimizer_config=source_config["training"]["optimizer"], loss_weights=source_config["training"]["loss_weights"], frequency_prior=prior, pca_waveform_prior=pca_waveform_prior, pca_waveform_ridge=float(temporal_config.get("pca_waveform_ridge", 1e-4)), pca_waveform_min_frames=int(temporal_config.get("pca_waveform_min_frames", 8)), temporal_every=int(temporal_config["every_steps"]), temporal_batch_size=int(temporal_config["max_frames"]), cardiac_sampling_fraction=float(source_config["training"]["cardiac_sampling_fraction"]))
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
         trainer.load_training_state_dict(checkpoint["training_state"])
         restore_rng_state(checkpoint["rng_state"])
     stages = (("stage1", args.stage1_steps), ("stage2a", args.stage2a_steps), ("stage2b", args.stage2b_steps), ("stage2c", args.stage2c_steps), ("stage3a", args.stage3a_steps), ("stage3b", args.stage3b_steps), ("stage3c", args.stage3c_steps))
+    segment = paperaligned_segment(args.segment) if args.segment else None
+    stage_reports = {segment.name: trainer.run_stage(segment.stage, steps=segment.steps, segment=segment)} if segment is not None else {stage: trainer.run_stage(stage, steps=steps) for stage, steps in stages if steps > 0}
     prior_payload = asdict(prior)
-    report = {"stages": {stage: trainer.run_stage(stage, steps=steps) for stage, steps in stages if steps > 0}, "effective_config": {**effective_model_config(model), "optimizer_config": source_config["training"]["optimizer"], "loss_weights": trainer.loss_weights, "temporal_auxiliary": temporal_config}, "canonical_encoding_backend": model.canonical.encoding_backend, "normalization_parameters": normalization_parameters, "normalization_groups": normalization_groups, "frequency_prior": prior_payload, "pca_waveform_prior": None if pca_waveform_prior is None else pca_waveform_prior.metadata, "source_lock": source_lock, "source_lock_verified": bool(source_lock.get("verified")), "reproducibility": reproducibility, "device": str(device), "torch_version": torch.__version__, "resumed_from": str(args.resume) if args.resume else None}
+    report = {"stages": stage_reports, "effective_config": {**effective_model_config(model), "optimizer_config": source_config["training"]["optimizer"], "loss_weights": trainer.loss_weights, "temporal_auxiliary": temporal_config, "observations_per_update": observations_per_update}, "paperaligned_segment": None if segment is None else segment.name, "canonical_encoding_backend": model.canonical.encoding_backend, "normalization_parameters": normalization_parameters, "normalization_groups": normalization_groups, "frequency_prior": prior_payload, "pca_waveform_prior": None if pca_waveform_prior is None else pca_waveform_prior.metadata, "source_lock": source_lock, "source_lock_verified": bool(source_lock.get("verified")), "reproducibility": reproducibility, "device": str(device), "torch_version": torch.__version__, "resumed_from": str(args.resume) if args.resume else None}
     args.output_dir.mkdir(parents=True, exist_ok=True); torch.save({"checkpoint_schema": 1, "model": model.state_dict(), "training_state": trainer.training_state_dict(), "rng_state": capture_rng_state(), "report": report, "frequency_prior": prior_payload, "normalization_parameters": normalization_parameters}, args.output_dir / "source_first_last.pt")
     (args.output_dir / "source_first_training_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     (args.output_dir / "effective_config.json").write_text(json.dumps(report["effective_config"], indent=2) + "\n", encoding="utf-8")

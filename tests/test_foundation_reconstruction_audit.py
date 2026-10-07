@@ -75,6 +75,16 @@ class FoundationReconstructionAuditTest(unittest.TestCase):
         self.assertGreater(temporal["whole_fov"]["mean_temporal_std"], 0.)
         self.assertAlmostEqual(1., temporal["whole_fov"]["delta_correlation"], places=6)
 
+    def test_shared_psf_seed_keeps_static_canonical_temporally_constant(self) -> None:
+        module = importlib.import_module("cardioresp4d.diagnostics.foundation")
+        first, second = _Observation(), _Observation()
+        second.dynamic_frame_id, second.timestamp_s = 6, 1.
+        model = _Model()
+        shared_seed = 123
+        one = module.foundation_predictions(model, first, joint_stage="stage3a", seed=7, psf_seed=shared_seed)
+        two = module.foundation_predictions(model, second, joint_stage="stage3a", seed=7, psf_seed=shared_seed)
+        self.assertEqual(0., float(module.temporal_std_map(torch.stack((one["canonical_psf"], two["canonical_psf"]))).max()))
+
 
 if __name__ == "__main__":
     unittest.main()
