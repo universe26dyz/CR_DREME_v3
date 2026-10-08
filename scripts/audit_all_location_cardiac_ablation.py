@@ -20,6 +20,7 @@ from cardioresp4d.diagnostics.change5c import aggregate_ablation, aggregate_abla
 from cardioresp4d.training.build_model import build_source_first_model
 from cardioresp4d.training.runtime_state import checkpoint_compatible_dynamic_frame_count, is_hard_invalid_reason
 from cardioresp4d.training.source_first_config import validate_source_first_config
+from cardioresp4d.training.stage_contract import stage_contract
 from train_source_first import observations_from_manifest
 
 
@@ -51,6 +52,13 @@ def _location_row(rows: list[dict]) -> dict:
     return {"view": rows[0]["view"], "slice_id": rows[0]["slice_id"], "status": "evaluated", "n_frames": len(rows), "n_pixels": sum(int(row["n_pixels"]) for row in rows), **totals, "absolute_mse_improvement": totals["resp_only_mse"] - totals["resp_plus_card_mse"], "relative_mse_improvement_percent": 100. * (totals["resp_only_mse"] - totals["resp_plus_card_mse"]) / max(totals["resp_only_mse"], torch.finfo(torch.float32).eps)}
 
 
+def validate_cardiac_ablation_stage(stage: str) -> str:
+    """Accept every formal stage that actually enables the cardiac branch."""
+    if not stage_contract(stage).enable_cardiac:
+        raise ValueError(f"cardiac ablation requires a cardiac-enabled checkpoint, got {stage}")
+    return stage
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-config", type=Path, required=True); parser.add_argument("--manifest", type=Path, required=True); parser.add_argument("--qc-table", type=Path, required=True); parser.add_argument("--canonical-domain", type=Path, required=True); parser.add_argument("--checkpoint", type=Path, required=True)
@@ -60,7 +68,10 @@ def main() -> None:
     config = yaml.safe_load(args.source_config.read_text(encoding="utf-8")); validate_source_first_config(config, PROJECT_ROOT)
     domain = json.loads(args.canonical_domain.read_text(encoding="utf-8")); observations, _, _ = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=config["training"]["normalization"]["mode"])
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False); stage = str(checkpoint.get("training_state", {}).get("current_stage", "stage3a"))
-    if stage != "stage3a": parser.error(f"Change5C requires Stage3a checkpoint, got {stage}")
+    try:
+        validate_cardiac_ablation_stage(stage)
+    except ValueError as exc:
+        parser.error(str(exc))
     n_dynamic_frames = checkpoint_compatible_dynamic_frame_count(checkpoint, observations)
     model = build_source_first_model(config, domain, n_dynamic_frames=n_dynamic_frames, device=device, canonical_encoding_backend=detect_checkpoint_encoding_backend(checkpoint["model"])).to(device); model.load_state_dict(checkpoint["model"]); model.eval(); model.canonical.inr.train()
     grouped: dict[tuple[str, str], list] = defaultdict(list)
