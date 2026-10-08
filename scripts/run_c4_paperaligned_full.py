@@ -50,6 +50,12 @@ def _write_manifest(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def record_segment_failure(manifest_path: Path, run_manifest: dict, *, segment_name: str, error: subprocess.CalledProcessError, log_path: Path) -> None:
+    """Persist a child-process failure without altering its output directory."""
+    run_manifest.update({"status": "failed", "failed_segment": segment_name, "returncode": error.returncode, "log_path": str(log_path)})
+    _write_manifest(manifest_path, run_manifest)
+
+
 def prepare_training_output_dir(output_dir: Path, *, resume: bool) -> None:
     """Create an empty run root without weakening normal overwrite protection."""
     if output_dir.exists() and not resume and any(output_dir.iterdir()):
@@ -91,8 +97,13 @@ def main() -> None:
         command = [sys.executable, "scripts/train_source_first.py", "--source-config", str(args.source_config), "--frequency-bands", str(args.frequency_bands), "--manifest", str(args.manifest), "--qc-table", str(args.qc_table), "--canonical-domain", str(args.canonical_domain), "--output-dir", str(destination), "--device", args.device, "--pixel-samples", str(args.pixel_samples), "--seed", str(args.seed), "--segment", segment_name]
         if parent is not None: command.extend(("--resume", str(parent)))
         started = time.monotonic()
-        with (logs / f"{directory_name}.log").open("w", encoding="utf-8") as log:
-            subprocess.run(command, cwd=PROJECT_ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)
+        log_path = logs / f"{directory_name}.log"
+        try:
+            with log_path.open("w", encoding="utf-8") as log:
+                subprocess.run(command, cwd=PROJECT_ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)
+        except subprocess.CalledProcessError as error:
+            record_segment_failure(manifest_path, run_manifest, segment_name=segment_name, error=error, log_path=log_path)
+            raise
         parent = destination / "source_first_last.pt"
         if not parent.is_file(): raise RuntimeError(f"segment did not produce a checkpoint: {parent}")
         run_manifest["completed"].append({"segment": segment_name, "checkpoint": str(parent), "runtime_seconds": time.monotonic() - started, "status": "completed"})

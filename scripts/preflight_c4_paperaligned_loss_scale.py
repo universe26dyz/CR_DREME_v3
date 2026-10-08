@@ -21,13 +21,33 @@ from cardioresp4d.training.build_model import build_source_first_model, effectiv
 from cardioresp4d.training.runtime_state import set_reproducibility, training_dynamic_frame_count
 from cardioresp4d.training.sampler import ViewLocationBalancedSampler
 from cardioresp4d.training.source_first_config import validate_source_dependencies, validate_source_first_config
-from cardioresp4d.training.stage_contract import paperaligned_segment
+from cardioresp4d.training.stage_contract import StageSegment, paperaligned_segment, stage_contract
 from cardioresp4d.training.trainer import UnifiedProgressiveTrainer, effective_loss_weights
 from train_source_first import observations_from_manifest
 
 
 def _mean_components(rows: list[dict[str, torch.Tensor]]) -> dict[str, float]:
     return {name: sum(float(row[name].detach()) for row in rows) / len(rows) for name in rows[0]}
+
+
+def nonfinite_trainable_gradient_names(model: torch.nn.Module) -> list[str]:
+    """Return trainable parameters lacking a finite backward result."""
+    return [name for name, parameter in model.named_parameters() if parameter.requires_grad and (parameter.grad is None or not torch.isfinite(parameter.grad).all())]
+
+
+def backward_finite_check(trainer: UnifiedProgressiveTrainer, segment: StageSegment) -> dict[str, object]:
+    """Run one read-only mean-loss backward pass for a formal C4 segment."""
+    trainer._configure_stage(segment.stage, segment=segment)
+    assert trainer.optimizer is not None
+    trainer.model.train(); trainer.optimizer.zero_grad(set_to_none=True)
+    for observation in trainer.sampler.sample_step(observations_per_update=trainer.observations_per_update):
+        (trainer._base_loss(trainer._observation_components(observation, segment.stage), segment.stage) / trainer.observations_per_update).backward()
+    if stage_contract(segment.stage).enable_motion:
+        temporal_loss = trainer._temporal_loss(trainer._temporal_components(segment.stage), segment.stage)
+        if temporal_loss.requires_grad:
+            temporal_loss.backward()
+    bad_parameter_names = nonfinite_trainable_gradient_names(trainer.model)
+    return {"finite": not bad_parameter_names, "bad_parameter_names": bad_parameter_names}
 
 
 def main() -> None:
@@ -63,9 +83,13 @@ def main() -> None:
             raise ValueError(f"non-finite loss-scale component: {name}")
         components[name] = {"raw_component": value, "weight": weight, "weighted_component": weighted, "weighted_over_data_loss": weighted / data}
     warnings = [f"{name}: weighted regularizer exceeds 100x data loss" for name, values in components.items() if abs(values["weighted_over_data_loss"]) > 100.]
-    payload = {"status": "PASS_READ_ONLY_NO_OPTIMIZER_STEP", "segment": segment.name, "stage": segment.stage, "observations_per_update": trainer.observations_per_update, "raw_data_loss": data, "components": components, "warnings": warnings, "effective_config": {**effective_model_config(model), "loss_weights": weights}, "frequency_prior": asdict(trainer.frequency_prior), "source_lock": verify_vendored_source_lock(PROJECT_ROOT), "seed": args.seed}
+    backward_checks = {name: backward_finite_check(trainer, paperaligned_segment(name)) for name in ("s1a", "s2a_init", "s3a", "s3b_full")}
+    checks_finite = all(bool(check["finite"]) for check in backward_checks.values())
+    payload = {"status": "PASS_READ_ONLY_NO_OPTIMIZER_STEP" if checks_finite else "FAIL_NONFINITE_BACKWARD_GRADIENT", "segment": segment.name, "stage": segment.stage, "observations_per_update": trainer.observations_per_update, "raw_data_loss": data, "components": components, "warnings": warnings, "backward_checks": backward_checks, "effective_config": {**effective_model_config(model), "loss_weights": weights}, "frequency_prior": asdict(trainer.frequency_prior), "source_lock": verify_vendored_source_lock(PROJECT_ROOT), "seed": args.seed}
     args.output_json.parent.mkdir(parents=True, exist_ok=True); args.output_json.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"status": payload["status"], "warnings": warnings, "output": str(args.output_json)}, indent=2))
+    if not checks_finite:
+        raise RuntimeError("non-finite trainable gradient in C4 backward preflight")
 
 
 if __name__ == "__main__":

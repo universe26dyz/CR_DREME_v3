@@ -23,7 +23,7 @@ LAUNCH_LOG=/data/dengyz/dataset/CR_DREME_v3/c4_paperaligned_full_launcher.log
 CFG=configs/source_first_change4_paperaligned.yaml
 ```
 
-## B. one-batch read-only loss-scale preflight
+## B. read-only loss-scale and backward-finiteness preflight
 
 ```bash
 test ! -e ${PREFLIGHT_OUT}
@@ -33,7 +33,7 @@ python scripts/preflight_c4_paperaligned_loss_scale.py \
   --device cuda --seed 0 --output-json ${PREFLIGHT_OUT}
 ```
 
-Inspect warnings before launching. The command never performs `optimizer.step()` and never changes weights.
+Inspect warnings before launching. The command never performs `optimizer.step()` or changes weights; it additionally checks finite trainable gradients for `s1a`, `s2a_init`, `s3a`, and `s3b_full`.
 
 ## C. launch full C4 6250-update run with nohup
 

@@ -68,6 +68,21 @@ class SourceBackedAdapterTest(unittest.TestCase):
         regularization = adapter.image_regularization(density, points, mode="edge")
         self.assertTrue(torch.isfinite(regularization))
 
+    def test_dreme_stable_tv_has_finite_zero_difference_backward(self) -> None:
+        adapter = NeSVoRCanonicalAdapter(torch.tensor([[-10., -10., -10.], [10., 10., 10.]]), width=8, depth=1, n_features_z=4)
+        density = torch.zeros(2, 3, requires_grad=True)
+        points = torch.tensor([[[0., 0., 0.], [1., 0., 0.], [2., 0., 0.]], [[0., 1., 0.], [1., 1., 0.], [2., 1., 0.]]])
+        regularization = adapter.image_regularization(density, points, mode="dreme_tv_stable")
+        self.assertTrue(torch.isfinite(regularization))
+        regularization.backward()
+        self.assertTrue(torch.isfinite(density.grad).all())
+
+    def test_dreme_stable_tv_matches_upstream_tv_for_nonzero_difference(self) -> None:
+        adapter = NeSVoRCanonicalAdapter(torch.tensor([[-10., -10., -10.], [10., 10., 10.]]), width=8, depth=1, n_features_z=4)
+        density = torch.tensor([[0.2, 0.5, 1.1], [0.7, 0.4, 0.3]])
+        points = torch.tensor([[[0., 0., 0.], [1., 0., 0.], [2., 0., 0.]], [[0., 1., 0.], [1., 1., 0.], [2., 1., 0.]]])
+        torch.testing.assert_close(adapter.image_regularization(density, points, mode="dreme_tv_stable"), adapter.image_regularization(density, points, mode="TV"), rtol=1e-6, atol=1e-7)
+
     def test_film_adapter_wraps_upstream_primitive(self) -> None:
         module = FiLMAdapter()
         from vr.models.filmed_net import FiLM

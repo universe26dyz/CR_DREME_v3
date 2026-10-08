@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 
 import torch
@@ -48,3 +49,14 @@ def test_full_launcher_still_refuses_nonempty_training_output(tmp_path: Path) ->
     (output / "unrelated_preflight.json").write_text("{}", encoding="utf-8")
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
         launcher.prepare_training_output_dir(output, resume=False)
+
+
+def test_launcher_child_failure_marks_manifest_failed(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "c4_paperaligned_run_manifest.json"
+    manifest = {"status": "running", "completed": []}
+    launcher.record_segment_failure(manifest_path, manifest, segment_name="s2a_init", error=subprocess.CalledProcessError(17, ["train"]), log_path=tmp_path / "logs" / "s2a_init_1850.log")
+    payload = __import__("json").loads(manifest_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["failed_segment"] == "s2a_init"
+    assert payload["returncode"] == 17
+    assert payload["log_path"].endswith("s2a_init_1850.log")

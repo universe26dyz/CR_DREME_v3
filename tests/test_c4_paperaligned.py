@@ -127,7 +127,7 @@ def test_paperaligned_config_has_only_requested_c4_losses_and_batching() -> None
     validate_source_first_config(config, ROOT)
     weights = effective_loss_weights(config["training"]["loss_weights"])
     assert config["training"]["observations_per_update"] == 32
-    assert config["training"]["image_regularization"]["mode"] == "TV"
+    assert config["training"]["image_regularization"]["mode"] == "dreme_tv_stable"
     assert {name: weights[name] for name in ("image", "mbc_normalization", "zero_mean_score", "cardiac_leakage_in_resp", "respiratory_leakage_in_card", "smooth_resp", "smooth_card", "cardiac_target_concentration", "cardiac_pca_waveform")} == {"image": 2e-6, "mbc_normalization": 1e-2, "zero_mean_score": 1e-4, "cardiac_leakage_in_resp": 1e-1, "respiratory_leakage_in_card": 5e-2, "smooth_resp": 0., "smooth_card": 0., "cardiac_target_concentration": 0., "cardiac_pca_waveform": 0.}
     with patch.object(train_source_first.PCAWaveformPrior, "load") as load:
         assert train_source_first.optional_pca_waveform_prior(config["training"]["loss_weights"], Path("unused.json")) is None

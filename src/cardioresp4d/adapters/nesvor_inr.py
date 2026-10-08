@@ -76,8 +76,13 @@ class NeSVoRCanonicalAdapter(nn.Module):
         return result
 
     def image_regularization(self, density: torch.Tensor, sample_points_world_mm: torch.Tensor, *, mode: str = "edge", delta: float = 1.) -> torch.Tensor:
-        """Delegate directly to pinned ``NeSVoR.img_reg`` without reimplementing it."""
-        if mode not in {"edge", "TV", "L2", "none"} or delta <= 0:
+        """Use pinned NeSVoR regularization, except C4's stable Eq.5 adaptation."""
+        if mode not in {"edge", "TV", "L2", "none", "dreme_tv_stable"} or delta <= 0:
             raise ValueError("invalid official NeSVoR image regularization mode or delta")
+        if mode == "dreme_tv_stable":
+            xyz = sample_points_world_mm * self.spatial_scaling
+            d_density = density - torch.flip(density, (1,))
+            dx2 = ((xyz - torch.flip(xyz, (1,))) ** 2).sum(-1) + 1e-6
+            return (d_density.abs() / dx2.sqrt()).mean()
         context = Namespace(args=Namespace(image_regularization=mode, img_reg_autodiff=False), inr=self.inr, spatial_scaling=self.spatial_scaling, delta=float(delta))
         return NeSVoR.img_reg(context, density, sample_points_world_mm)

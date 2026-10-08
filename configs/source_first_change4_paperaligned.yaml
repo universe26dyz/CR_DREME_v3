@@ -18,7 +18,7 @@ training:
   stage3b: {joint_cardiorespiratory: true, uncertainty_enabled: false}
   stage3c: {uncertainty_enabled: true}
   loss_weights: {image: 2.0e-6, mbc_normalization: 1.0e-2, smooth_resp: 0.0, smooth_card: 0.0, zero_mean_score: 1.0e-4, cardiac_leakage_in_resp: 1.0e-1, respiratory_leakage_in_card: 5.0e-2, cardiac_target_concentration: 0.0, cardiac_pca_waveform: 0.0}
-  image_regularization: {mode: TV, delta: 1.0}
+  image_regularization: {mode: dreme_tv_stable, delta: 1.0}
   optimizer:
     stage1a: {canonical_lr: 2.0e-4}
     stage1b: {canonical_lr: 5.0e-5}

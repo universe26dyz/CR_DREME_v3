@@ -58,12 +58,13 @@ def _observation(frame: int, timestamp: float, *, view: str = "SAX") -> DynamicO
     )
 
 
-def _model() -> SourceFirstDynamicModel:
+def _model(*, image_regularization_mode: str = "edge") -> SourceFirstDynamicModel:
     return SourceFirstDynamicModel(
         torch.tensor([-4., -4., -4.]), torch.tensor([4., 4., 4.]),
         cardiac_lower_world_mm=torch.tensor([-2., -2., -2.]), cardiac_upper_world_mm=torch.tensor([2., 2., 2.]),
         n_dynamic_frames=3, inr_width=8, inr_depth=1, latent_dim=4, motion_hidden_dim=8,
         respiratory_grid_shapes=((4, 4, 4), (4, 4, 4), (4, 4, 4)), cardiac_grid_shape=(4, 4, 4), psf_samples=1,
+        image_regularization_mode=image_regularization_mode,
     )
 
 
@@ -136,6 +137,12 @@ class Change4FrequencyPriorTest(unittest.TestCase):
         eq8.backward()
         self.assertTrue(any(parameter.grad is not None and torch.isfinite(parameter.grad).all() and parameter.grad.abs().sum() > 0 for parameter in trainer.model.film_encoder.resp.parameters()))
         self.assertTrue(all(parameter.grad is None for parameter in trainer.model.canonical.parameters()))
+
+    def test_paperaligned_s1a_one_update_has_finite_canonical_gradients(self) -> None:
+        sequence = [_observation(index, float(index), view=view) for index, view in enumerate(("SAX", "2CH", "4CH"))]
+        trainer = UnifiedProgressiveTrainer(_model(image_regularization_mode="dreme_tv_stable"), ViewLocationBalancedSampler(sequence), pixel_samples=2)
+        trainer.run_stage("stage1", steps=1, segment=paperaligned_segment("s1a"))
+        self.assertTrue(all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in trainer.model.canonical.parameters()))
 
 
 if __name__ == "__main__":
