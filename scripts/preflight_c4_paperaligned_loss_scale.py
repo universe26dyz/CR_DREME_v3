@@ -31,8 +31,19 @@ def _mean_components(rows: list[dict[str, torch.Tensor]]) -> dict[str, float]:
 
 
 def nonfinite_trainable_gradient_names(model: torch.nn.Module) -> list[str]:
-    """Return trainable parameters lacking a finite backward result."""
-    return [name for name, parameter in model.named_parameters() if parameter.requires_grad and (parameter.grad is None or not torch.isfinite(parameter.grad).all())]
+    """Return trainable parameters whose existing gradient is NaN or Inf."""
+    return [name for name, parameter in model.named_parameters() if parameter.requires_grad and parameter.grad is not None and not torch.isfinite(parameter.grad).all()]
+
+
+def expected_unused_gradient_names(model: torch.nn.Module, stage: str, missing_gradient_names: list[str]) -> list[str]:
+    """Identify dormant heads from formal stage ownership, not name matching."""
+    if stage_contract(stage).enable_cardiac:
+        return []
+    card_head = getattr(getattr(model, "film_encoder", None), "card", None)
+    if not isinstance(card_head, torch.nn.Module):
+        return []
+    card_parameter_ids = {id(parameter) for parameter in card_head.parameters()}
+    return [name for name, parameter in model.named_parameters() if name in missing_gradient_names and id(parameter) in card_parameter_ids]
 
 
 def backward_finite_check(trainer: UnifiedProgressiveTrainer, segment: StageSegment) -> dict[str, object]:
@@ -46,8 +57,11 @@ def backward_finite_check(trainer: UnifiedProgressiveTrainer, segment: StageSegm
         temporal_loss = trainer._temporal_loss(trainer._temporal_components(segment.stage), segment.stage)
         if temporal_loss.requires_grad:
             temporal_loss.backward()
-    bad_parameter_names = nonfinite_trainable_gradient_names(trainer.model)
-    return {"finite": not bad_parameter_names, "bad_parameter_names": bad_parameter_names}
+    missing_gradient_names = [name for name, parameter in trainer.model.named_parameters() if parameter.requires_grad and parameter.grad is None]
+    expected_unused = expected_unused_gradient_names(trainer.model, segment.stage, missing_gradient_names)
+    unexpected_missing = [name for name in missing_gradient_names if name not in expected_unused]
+    nonfinite = nonfinite_trainable_gradient_names(trainer.model)
+    return {"finite": not nonfinite and not unexpected_missing, "nonfinite_gradient_names": nonfinite, "missing_gradient_names": missing_gradient_names, "expected_unused_gradient_names": expected_unused, "unexpected_missing_gradient_names": unexpected_missing}
 
 
 def main() -> None:

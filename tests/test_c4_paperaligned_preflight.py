@@ -39,18 +39,18 @@ def _observation(view: str, frame: int) -> DynamicObservation:
 def _trainer() -> UnifiedProgressiveTrainer:
     trainer = UnifiedProgressiveTrainer(_Model(), ViewLocationBalancedSampler([_observation(view, index) for index, view in enumerate(("SAX", "2CH", "4CH"))]), pixel_samples=1)
 
-    def total() -> torch.Tensor:
-        return sum((parameter.square().sum() for parameter in trainer.model.parameters()))
+    def total(stage: str) -> torch.Tensor:
+        return sum((parameter.square().sum() for name, parameter in trainer.model.named_parameters() if not (stage == "stage2a" and name.startswith("film_encoder.card."))))
 
     def observation_components(_observation: DynamicObservation, stage: str) -> dict[str, torch.Tensor]:
-        value = total(); zero = value * 0.
+        value = total(stage); zero = value * 0.
         result = {"data": value, "image": zero}
         if stage != "stage1": result.update({"mbc_normalization": zero, "smooth_resp": zero})
         if stage in {"stage3a", "stage3b", "stage3c"}: result["smooth_card"] = zero
         return result
 
-    def temporal_components(_stage: str) -> dict[str, torch.Tensor]:
-        value = total()
+    def temporal_components(stage: str) -> dict[str, torch.Tensor]:
+        value = total(stage)
         return {"zero_mean_score": value, "cardiac_leakage_in_resp": value, "respiratory_leakage_in_card": value, "cardiac_target_concentration": value, "cardiac_pca_waveform": value}
 
     trainer._observation_components = observation_components  # type: ignore[method-assign]
@@ -61,11 +61,20 @@ def _trainer() -> UnifiedProgressiveTrainer:
 def test_critical_paperaligned_segments_pass_cpu_backward_preflight() -> None:
     trainer = _trainer()
     checks = {name: preflight.backward_finite_check(trainer, paperaligned_segment(name)) for name in ("s1a", "s2a_init", "s3a", "s3b_full")}
-    assert checks == {name: {"finite": True, "bad_parameter_names": []} for name in checks}
+    assert all(check["finite"] for check in checks.values())
+    assert checks["s2a_init"]["expected_unused_gradient_names"] == ["film_encoder.card.weight", "film_encoder.card.bias"]
+    assert all(not check["unexpected_missing_gradient_names"] for check in checks.values())
 
 
 def test_preflight_detects_deliberately_injected_nonfinite_gradient() -> None:
     model = torch.nn.Linear(1, 1)
     model.weight.grad = torch.full_like(model.weight, float("nan"))
+    model.bias.grad = torch.zeros_like(model.bias)
+    assert preflight.nonfinite_trainable_gradient_names(model) == ["weight"]
+
+
+def test_preflight_detects_deliberately_injected_infinite_gradient() -> None:
+    model = torch.nn.Linear(1, 1)
+    model.weight.grad = torch.full_like(model.weight, float("inf"))
     model.bias.grad = torch.zeros_like(model.bias)
     assert preflight.nonfinite_trainable_gradient_names(model) == ["weight"]
