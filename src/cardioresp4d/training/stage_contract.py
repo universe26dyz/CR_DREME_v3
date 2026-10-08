@@ -58,6 +58,9 @@ class StageSegment:
     steps: int
     optimizer_key: str
     train_canonical: bool | None = None
+    film_train_mode: FilmTrainMode | None = None
+    train_respiratory_mbc: bool | None = None
+    train_cardiac_mbc: bool | None = None
 
 
 _STAGES = {
@@ -82,7 +85,9 @@ _PAPERALIGNED_SEGMENTS = {
     "s2b_joint": StageSegment("s2b_joint", "stage2b", 200, "stage2", train_canonical=True),
     "s2c_init": StageSegment("s2c_init", "stage2c", 50, "stage2", train_canonical=False),
     "s2c_joint": StageSegment("s2c_joint", "stage2c", 200, "stage2", train_canonical=True),
-    "s3a": StageSegment("s3a", "stage3a", 50, "stage3a", train_canonical=False),
+    # This paper-aligned initialization adapts the source-first realization of
+    # C4: keep the spatial field fixed while all active motion components adapt.
+    "s3a": StageSegment("s3a", "stage3a", 50, "stage3a", train_canonical=False, film_train_mode="all", train_respiratory_mbc=True, train_cardiac_mbc=True),
     "s3b_full": StageSegment("s3b_full", "stage3b", 3650, "stage3b", train_canonical=True),
 }
 

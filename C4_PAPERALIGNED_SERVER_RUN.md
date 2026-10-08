@@ -17,18 +17,20 @@ FREQ=/data/dengyz/dataset/CR_DREME_v3/v1/phase1/frequency/frequency_bands.json
 MANIFEST=/data/dengyz/dataset/CR_DREME_v3/v1/phase1/dicom_manifest.csv
 QC=/data/dengyz/dataset/CR_DREME_v3/v1/phase1/acquisition_qc/acquisition_qc.csv
 DOMAIN=/data/dengyz/dataset/CR_DREME_v3/v1/phase1/canonical_domain/canonical_domain.json
-OUT=/data/dengyz/dataset/CR_DREME_v3/v1_change4_paperaligned_full
+TRAIN_OUT=/data/dengyz/dataset/CR_DREME_v3/v1_change4_paperaligned_full
+PREFLIGHT_OUT=/data/dengyz/dataset/CR_DREME_v3/c4_paperaligned_loss_scale_preflight.json
+LAUNCH_LOG=/data/dengyz/dataset/CR_DREME_v3/c4_paperaligned_full_launcher.log
 CFG=configs/source_first_change4_paperaligned.yaml
 ```
 
 ## B. one-batch read-only loss-scale preflight
 
 ```bash
-test ! -e ${OUT}/loss_scale_preflight.json
+test ! -e ${PREFLIGHT_OUT}
 python scripts/preflight_c4_paperaligned_loss_scale.py \
   --source-config ${CFG} --frequency-bands ${FREQ} --manifest ${MANIFEST} \
   --qc-table ${QC} --canonical-domain ${DOMAIN} --segment s3b_full \
-  --device cuda --seed 0 --output-json ${OUT}/loss_scale_preflight.json
+  --device cuda --seed 0 --output-json ${PREFLIGHT_OUT}
 ```
 
 Inspect warnings before launching. The command never performs `optimizer.step()` and never changes weights.
@@ -36,13 +38,12 @@ Inspect warnings before launching. The command never performs `optimizer.step()`
 ## C. launch full C4 6250-update run with nohup
 
 ```bash
-test ! -e ${OUT}/c4_paperaligned_run_manifest.json
-mkdir -p ${OUT}
+test ! -e ${TRAIN_OUT}/c4_paperaligned_run_manifest.json
 nohup python scripts/run_c4_paperaligned_full.py \
   --source-config ${CFG} --frequency-bands ${FREQ} --manifest ${MANIFEST} \
-  --qc-table ${QC} --canonical-domain ${DOMAIN} --output-dir ${OUT} \
+  --qc-table ${QC} --canonical-domain ${DOMAIN} --output-dir ${TRAIN_OUT} \
   --device cuda --pixel-samples 256 --seed 0 \
-  > ${OUT}/launcher.log 2>&1 &
+  > ${LAUNCH_LOG} 2>&1 &
 ```
 
 The launcher runs: `s1a_500`, `s1b_1800`, `s2a_init_1850`, `s2a_joint_2050`, `s2b_init_2100`, `s2b_joint_2300`, `s2c_init_2350`, `s2c_joint_2550`, `s3a_2600`, and `s3b_full_6250`.
@@ -64,7 +65,7 @@ PY
 ```bash
 python scripts/run_c4_paperaligned_full.py \
   --source-config ${CFG} --frequency-bands ${FREQ} --manifest ${MANIFEST} \
-  --qc-table ${QC} --canonical-domain ${DOMAIN} --output-dir ${OUT} \
+  --qc-table ${QC} --canonical-domain ${DOMAIN} --output-dir ${TRAIN_OUT} \
   --device cuda --pixel-samples 256 --seed 0 --resume
 ```
 
@@ -73,7 +74,7 @@ The launcher verifies contiguous checkpoint lineage and starts after the last co
 ## F. completion gate
 
 ```bash
-test -f ${OUT}/s3b_full_6250/source_first_last.pt
+test -f ${TRAIN_OUT}/s3b_full_6250/source_first_last.pt
 python - <<'PY'
 import json
 from pathlib import Path
@@ -88,8 +89,8 @@ PY
 ## G. final foundation/dynamics evaluation command
 
 ```bash
-FINAL=${OUT}/s3b_full_6250/source_first_last.pt
-EVAL=${OUT}/final_evaluation
+FINAL=${TRAIN_OUT}/s3b_full_6250/source_first_last.pt
+EVAL=${TRAIN_OUT}/final_evaluation
 mkdir -p ${EVAL}
 python scripts/audit_foundation_reconstruction.py \
   --source-config ${CFG} --manifest ${MANIFEST} --qc-table ${QC} \

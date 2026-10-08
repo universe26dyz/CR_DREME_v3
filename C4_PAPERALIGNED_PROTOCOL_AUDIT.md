@@ -13,6 +13,7 @@
 | Zero-mean score weight | Current Eq.7-style score implementation | DIRECT_TRANSFER | `1e-4` |
 | Eq.8 weight | Existing true-timestamp cardiac leakage in respiratory score, with paired baseline subtraction | DIRECT_TRANSFER | `1e-1` |
 | Eq.9 weight | Existing true-timestamp respiratory leakage in cardiac score | DIRECT_TRANSFER | `5e-2` |
+| S3A cardiac initialization | The historical generic Stage3a freezes shared/respiratory FiLM and respiratory MBC, but that is not the paper-aligned C4 adaptation | IMAGE_DOMAIN_ADAPTATION | Keep canonical frozen for 50 updates while full FiLM, all three respiratory MBC levels, and cardiac MBC train; uncertainty remains frozen |
 | K-space L1 data consistency | Project has reconstructed DICOM image observations and no raw k-space | NOT_TRANSFERABLE | Retain current image-domain MSE; do not claim k-space equivalence |
 | Stage-I approximate-volume target | Source-first deliberately has no approximate NUFFT volume target | NOT_TRANSFERABLE | Retain no-motion image-domain Stage1; align only budget/LR structure |
 | B-spline MBC implementation | Pinned upstream SINR B-spline FFD adapters | DIRECT_TRANSFER | Unchanged |
@@ -21,3 +22,5 @@
 | Long Stage-III full joint optimization | Existing Stage3b unfreezes canonical, full FiLM, respiratory and cardiac MBC | DIRECT_TRANSFER | 3650-update Stage3b with uncertainty off |
 
 The C4 config sets target concentration and PCA waveform to zero, leaves Stage3c at zero in the launcher, and uses no explicit DVF smoothness for this baseline (`smooth_resp=smooth_card=0`). This is a protocol control, not a change to generic regularizer support or to Change5A/Change5B.
+
+The prior paper-aligned S3A mapping incorrectly inherited the generic card-head-only warm-up. The corrected scheduling override keeps the canonical field frozen while all active motion components train, which is the required image-domain adaptation rather than an exact DREME-MR reproduction. The transfer remains non-exact because the project has no raw k-space data or approximate-volume target, uses its existing 2-D geometry-conditioned FiLM/SINR realization, and evaluates Eq.8/Eq.9 on true timestamps.

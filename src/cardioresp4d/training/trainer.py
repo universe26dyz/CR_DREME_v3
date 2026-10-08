@@ -56,12 +56,25 @@ class UnifiedProgressiveTrainer:
         if segment is not None and segment.stage != stage:
             raise ValueError(f"segment {segment.name} does not belong to {stage}")
         train_canonical = contract.train_canonical if segment is None or segment.train_canonical is None else segment.train_canonical
+        film_train_mode = contract.film_train_mode if segment is None or segment.film_train_mode is None else segment.film_train_mode
+        train_respiratory_mbc = contract.train_respiratory_mbc if segment is None or segment.train_respiratory_mbc is None else segment.train_respiratory_mbc
+        train_cardiac_mbc = contract.train_cardiac_mbc if segment is None or segment.train_cardiac_mbc is None else segment.train_cardiac_mbc
         groups = {"canonical": self.model.canonical, "film": self.model.film_encoder, "respiratory_mbc": self.model.respiratory_mbc, "cardiac_mbc": self.model.cardiac_mbc, "uncertainty": self.model.uncertainty}
-        enabled = contract.trainable_modules
+        enabled: set[str] = set()
+        if train_canonical:
+            enabled.add("canonical")
+        if film_train_mode != "none":
+            enabled.add("film")
+        if train_respiratory_mbc:
+            enabled.add("respiratory_mbc")
+        if train_cardiac_mbc:
+            enabled.add("cardiac_mbc")
+        if contract.enable_uncertainty:
+            enabled.add("uncertainty")
         for name, module in groups.items():
             for parameter in module.parameters():
-                parameter.requires_grad_(name in enabled and (name != "canonical" or train_canonical))
-        if contract.film_train_mode == "card_head_only":
+                parameter.requires_grad_(name in enabled)
+        if film_train_mode == "card_head_only":
             # Stage3a intentionally leaves the Stage2c shared FiLM/respiratory
             # representation immutable while its cardiac output head warms up.
             for parameter in self.model.film_encoder.parameters():
@@ -70,7 +83,7 @@ class UnifiedProgressiveTrainer:
                 parameter.requires_grad_(True)
         for index, level in enumerate(self.model.respiratory_mbc.levels):
             for parameter in level.parameters():
-                parameter.requires_grad_(contract.train_respiratory_mbc and index < contract.active_respiratory_levels)
+                parameter.requires_grad_(train_respiratory_mbc and index < contract.active_respiratory_levels)
         self.model.respiratory_mbc.set_active_levels(contract.active_respiratory_levels)
         stage_key = segment.optimizer_key if segment is not None else ("stage2" if stage.startswith("stage2") else stage)
         aliases = {"canonical": "canonical_lr", "film": "film_lr", "respiratory_mbc": "respiratory_mbc_lr", "cardiac_mbc": "cardiac_mbc_lr", "uncertainty": "uncertainty_lr"}

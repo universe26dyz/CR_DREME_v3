@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from cardioresp4d.frequency.training_prior import load_training_frequency_prior  # noqa: E402
 from cardioresp4d.training.model import SourceFirstDynamicModel  # noqa: E402
 from cardioresp4d.training.sampler import DynamicObservation, ViewLocationBalancedSampler  # noqa: E402
+from cardioresp4d.training.stage_contract import paperaligned_segment  # noqa: E402
 from cardioresp4d.training.trainer import UnifiedProgressiveTrainer  # noqa: E402
 import cardioresp4d.training.trainer as trainer_module  # noqa: E402
 
@@ -122,6 +123,19 @@ class Change4FrequencyPriorTest(unittest.TestCase):
         self.assertEqual(1, len(captured[0]))
         self.assertAlmostEqual(.233918 - .116959 / 2., captured[0][0][0], places=12)
         self.assertAlmostEqual(.233918 + .116959 / 2., captured[0][0][1], places=12)
+
+    def test_paperaligned_s3a_eq8_has_gradient_to_respiratory_score_encoder(self) -> None:
+        prior = _prior()
+        sequence = [_observation(index, timestamp) for index, timestamp in enumerate((0., .4, .9))]
+        sampler_rows = sequence + [_observation(0, 0., view="2CH"), _observation(1, .4, view="4CH")]
+        trainer = UnifiedProgressiveTrainer(_model(), ViewLocationBalancedSampler(sampler_rows), pixel_samples=1, frequency_prior=prior)
+        trainer.sampler.temporal_batch = lambda **_: sequence  # type: ignore[method-assign]
+        trainer._configure_stage("stage3a", segment=paperaligned_segment("s3a"))
+        eq8 = trainer._temporal_components("stage3a")["cardiac_leakage_in_resp"]
+        self.assertTrue(torch.isfinite(eq8))
+        eq8.backward()
+        self.assertTrue(any(parameter.grad is not None and torch.isfinite(parameter.grad).all() and parameter.grad.abs().sum() > 0 for parameter in trainer.model.film_encoder.resp.parameters()))
+        self.assertTrue(all(parameter.grad is None for parameter in trainer.model.canonical.parameters()))
 
 
 if __name__ == "__main__":

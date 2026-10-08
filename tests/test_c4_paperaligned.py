@@ -40,7 +40,7 @@ class _Model(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.canonical = torch.nn.Linear(1, 1); self.film_encoder = torch.nn.Module()
-        self.film_encoder.shared = torch.nn.Linear(1, 1); self.film_encoder.card = torch.nn.Linear(1, 1)
+        self.film_encoder.shared = torch.nn.Linear(1, 1); self.film_encoder.resp = torch.nn.Linear(1, 1); self.film_encoder.card = torch.nn.Linear(1, 1)
         self.respiratory_mbc = _Resp(); self.cardiac_mbc = torch.nn.Linear(1, 1); self.uncertainty = torch.nn.Linear(1, 1)
 
 
@@ -64,13 +64,44 @@ def test_paperaligned_segments_have_requested_freeze_lr_and_progression() -> Non
         assert all(parameter.requires_grad is canonical for parameter in trainer.model.canonical.parameters())
     trainer._configure_stage("stage3a", segment=paperaligned_segment("s3a"))
     assert not any(parameter.requires_grad for parameter in trainer.model.canonical.parameters())
-    assert all(parameter.requires_grad for parameter in trainer.model.film_encoder.card.parameters())
-    assert not any(parameter.requires_grad for parameter in trainer.model.film_encoder.shared.parameters())
+    assert all(parameter.requires_grad for parameter in trainer.model.film_encoder.parameters())
+    assert all(parameter.requires_grad for parameter in trainer.model.respiratory_mbc.parameters())
+    assert all(parameter.requires_grad for parameter in trainer.model.cardiac_mbc.parameters())
+    assert not any(parameter.requires_grad for parameter in trainer.model.uncertainty.parameters())
     trainer._configure_stage("stage3b", segment=paperaligned_segment("s3b_full"))
     assert all(parameter.requires_grad for parameter in trainer.model.canonical.parameters())
     assert all(parameter.requires_grad for parameter in trainer.model.film_encoder.parameters())
     assert all(parameter.requires_grad for parameter in trainer.model.respiratory_mbc.parameters())
     assert all(parameter.requires_grad for parameter in trainer.model.cardiac_mbc.parameters())
+
+
+def test_regular_stage3a_preserves_card_head_only_semantics() -> None:
+    trainer = _trainer()
+    trainer._configure_stage("stage3a")
+    assert not any(parameter.requires_grad for parameter in trainer.model.canonical.parameters())
+    assert all(parameter.requires_grad for parameter in trainer.model.film_encoder.card.parameters())
+    assert not any(parameter.requires_grad for parameter in trainer.model.film_encoder.shared.parameters())
+    assert not any(parameter.requires_grad for parameter in trainer.model.film_encoder.resp.parameters())
+    assert not any(parameter.requires_grad for parameter in trainer.model.respiratory_mbc.parameters())
+    assert all(parameter.requires_grad for parameter in trainer.model.cardiac_mbc.parameters())
+    assert not any(parameter.requires_grad for parameter in trainer.model.uncertainty.parameters())
+
+
+def test_paperaligned_s3a_trains_full_motion_with_canonical_frozen() -> None:
+    trainer = _trainer()
+    trainer._configure_stage("stage3a", segment=paperaligned_segment("s3a"))
+    assert not any(parameter.requires_grad for parameter in trainer.model.canonical.parameters())
+    assert all(parameter.requires_grad for parameter in trainer.model.film_encoder.parameters())
+    assert all(parameter.requires_grad for parameter in trainer.model.respiratory_mbc.parameters())
+    assert all(parameter.requires_grad for parameter in trainer.model.cardiac_mbc.parameters())
+    assert not any(parameter.requires_grad for parameter in trainer.model.uncertainty.parameters())
+
+
+def test_paperaligned_s3a_all_three_resp_levels_active_and_trainable() -> None:
+    trainer = _trainer()
+    trainer._configure_stage("stage3a", segment=paperaligned_segment("s3a"))
+    assert trainer.model.respiratory_mbc.active == 3
+    assert all(all(parameter.requires_grad for parameter in level.parameters()) for level in trainer.model.respiratory_mbc.levels)
 
 
 def test_sampler_balances_32_observations_and_restores_rotation() -> None:

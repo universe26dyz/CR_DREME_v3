@@ -50,6 +50,13 @@ def _write_manifest(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def prepare_training_output_dir(output_dir: Path, *, resume: bool) -> None:
+    """Create an empty run root without weakening normal overwrite protection."""
+    if output_dir.exists() and not resume and any(output_dir.iterdir()):
+        raise FileExistsError("refusing to overwrite existing output; use --resume after checking its lineage")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-config", type=Path, default=PROJECT_ROOT / "configs" / "source_first_change4_paperaligned.yaml")
@@ -63,9 +70,8 @@ def main() -> None:
     if float(weights.get("cardiac_target_concentration", 0.)) != 0. or float(weights.get("cardiac_pca_waveform", 0.)) != 0.:
         parser.error("formal C4 requires cardiac_target_concentration = cardiac_pca_waveform = 0")
     schedule = segment_schedule()
-    if args.output_dir.exists() and not args.resume and any(args.output_dir.iterdir()):
-        raise FileExistsError("refusing to overwrite existing output; use --resume after checking its lineage")
-    args.output_dir.mkdir(parents=True, exist_ok=True); logs = args.output_dir / "logs"; logs.mkdir(exist_ok=True)
+    prepare_training_output_dir(args.output_dir, resume=args.resume)
+    logs = args.output_dir / "logs"; logs.mkdir(exist_ok=True)
     index, parent = next_unfinished_segment(args.output_dir, schedule)
     if index and not args.resume:
         raise FileExistsError("completed segments exist; use --resume to continue their verified lineage")
