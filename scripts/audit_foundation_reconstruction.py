@@ -18,6 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src")); sys.path.insert(0, str(PROJECT_RO
 from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend
 from cardioresp4d.diagnostics.change5c import choose_representative_indices, stable_diagnostic_seed
 from cardioresp4d.diagnostics.foundation import cardiac_intersection, foundation_predictions, image_metrics, temporal_metrics, temporal_std_map
+from cardioresp4d.diagnostics.stage_visual import finite_array_stats, temporal_maps_and_metrics
 from cardioresp4d.training.build_model import build_source_first_model
 from cardioresp4d.training.runtime_state import checkpoint_compatible_dynamic_frame_count, is_hard_invalid_reason
 from cardioresp4d.training.source_first_config import validate_source_first_config
@@ -52,7 +53,7 @@ def _plot_comparison(path: Path, frames: list[dict], *, view: str, slice_id: str
     figure.tight_layout(); figure.savefig(path, dpi=150); plt.close(figure)
 
 
-def _plot_temporal_std(path: Path, stacks: dict[str, torch.Tensor], *, view: str, slice_id: str) -> None:
+def _plot_temporal_std(path: Path, stacks: dict[str, torch.Tensor], *, view: str, slice_id: str, individual_scale: bool = False) -> None:
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -61,8 +62,9 @@ def _plot_temporal_std(path: Path, stacks: dict[str, torch.Tensor], *, view: str
     maps = {name: temporal_std_map(stacks[name]).numpy() for name in names}
     vmax = max(float(values.max()) for values in maps.values())
     figure, axes = plt.subplots(1, len(names), figsize=(3.4 * len(names), 3.2))
-    for axis, name in zip(axes, names): axis.imshow(maps[name], cmap="magma", vmin=0., vmax=vmax); axis.set_title(name.replace("_", " ")); axis.axis("off")
-    figure.suptitle(f"{view}/{slice_id}: temporal std, shared scale")
+    for axis, name in zip(axes, names):
+        values = maps[name]; axis.imshow(values, cmap="magma", vmin=0., vmax=float(values.max()) if individual_scale else vmax); axis.set_title(f"{name.replace('_', ' ')}\nmean={values.mean():.4g} p95={np.quantile(values,.95):.4g} max={values.max():.4g}" if individual_scale else name.replace("_", " ")); axis.axis("off")
+    figure.suptitle(f"{view}/{slice_id}: temporal std, {'individual' if individual_scale else 'shared'} scale")
     figure.tight_layout(); figure.savefig(path, dpi=150); plt.close(figure)
 
 
@@ -116,6 +118,11 @@ def main() -> None:
             stacks = {name: torch.stack([torch.from_numpy(frame[name]) for frame in frame_payloads]) for name in ("acquired", "canonical_direct", "canonical_psf", "resp_only", "resp_plus_card")}
             assert mask is not None
             temporal = {name: temporal_metrics(stacks["acquired"], values, mask) for name, values in stacks.items()}
+            temporal_arrays = {}
+            for name, values in stacks.items():
+                maps, _ = temporal_maps_and_metrics(stacks["acquired"], values, mask)
+                temporal_arrays[f"{name}_temporal_std"] = maps["predicted_temporal_std"].numpy()
+                temporal_arrays[f"{name}_consecutive_delta"] = maps["predicted_delta"].numpy()
             effect = torch.stack([torch.from_numpy(frame["cardiac_effect"]) for frame in frame_payloads])
             temporal["cardiac_effect"] = {"whole_fov_mean_temporal_amplitude": float(effect.float().std(dim=0, unbiased=False).mean()), "cardiac_intersection_mean_temporal_amplitude": float(effect[:, mask].float().std(dim=0, unbiased=False).mean()) if mask.any() else None}
             safe = f"{view}_{slice_id}"
@@ -131,8 +138,12 @@ def main() -> None:
                 abs_acquired_minus_resp_plus_card=(stacks["acquired"] - stacks["resp_plus_card"]).abs().numpy(),
                 cardiac_intersection=mask.numpy(),
             )
+            np.savez_compressed(args.output_dir / f"{safe}_temporal_std_arrays.npz", cardiac_intersection=mask.numpy(), **{name: values.numpy() for name, values in stacks.items()}, **temporal_arrays)
+            (args.output_dir / f"{safe}_temporal_std_stats.json").write_text(json.dumps({"arrays": {name: finite_array_stats(values) for name, values in stacks.items()}, "temporal": temporal}, indent=2) + "\n", encoding="utf-8")
             _plot_comparison(args.output_dir / f"{safe}_foundation_comparison.png", frame_payloads, view=view, slice_id=slice_id)
             _plot_temporal_std(args.output_dir / f"{safe}_temporal_std.png", stacks, view=view, slice_id=slice_id)
+            _plot_temporal_std(args.output_dir / f"{safe}_temporal_std_shared_scale.png", stacks, view=view, slice_id=slice_id)
+            _plot_temporal_std(args.output_dir / f"{safe}_temporal_std_individual_scale.png", stacks, view=view, slice_id=slice_id, individual_scale=True)
             all_locations.append({"view": view, "slice_id": slice_id, "selected_frames": [{"timestamp_s": frame["timestamp_s"], "dynamic_frame_id": frame["dynamic_frame_id"]} for frame in frame_payloads], "cardiac_intersection_pixels": int(mask.sum()), "per_frame": frame_metrics, "temporal": temporal})
     warning = "Checkpoint is the documented short source-first foundation (Stage2c global_step=400, stage_step=100); this audit reports it without drawing a convergence conclusion." if checkpoint_stage == "stage2c" and int(state.get("global_step", -1)) == 400 else None
     payload = {"status": "read_only_no_optimizer_step", "checkpoint": str(args.checkpoint), "checkpoint_stage": checkpoint_stage, "global_step": state.get("global_step"), "stage_step": state.get("stage_step"), "joint_render_stage": joint_stage, "joint_stage_note": "Stage2c checkpoint has no trained cardiac branch; Resp+Card is reported as Resp-only." if joint_stage == "stage2c" else "Resp+Card uses the checkpoint's Stage3 semantics.", "foundation_warning": warning, "seed": args.seed, "slice_chunk_size": args.slice_chunk_size, "psf_pairing": "Each fixed view/slice temporal comparison uses one shared stable PSF realization; every PSF-bearing branch resets that same seed with chunk iteration inside one RNG context.", "locations": all_locations}

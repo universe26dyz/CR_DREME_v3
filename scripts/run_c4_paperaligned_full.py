@@ -63,11 +63,16 @@ def prepare_training_output_dir(output_dir: Path, *, resume: bool) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
 
+def visual_audit_command(*, source_config: Path, manifest: Path, qc_table: Path, canonical_domain: Path, checkpoint: Path, segment: str, output_dir: Path, device: str, seed: int) -> list[str]:
+    """Build an optional post-checkpoint read-only audit in a fresh process."""
+    return [sys.executable, "scripts/export_stage_visual_audit.py", "--source-config", str(source_config), "--manifest", str(manifest), "--qc-table", str(qc_table), "--canonical-domain", str(canonical_domain), "--checkpoint", f"{segment}={checkpoint}", "--output-dir", str(output_dir), "--device", device, "--seed", str(seed), "--slice-chunk-size", "1024"]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-config", type=Path, default=PROJECT_ROOT / "configs" / "source_first_change4_paperaligned.yaml")
     parser.add_argument("--frequency-bands", type=Path, required=True); parser.add_argument("--manifest", type=Path, required=True); parser.add_argument("--qc-table", type=Path, required=True); parser.add_argument("--canonical-domain", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=Path("/data/dengyz/dataset/CR_DREME_v3/v1_change4_paperaligned_full")); parser.add_argument("--device", default="cuda"); parser.add_argument("--pixel-samples", type=int, default=256); parser.add_argument("--seed", type=int, default=0); parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--output-dir", type=Path, default=Path("/data/dengyz/dataset/CR_DREME_v3/v1_change4_paperaligned_full")); parser.add_argument("--device", default="cuda"); parser.add_argument("--pixel-samples", type=int, default=256); parser.add_argument("--seed", type=int, default=0); parser.add_argument("--resume", action="store_true"); parser.add_argument("--visual-audit-output-dir", type=Path, help="Optional read-only major-stage audit root; failures are recorded and training continues")
     args = parser.parse_args()
     for path in (args.source_config, args.frequency_bands, args.manifest, args.qc_table, args.canonical_domain):
         if not path.is_file(): parser.error(f"required input is missing: {path}")
@@ -108,6 +113,18 @@ def main() -> None:
         if not parent.is_file(): raise RuntimeError(f"segment did not produce a checkpoint: {parent}")
         run_manifest["completed"].append({"segment": segment_name, "checkpoint": str(parent), "runtime_seconds": time.monotonic() - started, "status": "completed"})
         _write_manifest(manifest_path, run_manifest)
+        if args.visual_audit_output_dir is not None and segment_name in {"s1a", "s1b", "s2a_joint", "s2b_joint", "s2c_joint", "s3a", "s3b_full"}:
+            audit_root = args.visual_audit_output_dir
+            audit_log = logs / f"{directory_name}.visual_audit.log"
+            audit = {"segment": segment_name, "checkpoint": str(parent), "output_dir": str(audit_root), "log_path": str(audit_log)}
+            try:
+                with audit_log.open("w", encoding="utf-8") as log:
+                    subprocess.run(visual_audit_command(source_config=args.source_config, manifest=args.manifest, qc_table=args.qc_table, canonical_domain=args.canonical_domain, checkpoint=parent, segment=segment_name, output_dir=audit_root, device=args.device, seed=args.seed), cwd=PROJECT_ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)
+                audit["status"] = "completed"
+            except subprocess.CalledProcessError as error:
+                audit.update({"status": "failed", "returncode": error.returncode})
+                print(json.dumps({"visual_audit": "failed", "segment": segment_name, "log": str(audit_log)}, separators=(",", ":")))
+            run_manifest.setdefault("visual_audits", []).append(audit); _write_manifest(manifest_path, run_manifest)
         print(json.dumps({"segment": segment_name, "checkpoint": str(parent)}, separators=(",", ":")))
     run_manifest["status"] = "completed"; _write_manifest(manifest_path, run_manifest)
 

@@ -60,3 +60,10 @@ def test_launcher_child_failure_marks_manifest_failed(tmp_path: Path) -> None:
     assert payload["failed_segment"] == "s2a_init"
     assert payload["returncode"] == 17
     assert payload["log_path"].endswith("s2a_init_1850.log")
+
+
+def test_optional_visual_audit_command_is_read_only_stage_end_invocation(tmp_path: Path) -> None:
+    command = launcher.visual_audit_command(source_config=tmp_path / "config.yaml", manifest=tmp_path / "manifest.csv", qc_table=tmp_path / "qc.csv", canonical_domain=tmp_path / "domain.json", checkpoint=tmp_path / "source_first_last.pt", segment="s3b_full", output_dir=tmp_path / "audit", device="cuda", seed=4)
+    assert command[1] == "scripts/export_stage_visual_audit.py"
+    assert "s3b_full=" + str(tmp_path / "source_first_last.pt") in command
+    assert "--slice-chunk-size" in command
