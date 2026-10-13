@@ -185,7 +185,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     domain = _load_domain(args.canonical_domain); motion = GroundTruthMotion.from_domain(domain, respiratory_frequency_hz=float(synthetic["respiratory_frequency_hz"]), cardiac_frequency_hz=float(synthetic["cardiac_frequency_hz"]), respiratory_amplitude_mm=float(synthetic["respiratory_amplitude_mm"]), cardiac_amplitude_mm=float(synthetic["cardiac_amplitude_mm"]))
     image_shape = tuple(synthetic["image_shape"])
     frames = geometry_from_manifest(args.manifest, args.qc_table, locations_per_view=args.locations_per_view, frames_per_location=args.frames_per_location, device=device) if args.manifest else fallback_geometry(locations_per_view=args.locations_per_view, frames_per_location=args.frames_per_location, image_shape=image_shape, motion=motion, device=device)
-    phantom = AnalyticCanonicalPhantom(domain); observations = _build_observations(frames, image_shape=image_shape, phantom=phantom, motion=motion, psf_samples=int(synthetic["psf_samples"]), seed=args.seed)
+    phantom = AnalyticCanonicalPhantom(domain).to(device); observations = _build_observations(frames, image_shape=image_shape, phantom=phantom, motion=motion, psf_samples=int(synthetic["psf_samples"]), seed=args.seed)
     preflight = preflight_observations(observations, motion)
     if not preflight["valid"]: raise ValueError(f"synthetic geometry preflight failed: {preflight}")
     prior = build_synthetic_frequency_prior(motion.respiratory_frequency_hz, motion.cardiac_frequency_hz, {(item.view, item.slice_id) for item in observations})

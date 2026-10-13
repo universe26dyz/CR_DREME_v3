@@ -66,9 +66,18 @@ def render_synthetic_observation(frame: GeometryFrame, *, height: int, width: in
     adapter = NeSVoRPSFAdapter(psf_samples)
     canonical = PhantomCanonicalAdapter(phantom)
     timestamp = points.new_tensor([frame.timestamp_s])
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(seed)
-        rendered = adapter(canonical, points, torch.tensor([frame.pixel_spacing_mm[1], frame.pixel_spacing_mm[0], frame.slice_thickness_mm], dtype=points.dtype).expand(points.shape[0], 3), row_direction=frame.row_direction.expand(points.shape[0], -1), column_direction=frame.column_direction.expand(points.shape[0], -1), normal=frame.normal.expand(points.shape[0], -1), motion=lambda values: {"reference_points_mm": motion.pullback_reference_mm(values, timestamp)})
+    spacing = frame.pixel_spacing_mm.to(points)
+    resolution = torch.stack((spacing[1], spacing[0], points.new_tensor(frame.slice_thickness_mm))).expand(points.shape[0], 3)
+    axes = {"row_direction": frame.row_direction.to(points).expand(points.shape[0], -1), "column_direction": frame.column_direction.to(points).expand(points.shape[0], -1), "normal": frame.normal.to(points).expand(points.shape[0], -1)}
+    cuda_devices = [points.device.index if points.device.index is not None else 0] if points.is_cuda else []
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.random.default_generator.manual_seed(seed)
+        if points.is_cuda:
+            with torch.cuda.device(points.device):
+                torch.cuda.manual_seed(seed)
+                rendered = adapter(canonical, points, resolution, **axes, motion=lambda values: {"reference_points_mm": motion.pullback_reference_mm(values, timestamp)})
+        else:
+            rendered = adapter(canonical, points, resolution, **axes, motion=lambda values: {"reference_points_mm": motion.pullback_reference_mm(values, timestamp)})
     intensity = rendered["predicted_intensity"]
     # The fixed analytic callable preserves NeSVoR's explicit sample axis;
     # average that axis here exactly as a PSF-integrated acquisition does.

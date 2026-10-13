@@ -34,6 +34,9 @@ class AnalyticCanonicalPhantom(nn.Module):
 
     @torch.no_grad()
     def volume(self, lower_mm: torch.Tensor, upper_mm: torch.Tensor, shape: tuple[int, int, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        axes = [torch.linspace(float(lower_mm[index]), float(upper_mm[index]), shape[index]) for index in range(3)]
+        device, dtype = self.domain_center_mm.device, self.domain_center_mm.dtype
+        lower = torch.as_tensor(lower_mm, device=device, dtype=dtype)
+        upper = torch.as_tensor(upper_mm, device=device, dtype=dtype)
+        axes = [torch.linspace(lower[index], upper[index], shape[index], device=device, dtype=dtype) for index in range(3)]
         grid = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1)
-        return tuple(axis.numpy() for axis in axes) + (self(grid).squeeze(-1).cpu().numpy(),)
+        return tuple(axis.detach().cpu().numpy() for axis in axes) + (self(grid).squeeze(-1).detach().cpu().numpy(),)
