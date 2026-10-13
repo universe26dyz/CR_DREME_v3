@@ -1,0 +1,11 @@
+synthetic:
+  image_shape: [32, 32]
+  psf_samples: 8
+  respiratory_frequency_hz: 0.25
+  cardiac_frequency_hz: 1.10
+  respiratory_amplitude_mm: 6.0
+  cardiac_amplitude_mm: 3.5
+training:
+  motion_only_steps: 3000
+  full_joint_steps: 5000
+  pixel_samples: 256
