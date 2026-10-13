@@ -6,17 +6,30 @@ from torch import nn
 
 
 class AnalyticCanonicalPhantom(nn.Module):
-    """Continuous asymmetric world-mm phantom with thoracic and cardiac detail."""
+    """Continuous asymmetric phantom expressed relative to the supplied domain."""
+
+    def __init__(self, domain: dict[str, object] | None = None) -> None:
+        super().__init__()
+        domain = domain or {"world_min_mm": [-64., -64., -64.], "world_max_mm": [64., 64., 64.], "cardiac_box": {"min_mm": [-24., -24., -28.], "max_mm": [32., 24., 30.]}}
+        lower, upper = torch.tensor(domain["world_min_mm"], dtype=torch.float32), torch.tensor(domain["world_max_mm"], dtype=torch.float32)
+        cardiac = domain["cardiac_box"]
+        self.register_buffer("domain_center_mm", (lower + upper) / 2.0)
+        self.register_buffer("domain_half_extent_mm", (upper - lower) / 2.0)
+        self.register_buffer("cardiac_center_mm", (torch.tensor(cardiac["min_mm"], dtype=torch.float32) + torch.tensor(cardiac["max_mm"], dtype=torch.float32)) / 2.0)
+        self.register_buffer("cardiac_half_extent_mm", (torch.tensor(cardiac["max_mm"], dtype=torch.float32) - torch.tensor(cardiac["min_mm"], dtype=torch.float32)) / 2.0)
 
     def forward(self, points_mm: torch.Tensor) -> torch.Tensor:
         if points_mm.shape[-1] != 3:
             raise ValueError("points_mm must end in xyz")
-        x, y, z = points_mm.unbind(-1)
-        thorax = 0.22 * torch.exp(-((x / 48.0).square() + ((y + 4.0) / 35.0).square() + (z / 58.0).square()))
-        heart = 0.46 * torch.exp(-(((x - 7.0) / 18.0).square() + ((y + 5.0) / 15.0).square() + ((z - 3.0) / 20.0).square()))
-        oblique = 0.33 * torch.exp(-(((x + 18.0 + .35 * z) / 9.0).square() + ((y - 12.0 - .2 * x) / 7.0).square() + ((z + 10.0) / 15.0).square()))
-        vessel = 0.28 * torch.exp(-(((x - 14.0) / 4.0).square() + ((y - 11.0) / 5.0).square() + ((z + 7.0) / 29.0).square()))
-        texture = 0.12 * torch.sin(.23 * x + .11 * y - .17 * z) * torch.exp(-((x / 42.0).square() + (y / 34.0).square() + (z / 50.0).square()))
+        domain = (points_mm - self.domain_center_mm) / self.domain_half_extent_mm
+        cardiac = (points_mm - self.cardiac_center_mm) / self.cardiac_half_extent_mm
+        x, y, z = domain.unbind(-1)
+        cx, cy, cz = cardiac.unbind(-1)
+        thorax = 0.22 * torch.exp(-((x / .75).square() + ((y + .08) / .58).square() + (z / .82).square()))
+        heart = 0.46 * torch.exp(-((cx / .72).square() + ((cy + .12) / .70).square() + ((cz - .08) / .75).square()))
+        oblique = 0.33 * torch.exp(-(((x + .30 + .35 * z) / .16).square() + ((y - .22 - .2 * x) / .12).square() + ((z + .18) / .22).square()))
+        vessel = 0.28 * torch.exp(-(((cx - .30) / .18).square() + ((cy + .20) / .22).square() + ((cz + .12) / .90).square()))
+        texture = 0.12 * torch.sin(8.0 * x + 5.0 * y - 6.0 * z) * torch.exp(-((x / .70).square() + (y / .62).square() + (z / .78).square()))
         return (0.08 + thorax + heart + oblique + vessel + texture).clamp(0.0, 1.0).unsqueeze(-1)
 
     @torch.no_grad()

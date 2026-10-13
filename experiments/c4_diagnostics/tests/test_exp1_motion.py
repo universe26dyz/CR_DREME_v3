@@ -1,7 +1,7 @@
 import torch
 
 from cardioresp4d.models.cardioresp_motion import SequentialPullbackMotion
-from experiments.c4_diagnostics.synthetic.metrics import dominant_frequency_hz
+from experiments.c4_diagnostics.synthetic.metrics import location_spectral_metrics
 from experiments.c4_diagnostics.synthetic.motion import GroundTruthMotion
 
 
@@ -10,7 +10,7 @@ def test_known_respiratory_sinusoid_has_configured_dominant_frequency() -> None:
     motion = GroundTruthMotion(respiratory_frequency_hz=0.25, cardiac_frequency_hz=1.10)
     timestamps = torch.arange(0.0, 40.0, 0.05)
 
-    peak_hz = dominant_frequency_hz(motion.respiratory_score(timestamps), timestamps)
+    peak_hz = location_spectral_metrics(motion.respiratory_score(timestamps)[:, None], timestamps, [(0.22, 0.28)])["dominant_frequency_hz"]
 
     assert abs(peak_hz - 0.25) < 0.03
 

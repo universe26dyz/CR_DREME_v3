@@ -6,6 +6,11 @@ synthetic:
   respiratory_amplitude_mm: 6.0
   cardiac_amplitude_mm: 3.5
 training:
-  motion_only_steps: 3000
-  full_joint_steps: 5000
   pixel_samples: 256
+classification:
+  min_correct_band_fraction: 0.50
+  min_dynamic_rms_ratio: 0.15
+  max_dynamic_rms_ratio: 4.00
+  min_dynamic_cosine: 0.20
+  max_endpoint_error_mm: 10.0
+  static_collapse_ratio: 0.10

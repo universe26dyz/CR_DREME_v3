@@ -42,6 +42,15 @@ class GeometryFrame:
     pixel_spacing_mm: torch.Tensor
     slice_thickness_mm: float
     timestamp_s: float
+    original_rows: int
+    original_columns: int
+
+
+def rescale_frame_for_rendering(frame: GeometryFrame, *, height: int, width: int) -> GeometryFrame:
+    if min(height, width) < 2 or min(frame.original_rows, frame.original_columns) < 2:
+        raise ValueError("source and rendered image dimensions must be at least two")
+    scale = frame.pixel_spacing_mm.new_tensor([(frame.original_rows - 1) / (height - 1), (frame.original_columns - 1) / (width - 1)])
+    return GeometryFrame(frame.view, frame.slice_id, frame.center_mm, frame.row_direction, frame.column_direction, frame.normal, frame.pixel_spacing_mm * scale, frame.slice_thickness_mm, frame.timestamp_s, frame.original_rows, frame.original_columns)
 
 
 def pixel_centers(frame: GeometryFrame, height: int, width: int) -> torch.Tensor:
@@ -52,6 +61,7 @@ def pixel_centers(frame: GeometryFrame, height: int, width: int) -> torch.Tensor
 
 
 def render_synthetic_observation(frame: GeometryFrame, *, height: int, width: int, phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, psf_samples: int, seed: int, dynamic_frame_id: int) -> DynamicObservation:
+    frame = rescale_frame_for_rendering(frame, height=height, width=width)
     points = pixel_centers(frame, height, width)
     adapter = NeSVoRPSFAdapter(psf_samples)
     canonical = PhantomCanonicalAdapter(phantom)
