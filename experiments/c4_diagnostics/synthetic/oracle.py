@@ -152,10 +152,12 @@ def _grid(lower: torch.Tensor, upper: torch.Tensor, shape: tuple[int, int, int])
 
 class DirectMBCFit:
     """Direct mm-DVF fit at a +1 analytic phase; only one MBC branch is mutable."""
-    def __init__(self, model: OracleMBCMotionModel, motion: GroundTruthMotion, *, branch: str, grid_shape: tuple[int, int, int], lr: float, score_scales: OracleScoreScales | None = None) -> None:
+    def __init__(self, model: OracleMBCMotionModel, motion: GroundTruthMotion, *, branch: str, grid_shape: tuple[int, int, int], lr: float, normalization_weight: float, score_scales: OracleScoreScales | None = None) -> None:
         if branch not in {"resp", "card"}:
             raise ValueError("direct fit branch must be resp or card")
-        self.model, self.motion, self.branch = model, motion, branch
+        if normalization_weight < 0:
+            raise ValueError("normalization_weight must be non-negative")
+        self.model, self.motion, self.branch, self.normalization_weight = model, motion, branch, float(normalization_weight)
         model.configure_trainable(branch)
         lower, upper = (model.lower_world_mm, model.upper_world_mm) if branch == "resp" else (model.cardiac_lower_world_mm, model.cardiac_upper_world_mm)
         self.points = _grid(lower, upper, grid_shape)
@@ -177,9 +179,14 @@ class DirectMBCFit:
             return ScoreWeightedMBCField(self.model.respiratory_mbc, scores)(self.points)
         return ScoreWeightedMBCField(self.model.cardiac_mbc, self.score_scales.cardiac_component_rms_mm.to(self.points)[None, None])(self.points)
 
+    def loss_terms(self) -> dict[str, torch.Tensor]:
+        data_loss = (self.predicted() - self._target()).square().mean()
+        normalization = self.model.normalization(self.branch)
+        return {"data_loss": data_loss, "mbc_normalization": normalization, "loss": data_loss + self.normalization_weight * normalization}
+
     def step(self) -> float:
         self.optimizer.zero_grad(set_to_none=True)
-        loss = (self.predicted() - self._target()).square().mean() + 1e-4 * self.model.normalization(self.branch)
+        loss = self.loss_terms()["loss"]
         loss.backward(); self.optimizer.step()
         return float(loss.detach())
 
@@ -189,4 +196,4 @@ class DirectMBCFit:
             error = (prediction - target).square().sum(-1).sqrt()
             cosine = (prediction * target).sum() / (prediction.norm() * target.norm()).clamp_min(1e-12)
             gt_rms = target.square().mean().sqrt()
-            return {"epe_mm": float(error.mean()), "gt_rms_mm": float(gt_rms), "normalized_epe": float(error.mean() / gt_rms.clamp_min(1e-12)), "spatial_cosine": float(cosine), "rms_ratio": float(prediction.square().mean().sqrt() / gt_rms.clamp_min(1e-12)), "max_error_mm": float(error.max()), "mbc_normalization": float(self.model.normalization(self.branch))}
+            return {"epe_mm": float(error.mean()), "gt_rms_mm": float(gt_rms), "normalized_epe": float(error.mean() / gt_rms.clamp_min(1e-12)), "spatial_cosine": float(cosine), "rms_ratio": float(prediction.square().mean().sqrt() / gt_rms.clamp_min(1e-12)), "max_error_mm": float(error.max()), "mbc_normalization": float(self.model.normalization(self.branch)), "mbc_normalization_weight": self.normalization_weight}

@@ -23,9 +23,14 @@ from experiments.c4_diagnostics.synthetic.oracle import (
 from experiments.c4_diagnostics.synthetic.phantom import AnalyticCanonicalPhantom
 from experiments.c4_diagnostics.synthetic.render import GeometryFrame, render_synthetic_observation
 from experiments.c4_diagnostics.exp1b_observability_oracle import (
+    _aggregate_by_amplitude_scale,
+    _cardiac_support_mask,
     _direct_recovery_label,
     _normalization_grid_shapes,
+    _oracle_optimizer,
+    _oracle_render,
     _observability_label,
+    _roi_mse,
     run,
 )
 
@@ -142,13 +147,63 @@ def test_oracle_only_trains_selected_mbc_and_keeps_canonical_frozen() -> None:
 def test_direct_fit_updates_only_selected_mbc() -> None:
     domain = _domain()
     model = build_oracle_motion_model(domain, AnalyticCanonicalPhantom(domain), device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1, normalization_grid_shapes=((3, 3, 3), (3, 3, 3)))
-    fitter = DirectMBCFit(model, GroundTruthMotion.from_domain(domain), branch="resp", grid_shape=(3, 3, 3), lr=1e-3)
+    fitter = DirectMBCFit(model, GroundTruthMotion.from_domain(domain), branch="resp", grid_shape=(3, 3, 3), lr=1e-3, normalization_weight=1e-2)
     before_card = [value.detach().clone() for value in model.cardiac_mbc.parameters()]
     before_resp = [value.detach().clone() for value in model.respiratory_mbc.parameters()]
     loss = fitter.step()
     assert math.isfinite(loss)
     assert all(torch.equal(before, after) for before, after in zip(before_card, model.cardiac_mbc.parameters()))
     assert any(not torch.equal(before, after) for before, after in zip(before_resp, model.respiratory_mbc.parameters()))
+
+
+def test_same_motion_different_psf_seed_has_self_noise_but_same_seed_is_deterministic() -> None:
+    domain, motion = _domain(), GroundTruthMotion.from_domain(_domain())
+    phantom = AnalyticCanonicalPhantom(domain)
+    first = render_synthetic_observation(_frame(.4), height=8, width=8, phantom=phantom, motion=motion, psf_samples=1, seed=10, dynamic_frame_id=0)
+    same = render_synthetic_observation(_frame(.4), height=8, width=8, phantom=phantom, motion=motion, psf_samples=1, seed=10, dynamic_frame_id=0)
+    different = render_synthetic_observation(_frame(.4), height=8, width=8, phantom=phantom, motion=motion, psf_samples=1, seed=11, dynamic_frame_id=0)
+    assert torch.equal(first.image, same.image)
+    assert (first.image - different.image).square().mean() > 0.0
+
+
+def test_matched_crn_reuses_target_psf_and_stochastic_redraws_samples() -> None:
+    domain = _domain(); phantom = AnalyticCanonicalPhantom(domain)
+    motion = GroundTruthMotion.from_domain(domain, respiratory_amplitude_mm=0.0, cardiac_amplitude_mm=0.0)
+    target = render_synthetic_observation(_frame(.4), height=8, width=8, phantom=phantom, motion=motion, psf_samples=1, seed=13, dynamic_frame_id=0)
+    model = build_oracle_motion_model(domain, phantom, device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1, normalization_grid_shapes=((3, 3, 3), (3, 3, 3)))
+    uv = torch.stack(torch.meshgrid(torch.arange(8), torch.arange(8), indexing="xy"), dim=-1).reshape(-1, 2).float()
+    matched = _oracle_render(model, target, {}, "zero", uv, psf_training_mode="matched_crn", target_seed=13).reshape_as(target.image[0])
+    stochastic_a = _oracle_render(model, target, {}, "zero", uv, psf_training_mode="stochastic", target_seed=13)
+    stochastic_b = _oracle_render(model, target, {}, "zero", uv, psf_training_mode="stochastic", target_seed=13)
+    assert torch.allclose(matched, target.image[0], atol=1e-6, rtol=0.0)
+    assert not torch.equal(stochastic_a, stochastic_b)
+
+
+def test_cardiac_roi_mse_is_not_diluted_by_whole_fov() -> None:
+    predicted = torch.zeros(1, 1, 8, 8); target = predicted.clone(); target[..., 3:5, 3:5] = 1.0
+    mask = torch.zeros_like(target, dtype=torch.bool); mask[..., 3:5, 3:5] = True
+    assert _roi_mse(predicted, target, mask) > (predicted - target).square().mean()
+
+
+def test_amplitude_scale_aggregates_are_separate() -> None:
+    rows = {"a|scale=0": {"amplitude_scale": 0.0, "metric": 1.0}, "b|scale=0": {"amplitude_scale": 0.0, "metric": 3.0}, "a|scale=1": {"amplitude_scale": 1.0, "metric": 9.0}}
+    aggregate = _aggregate_by_amplitude_scale(rows)
+    assert aggregate["0"]["metric"]["median"] == 2.0
+    assert aggregate["1"]["metric"]["median"] == 9.0
+
+
+def test_direct_mbc_fit_uses_supplied_normalization_weight() -> None:
+    domain = _domain(); model = build_oracle_motion_model(domain, AnalyticCanonicalPhantom(domain), device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1, normalization_grid_shapes=((3, 3, 3), (3, 3, 3)))
+    fitter = DirectMBCFit(model, GroundTruthMotion.from_domain(domain), branch="resp", grid_shape=(3, 3, 3), lr=1e-3, normalization_weight=.37)
+    terms = fitter.loss_terms()
+    assert float(terms["loss"].detach()) == pytest.approx(float((terms["data_loss"] + .37 * terms["mbc_normalization"]).detach()))
+
+
+def test_combined_oracle_optimizer_keeps_resp_and_card_learning_rates_separate() -> None:
+    domain = _domain(); model = build_oracle_motion_model(domain, AnalyticCanonicalPhantom(domain), device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1, normalization_grid_shapes=((3, 3, 3), (3, 3, 3)))
+    config = {"training": {"optimizer": {"stage2": {"respiratory_mbc_lr": 1e-3}, "stage3a": {"cardiac_mbc_lr": 2e-3}, "stage3b": {"respiratory_mbc_lr": 3e-3, "cardiac_mbc_lr": 4e-3}}}}
+    optimizer = _oracle_optimizer(model, "combined", config)
+    assert sorted(group["lr"] for group in optimizer.param_groups) == [3e-3, 4e-3]
 
 
 def test_cpu_tiny_smoke_covers_observability_direct_and_oracle(tmp_path: Path) -> None:
@@ -160,7 +215,7 @@ def test_cpu_tiny_smoke_covers_observability_direct_and_oracle(tmp_path: Path) -
             manifest=None, qc_table=None, canonical_domain=None, mode=mode, output_dir=output,
             device="cpu", overwrite=False, smoke=True, locations_per_view=1,
             frames_per_location=3, steps=1, pixel_samples=4, observations_per_update=1,
-            amplitude_scales=[1.0], seed=7,
+            amplitude_scales=[1.0], psf_training_mode="stochastic", seed=7,
         )
     observed = run(arguments("observability", tmp_path / "observability"))
     direct = run(arguments("direct_mbc", tmp_path / "direct"))
