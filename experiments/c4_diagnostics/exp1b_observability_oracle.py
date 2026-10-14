@@ -11,8 +11,12 @@ import csv
 import json
 import math
 import shutil
+import sys
 from dataclasses import replace
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path[:0] = [str(PROJECT_ROOT), str(PROJECT_ROOT / "src")]
 
 import numpy as np
 import torch
@@ -27,12 +31,9 @@ from experiments.c4_diagnostics.exp1_synthetic_gt_recovery import (
 from experiments.c4_diagnostics.synthetic.metrics import aggregate_location_metrics, dvf_metrics, location_spectral_metrics
 from experiments.c4_diagnostics.synthetic.motion import GroundTruthMotion
 from experiments.c4_diagnostics.synthetic.observability import image_sequence_metrics, normalized_cross_correlation
-from experiments.c4_diagnostics.synthetic.oracle import DirectMBCFit, OracleScoreGenerator, build_oracle_motion_model
+from experiments.c4_diagnostics.synthetic.oracle import DirectMBCFit, OracleScoreGenerator, OracleScoreScales, build_oracle_motion_model, derive_oracle_score_scales
 from experiments.c4_diagnostics.synthetic.phantom import AnalyticCanonicalPhantom
 from experiments.c4_diagnostics.synthetic.render import GeometryFrame, pixel_centers, rescale_frame_for_rendering, render_synthetic_observation
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _prepare_output(path: Path, overwrite: bool) -> None:
@@ -105,6 +106,15 @@ def observability_audit(observations: list, frames: list[GeometryFrame], *, imag
             values["resp_only_vs_gt_mse_gap"] = values["resp_only_gt_per_frame_mse"] - gt_mse
             values["card_only_vs_gt_mse_gap"] = values["card_only_gt_per_frame_mse"] - gt_mse
             values["zero_motion_observability_fraction"] = (zero_mse - gt_mse) / max(zero_mse, 1e-12)
+            target_variance = float(target[:, 0].var(dim=0, unbiased=False).mean())
+            target_delta = target[1:] - target[:-1]
+            zero_prediction = arrays[f"observability_{scale:g}_{location.replace('/', '_')}_zero_motion"]
+            zero_prediction_tensor = torch.from_numpy(zero_prediction).to(target)
+            delta_error = float(((zero_prediction_tensor[1:] - zero_prediction_tensor[:-1] - target_delta).square().mean().sqrt()))
+            target_delta_rms = float(target_delta.square().mean().sqrt())
+            values["target_temporal_variance_mean"] = target_variance
+            values["zero_motion_mse_over_target_temporal_variance"] = zero_mse / max(target_variance, 1e-12)
+            values["zero_motion_delta_error_over_gt_delta_rms"] = delta_error / max(target_delta_rms, 1e-12)
             rows[f"{location}|scale={scale:g}"] = values
     return rows, arrays
 
@@ -116,13 +126,21 @@ def _source_mbc_shapes(config: dict[str, object], smoke: bool) -> tuple[int, tup
     return int(model["respiratory_mbc"]["hidden_dim"]), tuple(tuple(int(x) for x in shape) for shape in model["respiratory_mbc"]["logical_control_shapes"]), tuple(int(x) for x in model["cardiac_mbc"]["logical_control_shape"]), int(model["psf"]["n_samples"])
 
 
-def _direct_fit(domain: dict[str, object], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, config: dict[str, object], *, device: torch.device, steps: int, smoke: bool) -> dict[str, dict[str, float]]:
+def _normalization_grid_shapes(config: dict[str, object], smoke: bool) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    if smoke:
+        return (3, 3, 3), (3, 3, 3)
+    regularization = config["training"]["motion_regularization"]
+    return tuple(int(value) for value in regularization["respiratory_evaluation_grid"]["shape"]), tuple(int(value) for value in regularization["cardiac_evaluation_grid"]["shape"])
+
+
+def _direct_fit(domain: dict[str, object], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, config: dict[str, object], score_scales: OracleScoreScales, *, device: torch.device, steps: int, smoke: bool) -> dict[str, dict[str, float]]:
     hidden, resp_shapes, card_shape, psf_samples = _source_mbc_shapes(config, smoke)
+    normalization_grid_shapes = _normalization_grid_shapes(config, smoke)
     lr = float(config["training"]["optimizer"]["stage2"]["respiratory_mbc_lr"])
     output: dict[str, dict[str, float]] = {}
     for branch in ("resp", "card"):
-        model = build_oracle_motion_model(domain, phantom, device=device, active_respiratory_levels=3, hidden_dim=hidden, respiratory_shapes=resp_shapes, cardiac_shape=card_shape, psf_samples=psf_samples)
-        fitter = DirectMBCFit(model, motion, branch=branch, grid_shape=(3, 3, 3) if smoke else (12, 12, 12), lr=lr)
+        model = build_oracle_motion_model(domain, phantom, device=device, active_respiratory_levels=3, hidden_dim=hidden, respiratory_shapes=resp_shapes, cardiac_shape=card_shape, psf_samples=psf_samples, normalization_grid_shapes=normalization_grid_shapes)
+        fitter = DirectMBCFit(model, motion, branch=branch, grid_shape=(3, 3, 3) if smoke else normalization_grid_shapes[0 if branch == "resp" else 1], lr=lr, score_scales=score_scales)
         for _ in range(steps):
             fitter.step()
         output[branch] = fitter.metrics()
@@ -156,7 +174,9 @@ def _oracle_evaluation(model, observations: list, motion: GroundTruthMotion, gen
             pred_dvf.append(model.motion(scores, branch)(grid)["reference_points_mm"] - grid)
             gt_dvf.append(_motion_for_branch(motion, branch).pullback_reference_mm(grid, timestamp) - grid)
             ts.append(observation.timestamp_s)
-        values = {**{f"dvf_{key}": value for key, value in dvf_metrics(torch.cat(pred_dvf), torch.cat(gt_dvf)).items()}, **image_sequence_metrics(torch.stack(predicted_images), torch.stack(target_images))}
+        dvf_values = dvf_metrics(torch.cat(pred_dvf), torch.cat(gt_dvf))
+        dvf_values["normalized_epe"] = dvf_values["endpoint_error_mm"] / max(dvf_values["gt_dynamic_rms_mm"], 1e-12)
+        values = {**{f"dvf_{key}": value for key, value in dvf_values.items()}, **image_sequence_metrics(torch.stack(predicted_images), torch.stack(target_images))}
         all_scores = generator(torch.as_tensor(ts, device=grid.device))
         for score_name, score_values, frequency in (("resp", all_scores["resp_scores"], motion.respiratory_frequency_hz), ("card", all_scores["card_scores"], motion.cardiac_frequency_hz)):
             score_metrics = location_spectral_metrics(score_values, torch.as_tensor(ts, device=grid.device), [(frequency - .05, frequency + .05)])
@@ -166,16 +186,17 @@ def _oracle_evaluation(model, observations: list, motion: GroundTruthMotion, gen
     return result, arrays
 
 
-def _oracle_run(domain: dict[str, object], frames: list[GeometryFrame], *, image_shape: tuple[int, int], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, config: dict[str, object], branch: str, device: torch.device, steps: int, pixel_samples: int, observations_per_update: int, seed: int, smoke: bool) -> tuple[dict[str, dict[str, float]], dict[str, np.ndarray]]:
+def _oracle_run(domain: dict[str, object], frames: list[GeometryFrame], *, image_shape: tuple[int, int], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, config: dict[str, object], score_scales: OracleScoreScales, branch: str, device: torch.device, steps: int, pixel_samples: int, observations_per_update: int, seed: int, smoke: bool) -> tuple[dict[str, dict[str, float]], dict[str, np.ndarray]]:
     hidden, resp_shapes, card_shape, psf_samples = _source_mbc_shapes(config, smoke)
+    normalization_grid_shapes = _normalization_grid_shapes(config, smoke)
     observations = _oracle_target_observations(frames, image_shape=image_shape, phantom=phantom, motion=motion, branch=branch, psf_samples=psf_samples, seed=seed)
-    model = build_oracle_motion_model(domain, phantom, device=device, active_respiratory_levels=3, hidden_dim=hidden, respiratory_shapes=resp_shapes, cardiac_shape=card_shape, psf_samples=psf_samples)
+    model = build_oracle_motion_model(domain, phantom, device=device, active_respiratory_levels=3, hidden_dim=hidden, respiratory_shapes=resp_shapes, cardiac_shape=card_shape, psf_samples=psf_samples, normalization_grid_shapes=normalization_grid_shapes)
     train_branch = {"resp": "resp", "card": "card", "combined": "combined"}[branch]
     model.configure_trainable(train_branch)
     lr_key = "stage2" if branch == "resp" else "stage3a"
     lr_name = "respiratory_mbc_lr" if branch == "resp" else "cardiac_mbc_lr"
     optimizer = torch.optim.Adam([item for item in model.parameters() if item.requires_grad], lr=float(config["training"]["optimizer"][lr_key][lr_name]))
-    score_generator = OracleScoreGenerator(motion, active_respiratory_levels=3)
+    score_generator = OracleScoreGenerator(motion, score_scales, active_respiratory_levels=3)
     random = torch.Generator(device=device).manual_seed(seed)
     norm_weight = float(config["training"]["loss_weights"]["mbc_normalization"])
     for step in range(steps):
@@ -188,7 +209,7 @@ def _oracle_run(domain: dict[str, object], frames: list[GeometryFrame], *, image
             prediction = model.render(observation, scores, train_branch, uv)
             target = observation.image[0, uv[:, 1].long(), uv[:, 0].long()]
             losses.append((prediction - target).square().mean())
-        loss = torch.stack(losses).mean() + norm_weight * model.normalization(train_branch, grid_shape=(3, 3, 3))
+        loss = torch.stack(losses).mean() + norm_weight * model.normalization(train_branch)
         loss.backward(); optimizer.step()
     return _oracle_evaluation(model, observations, motion, score_generator, train_branch, domain, pixel_samples)
 
@@ -206,12 +227,22 @@ def _write_aggregate(path: Path, aggregate: dict[str, dict[str, float]]) -> None
         writer.writerows({"metric": name, **values} for name, values in aggregate.items())
 
 
-def _recovery_label(aggregate: dict[str, dict[str, float]]) -> str:
+def _direct_recovery_label(metrics: dict[str, float], thresholds: dict[str, float]) -> str:
+    ok = metrics["normalized_epe"] <= thresholds["max_normalized_epe"] and metrics["spatial_cosine"] >= thresholds["min_spatial_cosine"] and thresholds["min_rms_ratio"] <= metrics["rms_ratio"] <= thresholds["max_rms_ratio"]
+    return "pass" if ok else "fail"
+
+
+def _recovery_label(aggregate: dict[str, dict[str, float]], thresholds: dict[str, float]) -> str:
     if not aggregate:
         return "indeterminate"
     value = lambda key: aggregate.get(key, {}).get("median", float("nan"))
-    ok = .15 <= value("dvf_dynamic_rms_ratio") <= 4.0 and value("dvf_dynamic_cosine") >= .2 and value("dvf_endpoint_error_mm") <= 10.0
+    ok = thresholds["min_rms_ratio"] <= value("dvf_dynamic_rms_ratio") <= thresholds["max_rms_ratio"] and value("dvf_dynamic_cosine") >= thresholds["min_spatial_cosine"] and value("dvf_normalized_epe") <= thresholds["max_normalized_epe"]
     return "pass" if ok else "fail"
+
+
+def _observability_label(aggregate: dict[str, dict[str, float]]) -> str:
+    """Avoid turning the deterministic GT rerender's zero MSE into a verdict."""
+    return "quantitative_only" if aggregate else "indeterminate"
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
@@ -225,6 +256,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         synthetic = yaml.safe_load(handle)["synthetic"]
     domain = _load_domain(args.canonical_domain)
     motion = GroundTruthMotion.from_domain(domain, respiratory_frequency_hz=float(synthetic["respiratory_frequency_hz"]), cardiac_frequency_hz=float(synthetic["cardiac_frequency_hz"]), respiratory_amplitude_mm=float(synthetic["respiratory_amplitude_mm"]), cardiac_amplitude_mm=float(synthetic["cardiac_amplitude_mm"]))
+    normalization_grid_shapes = _normalization_grid_shapes(config, args.smoke)
+    cardiac = domain["cardiac_box"]
+    score_scales = derive_oracle_score_scales(motion, lower_world_mm=torch.as_tensor(domain["world_min_mm"], dtype=torch.float32, device=device), upper_world_mm=torch.as_tensor(domain["world_max_mm"], dtype=torch.float32, device=device), cardiac_lower_world_mm=torch.as_tensor(cardiac["min_mm"], dtype=torch.float32, device=device), cardiac_upper_world_mm=torch.as_tensor(cardiac["max_mm"], dtype=torch.float32, device=device), respiratory_grid_shape=normalization_grid_shapes[0], cardiac_grid_shape=normalization_grid_shapes[1])
+    thresholds = {"max_normalized_epe": float(getattr(args, "max_normalized_epe", .25)), "min_spatial_cosine": float(getattr(args, "min_spatial_cosine", .90)), "min_rms_ratio": float(getattr(args, "min_rms_ratio", .75)), "max_rms_ratio": float(getattr(args, "max_rms_ratio", 1.25))}
     image_shape = tuple(int(value) for value in synthetic["image_shape"])
     if args.smoke:
         image_shape = (8, 8)
@@ -237,32 +272,32 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         obs_rows, values = observability_audit(observations, frames, image_shape=image_shape, phantom=phantom, motion=motion, psf_samples=psf_samples, seed=args.seed, amplitude_scales=args.amplitude_scales)
         arrays.update(values)
     if args.mode in {"direct_mbc", "all"}:
-        direct = _direct_fit(domain, phantom, motion, config, device=device, steps=args.steps, smoke=args.smoke)
+        direct = _direct_fit(domain, phantom, motion, config, score_scales, device=device, steps=args.steps, smoke=args.smoke)
     branch_map = {"oracle_resp_only": "resp", "oracle_card_only": "card", "oracle_combined": "combined"}
     if args.mode in branch_map:
-        oracle_rows, values = _oracle_run(domain, frames, image_shape=image_shape, phantom=phantom, motion=motion, config=config, branch=branch_map[args.mode], device=device, steps=args.steps, pixel_samples=args.pixel_samples, observations_per_update=args.observations_per_update, seed=args.seed, smoke=args.smoke)
+        oracle_rows, values = _oracle_run(domain, frames, image_shape=image_shape, phantom=phantom, motion=motion, config=config, score_scales=score_scales, branch=branch_map[args.mode], device=device, steps=args.steps, pixel_samples=args.pixel_samples, observations_per_update=args.observations_per_update, seed=args.seed, smoke=args.smoke)
         arrays.update(values)
     obs_aggregate = aggregate_location_metrics(obs_rows) if obs_rows else {}
     oracle_aggregate = aggregate_location_metrics(oracle_rows) if oracle_rows else {}
     _write_rows(args.output_dir / "observability_per_location.csv", obs_rows)
     _write_aggregate(args.output_dir / "observability_aggregate.csv", obs_aggregate)
     with (args.output_dir / "direct_mbc_fit.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["branch", "epe_mm", "spatial_cosine", "rms_ratio", "max_error_mm", "mbc_normalization"]); writer.writeheader(); writer.writerows({"branch": key, **value} for key, value in direct.items())
+        writer = csv.DictWriter(handle, fieldnames=["branch", "epe_mm", "gt_rms_mm", "normalized_epe", "spatial_cosine", "rms_ratio", "max_error_mm", "mbc_normalization"]); writer.writeheader(); writer.writerows({"branch": key, **value} for key, value in direct.items())
     _write_rows(args.output_dir / "oracle_per_location.csv", oracle_rows)
     _write_aggregate(args.output_dir / "oracle_aggregate.csv", oracle_aggregate)
     np.savez_compressed(args.output_dir / "recovery_arrays.npz", **arrays)
     if obs_rows:
         import matplotlib.pyplot as plt
         figure, axis = plt.subplots(figsize=(5, 3)); axis.bar(range(len(obs_rows)), [value["zero_vs_gt_mse_gap"] for value in obs_rows.values()]); axis.set_ylabel("zero-vs-GT MSE gap"); axis.set_xlabel("fixed location / amplitude"); figure.tight_layout(); figure.savefig(args.output_dir / "figures" / "observability_mse_gaps.png", dpi=140); plt.close(figure)
-    observability = "indeterminate" if not obs_aggregate else ("strong" if obs_aggregate["zero_motion_observability_fraction"]["median"] >= .01 else "weak")
-    direct_label = lambda branch: "indeterminate" if branch not in direct else ("pass" if direct[branch]["epe_mm"] <= 2.0 and direct[branch]["spatial_cosine"] >= .2 else "fail")
-    recovery = _recovery_label(oracle_aggregate)
+    observability = _observability_label(obs_aggregate)
+    direct_label = lambda branch: "indeterminate" if branch not in direct else _direct_recovery_label(direct[branch], thresholds)
+    recovery = _recovery_label(oracle_aggregate, thresholds)
     interpretation = "observability not evaluated"
-    if observability == "weak": interpretation = "benchmark resolution/amplitude gives weak image-domain motion observability"
-    elif observability == "strong" and any(direct_label(branch) == "fail" for branch in direct): interpretation = "production MBC direct representability is the limiting factor"
-    elif observability == "strong" and oracle_rows and recovery == "fail": interpretation = "MBC is tested directly; oracle image-domain recovery points to reconstruction-gradient/optimization"
-    elif observability == "strong" and oracle_rows and recovery == "pass": interpretation = "oracle recovery supports an encoder/state-inference explanation for original Exp1 failure"
-    summary = {"experiment": "exp1b_observability_oracle", "mode": args.mode, "observability": observability, "resp_direct_mbc_fit": direct_label("resp"), "card_direct_mbc_fit": direct_label("card"), "oracle_resp_recovery": recovery if args.mode == "oracle_resp_only" else "indeterminate", "oracle_card_recovery": recovery if args.mode == "oracle_card_only" else "indeterminate", "oracle_combined_recovery": recovery if args.mode == "oracle_combined" else "indeterminate", "mechanistic_interpretation": interpretation, "observability_aggregate": obs_aggregate, "direct_mbc_metrics": direct, "oracle_aggregate": oracle_aggregate, "training": {"steps": args.steps, "pixel_samples": args.pixel_samples, "observations_per_update": args.observations_per_update, "canonical_trainable": False, "encoder_trainable": False}}
+    if observability == "quantitative_only": interpretation = "observability is reported quantitatively; deterministic GT rerender MSE is not used as a strong/weak verdict"
+    elif any(direct_label(branch) == "fail" for branch in direct): interpretation = "production MBC direct representability is the limiting factor"
+    elif oracle_rows and recovery == "fail": interpretation = "MBC is tested directly; oracle image-domain recovery points to reconstruction-gradient/optimization"
+    elif oracle_rows and recovery == "pass": interpretation = "oracle recovery supports an encoder/state-inference explanation for original Exp1 failure"
+    summary = {"experiment": "exp1b_observability_oracle", "mode": args.mode, "observability": observability, "resp_direct_mbc_fit": direct_label("resp"), "card_direct_mbc_fit": direct_label("card"), "oracle_resp_recovery": recovery if args.mode == "oracle_resp_only" else "indeterminate", "oracle_card_recovery": recovery if args.mode == "oracle_card_only" else "indeterminate", "oracle_combined_recovery": recovery if args.mode == "oracle_combined" else "indeterminate", "mechanistic_interpretation": interpretation, "observability_aggregate": obs_aggregate, "direct_mbc_metrics": direct, "oracle_aggregate": oracle_aggregate, "oracle_score_scales": score_scales.summary(), "recovery_thresholds": thresholds, "training": {"steps": args.steps, "pixel_samples": args.pixel_samples, "observations_per_update": args.observations_per_update, "normalization_grid_shapes": {"respiratory": list(normalization_grid_shapes[0]), "cardiac": list(normalization_grid_shapes[1])}, "canonical_trainable": False, "encoder_trainable": False}}
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
 
@@ -274,7 +309,7 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path); parser.add_argument("--qc-table", type=Path); parser.add_argument("--canonical-domain", type=Path)
     parser.add_argument("--mode", choices=("observability", "direct_mbc", "oracle_resp_only", "oracle_card_only", "oracle_combined", "all"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True); parser.add_argument("--device", default="cpu"); parser.add_argument("--overwrite", action="store_true"); parser.add_argument("--smoke", action="store_true")
-    parser.add_argument("--locations-per-view", type=int, default=3); parser.add_argument("--frames-per-location", type=int, default=20); parser.add_argument("--steps", type=int, default=400); parser.add_argument("--pixel-samples", type=int, default=256); parser.add_argument("--observations-per-update", type=int, default=32); parser.add_argument("--amplitude-scales", type=lambda value: [float(item) for item in value.split(",")], default=[1.0]); parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--locations-per-view", type=int, default=3); parser.add_argument("--frames-per-location", type=int, default=50); parser.add_argument("--steps", type=int, default=400); parser.add_argument("--pixel-samples", type=int, default=256); parser.add_argument("--observations-per-update", type=int, default=32); parser.add_argument("--amplitude-scales", type=lambda value: [float(item) for item in value.split(",")], default=[1.0]); parser.add_argument("--max-normalized-epe", type=float, default=.25); parser.add_argument("--min-spatial-cosine", type=float, default=.90); parser.add_argument("--min-rms-ratio", type=float, default=.75); parser.add_argument("--max-rms-ratio", type=float, default=1.25); parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     if (args.manifest is None) != (args.qc_table is None): parser.error("--manifest and --qc-table must be provided together")
     if args.smoke:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import subprocess
+import sys
 from argparse import Namespace
 from pathlib import Path
 
@@ -16,10 +18,16 @@ from experiments.c4_diagnostics.synthetic.oracle import (
     DirectMBCFit,
     OracleScoreGenerator,
     build_oracle_motion_model,
+    derive_oracle_score_scales,
 )
 from experiments.c4_diagnostics.synthetic.phantom import AnalyticCanonicalPhantom
 from experiments.c4_diagnostics.synthetic.render import GeometryFrame, render_synthetic_observation
-from experiments.c4_diagnostics.exp1b_observability_oracle import run
+from experiments.c4_diagnostics.exp1b_observability_oracle import (
+    _direct_recovery_label,
+    _normalization_grid_shapes,
+    _observability_label,
+    run,
+)
 
 
 def _domain() -> dict[str, object]:
@@ -36,6 +44,11 @@ def _frame(timestamp_s: float) -> GeometryFrame:
         torch.tensor([0.0, 1.0, 0.0]), torch.tensor([0.0, 0.0, 1.0]),
         torch.tensor([1.5, 1.5]), 4.0, timestamp_s, 8, 8,
     )
+
+
+def _scales(domain: dict[str, object], motion: GroundTruthMotion):
+    cardiac = domain["cardiac_box"]
+    return derive_oracle_score_scales(motion, lower_world_mm=torch.tensor(domain["world_min_mm"]), upper_world_mm=torch.tensor(domain["world_max_mm"]), cardiac_lower_world_mm=torch.tensor(cardiac["min_mm"]), cardiac_upper_world_mm=torch.tensor(cardiac["max_mm"]), respiratory_grid_shape=(3, 3, 3), cardiac_grid_shape=(3, 3, 3))
 
 
 def test_true_temporal_std_excludes_static_spatial_contrast() -> None:
@@ -59,8 +72,8 @@ def test_gt_renderer_is_deterministic_and_zero_motion_is_observable() -> None:
 
 
 def test_oracle_scores_are_timestamp_only_and_match_shapes() -> None:
-    motion = GroundTruthMotion()
-    generator = OracleScoreGenerator(motion, active_respiratory_levels=3)
+    domain, motion = _domain(), GroundTruthMotion.from_domain(_domain())
+    generator = OracleScoreGenerator(motion, _scales(domain, motion), active_respiratory_levels=3)
     timestamps = torch.arange(0.0, 16.0, 0.125)
     scores_a = generator(timestamps)
     scores_b = generator(timestamps.clone() + 0.0, image=torch.randn(2, 3), geometry=torch.randn(4, 3))
@@ -73,8 +86,52 @@ def test_oracle_scores_are_timestamp_only_and_match_shapes() -> None:
     assert float(cardiac_peak) == pytest.approx(motion.cardiac_frequency_hz, abs=0.05)
 
 
+def test_oracle_score_physical_scales_come_from_gt_normalization_grids() -> None:
+    domain, motion = _domain(), GroundTruthMotion.from_domain(_domain())
+    scales = derive_oracle_score_scales(motion, lower_world_mm=torch.tensor(domain["world_min_mm"]), upper_world_mm=torch.tensor(domain["world_max_mm"]), cardiac_lower_world_mm=torch.tensor(domain["cardiac_box"]["min_mm"]), cardiac_upper_world_mm=torch.tensor(domain["cardiac_box"]["max_mm"]), respiratory_grid_shape=(4, 4, 4), cardiac_grid_shape=(5, 5, 5))
+    resp_target = motion.respiratory_dvf_mm(scales.respiratory_grid, torch.tensor([1.0 / (4.0 * motion.respiratory_frequency_hz)]))
+    card_target = motion.cardiac_dvf_mm(scales.cardiac_grid, torch.tensor([(math.pi / 2.0 - .37) / (2.0 * math.pi * motion.cardiac_frequency_hz)]))
+    assert torch.allclose(scales.respiratory_component_rms_mm, resp_target.square().mean(dim=(0, 1)).sqrt())
+    assert torch.allclose(scales.cardiac_component_rms_mm, card_target.square().mean(dim=(0, 1)).sqrt())
+
+
+def test_unit_normalized_mbc_factorization_with_scaled_oracle_scores_recovers_gt() -> None:
+    domain, motion = _domain(), GroundTruthMotion.from_domain(_domain())
+    scales = derive_oracle_score_scales(motion, lower_world_mm=torch.tensor(domain["world_min_mm"]), upper_world_mm=torch.tensor(domain["world_max_mm"]), cardiac_lower_world_mm=torch.tensor(domain["cardiac_box"]["min_mm"]), cardiac_upper_world_mm=torch.tensor(domain["cardiac_box"]["max_mm"]), respiratory_grid_shape=(4, 4, 4), cardiac_grid_shape=(4, 4, 4))
+    target = motion.respiratory_dvf_mm(scales.respiratory_grid, torch.tensor([1.0 / (4.0 * motion.respiratory_frequency_hz)]))
+    unit_mbc = target / scales.respiratory_component_rms_mm
+    scores = OracleScoreGenerator(motion, scales, active_respiratory_levels=3)(torch.tensor([1.0 / (4.0 * motion.respiratory_frequency_hz)]))["resp_scores"]
+    recovered = (unit_mbc[:, None] * scores[:, :, None]).sum(dim=1)
+    assert torch.allclose(unit_mbc.square().mean(dim=(0, 1)).sqrt(), torch.ones(3), atol=1e-6)
+    assert torch.allclose(recovered, target, atol=1e-6)
+
+
+def test_formal_normalization_grid_is_c4_16_cubed() -> None:
+    root = Path(__file__).resolve().parents[3]
+    config = __import__("yaml").safe_load((root / "configs/source_first_change4_paperaligned.yaml").read_text())
+    assert _normalization_grid_shapes(config, smoke=False) == ((16, 16, 16), (16, 16, 16))
+    assert _normalization_grid_shapes(config, smoke=True) == ((3, 3, 3), (3, 3, 3))
+
+
+def test_direct_fit_recovery_label_is_gt_relative() -> None:
+    thresholds = {"max_normalized_epe": .25, "min_spatial_cosine": .90, "min_rms_ratio": .75, "max_rms_ratio": 1.25}
+    assert _direct_recovery_label({"normalized_epe": .20, "spatial_cosine": .95, "rms_ratio": 1.1}, thresholds) == "pass"
+    assert _direct_recovery_label({"normalized_epe": .30, "spatial_cosine": .99, "rms_ratio": 1.0}, thresholds) == "fail"
+
+
+def test_observability_is_quantitative_when_gt_rerender_mse_is_zero() -> None:
+    aggregate = {"zero_motion_observability_fraction": {"median": 1.0}, "zero_motion_mse_over_target_temporal_variance": {"median": 1e-6}}
+    assert _observability_label(aggregate) == "quantitative_only"
+
+
+def test_cli_path_import_bootstrap_from_repository_root() -> None:
+    root = Path(__file__).resolve().parents[3]
+    result = subprocess.run([sys.executable, "experiments/c4_diagnostics/exp1b_observability_oracle.py", "--help"], cwd=root, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+
+
 def test_oracle_only_trains_selected_mbc_and_keeps_canonical_frozen() -> None:
-    model = build_oracle_motion_model(_domain(), AnalyticCanonicalPhantom(_domain()), device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1)
+    model = build_oracle_motion_model(_domain(), AnalyticCanonicalPhantom(_domain()), device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1, normalization_grid_shapes=((3, 3, 3), (3, 3, 3)))
     model.configure_trainable("resp")
     names = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
     assert names and all(name.startswith("respiratory_mbc") for name in names)
@@ -84,7 +141,7 @@ def test_oracle_only_trains_selected_mbc_and_keeps_canonical_frozen() -> None:
 
 def test_direct_fit_updates_only_selected_mbc() -> None:
     domain = _domain()
-    model = build_oracle_motion_model(domain, AnalyticCanonicalPhantom(domain), device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1)
+    model = build_oracle_motion_model(domain, AnalyticCanonicalPhantom(domain), device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1, normalization_grid_shapes=((3, 3, 3), (3, 3, 3)))
     fitter = DirectMBCFit(model, GroundTruthMotion.from_domain(domain), branch="resp", grid_shape=(3, 3, 3), lr=1e-3)
     before_card = [value.detach().clone() for value in model.cardiac_mbc.parameters()]
     before_resp = [value.detach().clone() for value in model.respiratory_mbc.parameters()]
@@ -110,7 +167,7 @@ def test_cpu_tiny_smoke_covers_observability_direct_and_oracle(tmp_path: Path) -
     oracle_resp = run(arguments("oracle_resp_only", tmp_path / "oracle_resp"))
     oracle_card = run(arguments("oracle_card_only", tmp_path / "oracle_card"))
     oracle_combined = run(arguments("oracle_combined", tmp_path / "oracle_combined"))
-    assert observed["observability"] in {"strong", "weak"}
+    assert observed["observability"] == "quantitative_only"
     assert direct["resp_direct_mbc_fit"] in {"pass", "fail"}
     assert oracle_resp["oracle_resp_recovery"] in {"pass", "fail"}
     assert oracle_card["oracle_card_recovery"] in {"pass", "fail"}
