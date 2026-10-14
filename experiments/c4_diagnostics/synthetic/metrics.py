@@ -34,6 +34,24 @@ def dvf_metrics(predicted: torch.Tensor, target: torch.Tensor) -> dict[str, floa
     return {"static_rms_mm": float(predicted.mean(0).square().mean().sqrt()), "dynamic_rms_mm": float(pred_dynamic.square().mean().sqrt()), "gt_dynamic_rms_mm": float(gt_dynamic.square().mean().sqrt()), "dynamic_rms_ratio": float(pred_dynamic.square().mean().sqrt() / gt_dynamic.square().mean().sqrt().clamp_min(1e-12)), "endpoint_error_mm": float((predicted - target).square().sum(-1).sqrt().mean()), "dynamic_cosine": float((pred_dynamic * gt_dynamic).sum() / denominator.clamp_min(1e-12))}
 
 
+def vector_field_agreement_metrics(predicted: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+    """Pointwise vector agreement where sample locations need not match in time."""
+    if predicted.shape != target.shape or predicted.shape[-1] != 3:
+        raise ValueError("predicted and target vector fields must share an xyz shape")
+    pred_rms = predicted.square().mean().sqrt()
+    gt_rms = target.square().mean().sqrt()
+    denominator = predicted.norm() * target.norm()
+    endpoint_error = (predicted - target).square().sum(-1).sqrt().mean()
+    return {
+        "pred_rms_mm": float(pred_rms),
+        "gt_rms_mm": float(gt_rms),
+        "rms_ratio": float(pred_rms / gt_rms.clamp_min(1e-12)),
+        "endpoint_error_mm": float(endpoint_error),
+        "normalized_epe": float(endpoint_error / gt_rms.clamp_min(1e-12)),
+        "spatial_cosine": float((predicted * target).sum() / denominator.clamp_min(1e-12)),
+    }
+
+
 def aggregate_location_metrics(by_location: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
     """Aggregate only already-computed fixed-location metrics."""
     keys = sorted({name for values in by_location.values() for name, value in values.items() if isinstance(value, (int, float)) and np.isfinite(value)})

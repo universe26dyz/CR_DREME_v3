@@ -14,6 +14,7 @@ from experiments.c4_diagnostics.synthetic.observability import (
     image_sequence_metrics,
     legacy_flattened_temporal_std,
 )
+from experiments.c4_diagnostics.synthetic.metrics import vector_field_agreement_metrics
 from experiments.c4_diagnostics.synthetic.oracle import (
     DirectMBCFit,
     OracleScoreGenerator,
@@ -34,6 +35,10 @@ from experiments.c4_diagnostics.exp1b_observability_oracle import (
     _oracle_render,
     _oracle_spectral_metrics,
     _render_full_image_chunked,
+    _center_support_metrics,
+    _save_oracle_checkpoint,
+    _support_mechanistic_interpretation,
+    _support_recovery_label,
     _observability_label,
     _roi_mse,
     run,
@@ -225,10 +230,79 @@ def test_oracle_evaluation_returns_detached_branch_specific_outputs() -> None:
     caches = {item.dynamic_frame_id: build_target_psf_offset_cache(item, psf_samples=1, seed=29 + item.dynamic_frame_id) for item in observations}
     rows, arrays = _oracle_evaluation(model, observations, caches, motion, generator, "resp", "matched_crn", domain, pixel_samples=4, evaluation_pixel_chunk=3)
     values = next(iter(rows.values()))
+    assert "resp_dvf_dynamic_rms_ratio" in values
+    assert "resp_center_support_dynamic_rms_ratio" in values
+    assert "resp_psf_support_spatial_cosine" in values
     assert any(key.startswith("oracle_resp_score_") for key in values)
     assert not any(key.startswith("oracle_card_score_") for key in values)
     assert all(not isinstance(value, torch.Tensor) for value in values.values())
     assert all(not isinstance(value, torch.Tensor) for value in arrays.values())
+
+
+def test_vector_field_agreement_reports_identity_scale_and_orthogonal_errors() -> None:
+    target = torch.tensor([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]])
+    identical = vector_field_agreement_metrics(target, target)
+    scaled = vector_field_agreement_metrics(2.0 * target, target)
+    orthogonal = vector_field_agreement_metrics(torch.tensor([[0.0, 1.0, 0.0], [-2.0, 0.0, 0.0]]), target)
+    assert identical["rms_ratio"] == pytest.approx(1.0)
+    assert identical["spatial_cosine"] == pytest.approx(1.0)
+    assert identical["endpoint_error_mm"] == pytest.approx(0.0)
+    assert identical["normalized_epe"] == pytest.approx(0.0)
+    assert scaled["rms_ratio"] == pytest.approx(2.0)
+    assert orthogonal["spatial_cosine"] == pytest.approx(0.0, abs=1e-7)
+
+
+def test_center_support_metrics_require_corresponding_pixel_world_points() -> None:
+    points = torch.tensor([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]])
+    target = torch.tensor([[[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], [[-1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]])
+    exact = _center_support_metrics(target, target, points)
+    assert exact["dynamic_rms_ratio"] == pytest.approx(1.0)
+    assert exact["dynamic_cosine"] == pytest.approx(1.0)
+    assert exact["normalized_epe"] == pytest.approx(0.0)
+    mismatched = points.clone(); mismatched[1, 0, 0] += .1
+    with pytest.raises(ValueError, match="pixel-center world coordinates"):
+        _center_support_metrics(target, target, mismatched)
+
+
+def test_cached_psf_world_points_are_the_same_points_used_by_render() -> None:
+    domain = _domain(); phantom = AnalyticCanonicalPhantom(domain)
+    zero_motion = GroundTruthMotion.from_domain(domain, respiratory_amplitude_mm=0.0, cardiac_amplitude_mm=0.0)
+    observation = render_synthetic_observation(_frame(.4), height=8, width=8, phantom=phantom, motion=zero_motion, psf_samples=1, seed=41, dynamic_frame_id=0)
+    model = build_oracle_motion_model(domain, phantom, device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1, normalization_grid_shapes=((3, 3, 3), (3, 3, 3)))
+    cache = build_target_psf_offset_cache(observation, psf_samples=1, seed=41)
+    uv = torch.tensor([[5.0, 4.0], [2.0, 0.0], [7.0, 6.0]])
+    samples = model.psf_sample_world_points(observation, uv, cache.for_pixel_uv(uv))
+    expected = model.canonical(samples, return_features=True)[0].mean(-1)
+    rendered = model.render(observation, {}, "zero", uv, standard_normal_offsets=cache.for_pixel_uv(uv))
+    assert torch.allclose(rendered, expected, atol=1e-6, rtol=0.0)
+
+
+def test_oracle_checkpoint_reloads_identical_motion_field(tmp_path: Path) -> None:
+    domain = _domain(); phantom = AnalyticCanonicalPhantom(domain)
+    model = build_oracle_motion_model(domain, phantom, device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1, normalization_grid_shapes=((3, 3, 3), (3, 3, 3)))
+    path = tmp_path / "oracle_model_last.pt"
+    _save_oracle_checkpoint(model, path, {"experiment": "test", "branch": "resp"})
+    reloaded = build_oracle_motion_model(domain, AnalyticCanonicalPhantom(domain), device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1, normalization_grid_shapes=((3, 3, 3), (3, 3, 3)))
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    reloaded.load_state_dict(payload["model_state_dict"])
+    points = torch.tensor([[[1.0, 2.0, 3.0]]])
+    scores = {"resp_scores": torch.ones(1, 1, 3), "card_scores": torch.zeros(1, 1, 3)}
+    assert torch.equal(model.motion(scores, "resp").respiratory_field(points), reloaded.motion(scores, "resp").respiratory_field(points))
+
+
+def test_support_recovery_uses_existing_thresholds_without_redefining_full_grid() -> None:
+    thresholds = {"max_normalized_epe": .25, "min_spatial_cosine": .90, "min_rms_ratio": .75, "max_rms_ratio": 1.25}
+    aggregate = {
+        "resp_center_support_dynamic_rms_ratio": {"median": 1.0},
+        "resp_center_support_dynamic_cosine": {"median": .95},
+        "resp_center_support_normalized_epe": {"median": .1},
+        "resp_psf_support_rms_ratio": {"median": 1.0},
+        "resp_psf_support_spatial_cosine": {"median": .95},
+        "resp_psf_support_normalized_epe": {"median": .1},
+    }
+    assert _support_recovery_label(aggregate, "resp_center_support", thresholds, dynamic=True) == "pass"
+    assert _support_recovery_label(aggregate, "resp_psf_support", thresholds, dynamic=False) == "pass"
+    assert _support_mechanistic_interpretation("fail", "pass", "pass") == "full-volume recovery fails while acquired center-plane support passes; off-support 3D null-space/extrapolation is implicated"
 
 
 def test_smoke_spectral_diagnostic_is_unavailable_instead_of_crashing_above_nyquist() -> None:
@@ -288,8 +362,14 @@ def test_cpu_tiny_smoke_covers_observability_direct_and_oracle(tmp_path: Path) -
     oracle_resp = run(arguments("oracle_resp_only", tmp_path / "oracle_resp"))
     oracle_card = run(arguments("oracle_card_only", tmp_path / "oracle_card"))
     oracle_combined = run(arguments("oracle_combined", tmp_path / "oracle_combined"))
+    matched_args = arguments("oracle_resp_only", tmp_path / "oracle_resp_matched")
+    matched_args.psf_training_mode = "matched_crn"
+    oracle_resp_matched = run(matched_args)
     assert observed["observability"] == "quantitative_only"
     assert direct["resp_direct_mbc_fit"] in {"pass", "fail"}
     assert oracle_resp["oracle_resp_recovery"] in {"pass", "fail"}
     assert oracle_card["oracle_card_recovery"] in {"pass", "fail"}
     assert oracle_combined["oracle_combined_recovery"] in {"pass", "fail"}
+    assert oracle_resp_matched["oracle_resp_center_support_recovery"] in {"pass", "fail"}
+    assert oracle_resp_matched["oracle_resp_psf_support_recovery"] in {"pass", "fail"}
+    assert (matched_args.output_dir / "oracle_model_last.pt").is_file()

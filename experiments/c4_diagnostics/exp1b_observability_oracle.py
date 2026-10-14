@@ -29,7 +29,7 @@ from cardioresp4d.training.model import SourceFirstDynamicModel
 from experiments.c4_diagnostics.exp1_synthetic_gt_recovery import (
     _build_observations, _load_domain, fallback_geometry, geometry_from_manifest,
 )
-from experiments.c4_diagnostics.synthetic.metrics import aggregate_location_metrics, dvf_metrics, location_spectral_metrics
+from experiments.c4_diagnostics.synthetic.metrics import aggregate_location_metrics, dvf_metrics, location_spectral_metrics, vector_field_agreement_metrics
 from experiments.c4_diagnostics.synthetic.motion import GroundTruthMotion
 from experiments.c4_diagnostics.synthetic.observability import image_sequence_metrics, normalized_cross_correlation
 from experiments.c4_diagnostics.synthetic.oracle import DirectMBCFit, OracleScoreGenerator, OracleScoreScales, TargetPSFOffsetCache, build_oracle_motion_model, build_target_psf_offset_cache, derive_oracle_score_scales
@@ -127,6 +127,66 @@ def _render_full_image_chunked(model, observation, scores: dict[str, torch.Tenso
             )
         )
     return torch.cat(chunks)
+
+
+def _center_support_metrics(predicted: torch.Tensor, target: torch.Tensor, pixel_centers_world_mm: torch.Tensor, *, tolerance_mm: float = 1e-4) -> dict[str, float]:
+    """Temporal DVF metrics only after proving pixel centres correspond in time."""
+    if predicted.shape != target.shape or predicted.shape != pixel_centers_world_mm.shape or predicted.ndim != 3 or predicted.shape[-1] != 3:
+        raise ValueError("center-support fields and pixel-center world coordinates must be [time, pixels, xyz]")
+    reference = pixel_centers_world_mm[0]
+    if not torch.allclose(pixel_centers_world_mm, reference.expand_as(pixel_centers_world_mm), atol=tolerance_mm, rtol=0.0):
+        raise ValueError("pixel-center world coordinates differ across frames of one fixed location")
+    values = dvf_metrics(predicted, target)
+    values["normalized_epe"] = values["endpoint_error_mm"] / max(values["gt_dynamic_rms_mm"], 1e-12)
+    values["point_count"] = float(predicted.shape[1])
+    return values
+
+
+def _respiratory_support_audit(model, sequence: list[tuple[int, object, GeometryFrame]], psf_offset_caches: dict[int, TargetPSFOffsetCache], motion: GroundTruthMotion, generator: OracleScoreGenerator, *, evaluation_pixel_chunk: int) -> tuple[dict[str, float], dict[str, np.ndarray]]:
+    """Audit respiratory fields on pixel centres and exact target PSF samples."""
+    center_pred: list[torch.Tensor] = []; center_gt: list[torch.Tensor] = []; center_points: list[torch.Tensor] = []
+    psf_pred: list[torch.Tensor] = []; psf_gt: list[torch.Tensor] = []
+    for _, observation, _ in sequence:
+        timestamp = observation.image.new_tensor([observation.timestamp_s])
+        learned_motion = model.motion(generator(timestamp), "resp")
+        frame_center_pred: list[torch.Tensor] = []; frame_center_gt: list[torch.Tensor] = []; frame_points: list[torch.Tensor] = []
+        frame_psf_pred: list[torch.Tensor] = []; frame_psf_gt: list[torch.Tensor] = []
+        for pixel_uv in _full_image_uv(observation).split(evaluation_pixel_chunk):
+            points = SourceFirstDynamicModel._pixel_world(observation, pixel_uv.to(observation.image))
+            predicted = learned_motion.respiratory_field(points[None])[0]
+            target = motion.respiratory_dvf_mm(points[None], timestamp)[0]
+            samples = model.psf_sample_world_points(observation, pixel_uv, psf_offset_caches[observation.dynamic_frame_id].for_pixel_uv(pixel_uv))
+            psf_predicted = learned_motion.respiratory_field(samples[None])[0]
+            psf_target = motion.respiratory_dvf_mm(samples[None], timestamp)[0]
+            frame_center_pred.append(predicted.detach().cpu()); frame_center_gt.append(target.detach().cpu()); frame_points.append(points.detach().cpu())
+            frame_psf_pred.append(psf_predicted.detach().cpu()); frame_psf_gt.append(psf_target.detach().cpu())
+        center_pred.append(torch.cat(frame_center_pred)); center_gt.append(torch.cat(frame_center_gt)); center_points.append(torch.cat(frame_points))
+        psf_pred.append(torch.cat(frame_psf_pred)); psf_gt.append(torch.cat(frame_psf_gt))
+    center_prediction, center_target, center_world = torch.stack(center_pred), torch.stack(center_gt), torch.stack(center_points)
+    psf_prediction, psf_target = torch.stack(psf_pred), torch.stack(psf_gt)
+    center = _center_support_metrics(center_prediction, center_target, center_world)
+    psf = vector_field_agreement_metrics(psf_prediction, psf_target)
+    values = {f"resp_center_support_{key}": value for key, value in center.items()}
+    values.update({f"resp_psf_support_{key}": value for key, value in psf.items()})
+    values["resp_psf_support_point_count"] = float(psf_prediction.shape[0] * psf_prediction.shape[1] * psf_prediction.shape[2])
+    stem = f"oracle_{sequence[0][1].view}_{sequence[0][1].slice_id}".replace("/", "_")
+    arrays = {
+        f"{stem}_center_support_pred_dvf_mm": center_prediction.numpy(),
+        f"{stem}_center_support_gt_dvf_mm": center_target.numpy(),
+        f"{stem}_psf_support_pred_dvf_mm": psf_prediction.numpy(),
+        f"{stem}_psf_support_gt_dvf_mm": psf_target.numpy(),
+    }
+    return values, arrays
+
+
+def _save_oracle_checkpoint(model, path: Path, metadata: dict[str, object]) -> None:
+    """Persist a CPU-only diagnostic model snapshot for read-only audits."""
+    payload = {
+        "checkpoint_schema": "c4_exp1b_oracle_last_v1",
+        **metadata,
+        "model_state_dict": {name: value.detach().cpu().clone() for name, value in model.state_dict().items()},
+    }
+    torch.save(payload, path)
 
 
 def _roi_mse(predicted: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
@@ -353,6 +413,9 @@ def _oracle_evaluation(model, observations: list, psf_offset_caches: dict[int, T
                 dvf_values = dvf_metrics(torch.cat(predicted), torch.cat(target))
                 dvf_values["normalized_epe"] = dvf_values["endpoint_error_mm"] / max(dvf_values["gt_dynamic_rms_mm"], 1e-12)
                 values.update({f"{label}_{key}": value for key, value in dvf_values.items()})
+        if branch in {"resp", "combined"}:
+            support_values, support_arrays = _respiratory_support_audit(model, sequence, psf_offset_caches, motion, generator, evaluation_pixel_chunk=evaluation_pixel_chunk)
+            values.update(support_values); arrays.update(support_arrays)
         all_scores = generator(torch.as_tensor(ts, device=resp_grid.device))
         score_branches = (("resp", all_scores["resp_scores"], motion.respiratory_frequency_hz),) if branch == "resp" else (("card", all_scores["card_scores"], motion.cardiac_frequency_hz),) if branch == "card" else (("resp", all_scores["resp_scores"], motion.respiratory_frequency_hz), ("card", all_scores["card_scores"], motion.cardiac_frequency_hz))
         for score_name, score_values, frequency in score_branches:
@@ -363,7 +426,7 @@ def _oracle_evaluation(model, observations: list, psf_offset_caches: dict[int, T
     return result, arrays
 
 
-def _oracle_run(domain: dict[str, object], frames: list[GeometryFrame], *, image_shape: tuple[int, int], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, config: dict[str, object], score_scales: OracleScoreScales, branch: str, device: torch.device, steps: int, pixel_samples: int, observations_per_update: int, psf_training_mode: str, evaluation_pixel_chunk: int, seed: int, smoke: bool) -> tuple[dict[str, dict[str, float]], dict[str, np.ndarray], list[dict[str, float]]]:
+def _oracle_run(domain: dict[str, object], frames: list[GeometryFrame], *, image_shape: tuple[int, int], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, config: dict[str, object], score_scales: OracleScoreScales, branch: str, device: torch.device, steps: int, pixel_samples: int, observations_per_update: int, psf_training_mode: str, evaluation_pixel_chunk: int, checkpoint_path: Path, checkpoint_metadata: dict[str, object], seed: int, smoke: bool) -> tuple[dict[str, dict[str, float]], dict[str, np.ndarray], list[dict[str, float]]]:
     hidden, resp_shapes, card_shape, psf_samples = _source_mbc_shapes(config, smoke)
     normalization_grid_shapes = _normalization_grid_shapes(config, smoke)
     observations, psf_offset_caches = _oracle_target_observations(frames, image_shape=image_shape, phantom=phantom, motion=motion, branch=branch, psf_samples=psf_samples, seed=seed)
@@ -387,6 +450,7 @@ def _oracle_run(domain: dict[str, object], frames: list[GeometryFrame], *, image
         loss = torch.stack(losses).mean() + norm_weight * model.normalization(train_branch)
         loss.backward(); optimizer.step()
     parameter_groups = [{"lr": float(group["lr"]), "parameter_count": sum(parameter.numel() for parameter in group["params"])} for group in optimizer.param_groups]
+    _save_oracle_checkpoint(model, checkpoint_path, checkpoint_metadata)
     optimizer.zero_grad(set_to_none=True)
     loss = losses = prediction = target = scores = uv = None
     del optimizer
@@ -429,6 +493,28 @@ def _recovery_label(aggregate: dict[str, dict[str, float]], branch: str, thresho
     return "pass" if (passed("resp_dvf") if branch == "resp" else passed("card_dvf") if branch == "card" else passed("resp_dvf") and passed("card_dvf")) else "fail"
 
 
+def _support_recovery_label(aggregate: dict[str, dict[str, float]], prefix: str, thresholds: dict[str, float], *, dynamic: bool) -> str:
+    if not aggregate:
+        return "indeterminate"
+    def metric(name: str) -> float:
+        return aggregate.get(f"{prefix}_{name}", {}).get("median", float("nan"))
+    ratio_name, cosine_name = ("dynamic_rms_ratio", "dynamic_cosine") if dynamic else ("rms_ratio", "spatial_cosine")
+    passed = thresholds["min_rms_ratio"] <= metric(ratio_name) <= thresholds["max_rms_ratio"] and metric(cosine_name) >= thresholds["min_spatial_cosine"] and metric("normalized_epe") <= thresholds["max_normalized_epe"]
+    return "pass" if passed else "fail"
+
+
+def _support_mechanistic_interpretation(full_grid: str, center_support: str, psf_support: str) -> str:
+    if full_grid == "fail" and center_support == "pass":
+        return "full-volume recovery fails while acquired center-plane support passes; off-support 3D null-space/extrapolation is implicated"
+    if center_support == "fail" and psf_support == "fail":
+        return "field recovery fails even on directly queried acquisition support; image-equivalent motion ambiguity/identifiability remains"
+    if center_support == "fail" and psf_support == "pass":
+        return "center-plane support fails while exact PSF-query support passes"
+    if center_support == "pass" and psf_support == "pass":
+        return "motion is recovered on acquisition support; remaining full-volume error is predominantly off-support"
+    return "support audit is indeterminate"
+
+
 def _observability_label(aggregate: dict[str, dict[str, float]]) -> str:
     """Avoid turning the deterministic GT rerender's zero MSE into a verdict."""
     return "quantitative_only" if aggregate else "indeterminate"
@@ -464,7 +550,23 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         direct = _direct_fit(domain, phantom, motion, config, score_scales, device=device, steps=args.steps, smoke=args.smoke)
     branch_map = {"oracle_resp_only": "resp", "oracle_card_only": "card", "oracle_combined": "combined"}
     if args.mode in branch_map:
-        oracle_rows, values, optimizer_parameter_groups = _oracle_run(domain, frames, image_shape=image_shape, phantom=phantom, motion=motion, config=config, score_scales=score_scales, branch=branch_map[args.mode], device=device, steps=args.steps, pixel_samples=args.pixel_samples, observations_per_update=args.observations_per_update, psf_training_mode=args.psf_training_mode, evaluation_pixel_chunk=getattr(args, "evaluation_pixel_chunk", 64), seed=args.seed, smoke=args.smoke)
+        oracle_checkpoint_metadata = {
+            "experiment": "exp1b_observability_oracle",
+            "mode": args.mode,
+            "branch": branch_map[args.mode],
+            "psf_training_mode": args.psf_training_mode,
+            "source_config": str(args.source_config),
+            "experiment_config": str(args.experiment_config),
+            "seed": args.seed,
+            "steps": args.steps,
+            "pixel_samples": args.pixel_samples,
+            "observations_per_update": args.observations_per_update,
+            "evaluation_pixel_chunk": getattr(args, "evaluation_pixel_chunk", 64),
+            "active_respiratory_levels": 3,
+            "oracle_score_scales": score_scales.summary(),
+            "normalization_grid_shapes": {"respiratory": list(normalization_grid_shapes[0]), "cardiac": list(normalization_grid_shapes[1])},
+        }
+        oracle_rows, values, optimizer_parameter_groups = _oracle_run(domain, frames, image_shape=image_shape, phantom=phantom, motion=motion, config=config, score_scales=score_scales, branch=branch_map[args.mode], device=device, steps=args.steps, pixel_samples=args.pixel_samples, observations_per_update=args.observations_per_update, psf_training_mode=args.psf_training_mode, evaluation_pixel_chunk=getattr(args, "evaluation_pixel_chunk", 64), checkpoint_path=args.output_dir / "oracle_model_last.pt", checkpoint_metadata=oracle_checkpoint_metadata, seed=args.seed, smoke=args.smoke)
         arrays.update(values)
     obs_aggregate = _aggregate_by_amplitude_scale(obs_rows) if obs_rows else {}
     oracle_aggregate = aggregate_location_metrics(oracle_rows) if oracle_rows else {}
@@ -481,12 +583,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     observability = _observability_label(obs_aggregate)
     direct_label = lambda branch: "indeterminate" if branch not in direct else _direct_recovery_label(direct[branch], thresholds)
     recovery = _recovery_label(oracle_aggregate, branch_map[args.mode], thresholds) if args.mode in branch_map else "indeterminate"
+    full_resp_recovery = _recovery_label(oracle_aggregate, "resp", thresholds) if args.mode in {"oracle_resp_only", "oracle_combined"} else "indeterminate"
+    center_support_recovery = _support_recovery_label(oracle_aggregate, "resp_center_support", thresholds, dynamic=True) if args.mode in {"oracle_resp_only", "oracle_combined"} else "indeterminate"
+    psf_support_recovery = _support_recovery_label(oracle_aggregate, "resp_psf_support", thresholds, dynamic=False) if args.mode in {"oracle_resp_only", "oracle_combined"} else "indeterminate"
+    support_interpretation = _support_mechanistic_interpretation(full_resp_recovery, center_support_recovery, psf_support_recovery)
     interpretation = "observability not evaluated"
     if observability == "quantitative_only": interpretation = "observability is reported quantitatively; deterministic GT rerender MSE is not used as a strong/weak verdict"
     elif any(direct_label(branch) == "fail" for branch in direct): interpretation = "production MBC direct representability is the limiting factor"
     elif oracle_rows and recovery == "fail": interpretation = "MBC is tested directly; oracle image-domain recovery points to reconstruction-gradient/optimization"
     elif oracle_rows and recovery == "pass": interpretation = "oracle recovery supports an encoder/state-inference explanation for original Exp1 failure"
-    summary = {"experiment": "exp1b_observability_oracle", "mode": args.mode, "observability": observability, "resp_direct_mbc_fit": direct_label("resp"), "card_direct_mbc_fit": direct_label("card"), "oracle_resp_recovery": recovery if args.mode == "oracle_resp_only" else "indeterminate", "oracle_card_recovery": recovery if args.mode == "oracle_card_only" else "indeterminate", "oracle_combined_recovery": recovery if args.mode == "oracle_combined" else "indeterminate", "mechanistic_interpretation": interpretation, "observability_aggregate_by_amplitude_scale": obs_aggregate, "direct_mbc_metrics": direct, "direct_mbc_normalization_weight": float(config["training"]["loss_weights"]["mbc_normalization"]), "oracle_aggregate": oracle_aggregate, "oracle_score_scales": score_scales.summary(), "recovery_thresholds": thresholds, "training": {"steps": args.steps, "pixel_samples": args.pixel_samples, "evaluation_pixel_chunk": getattr(args, "evaluation_pixel_chunk", 64), "observations_per_update": args.observations_per_update, "psf_training_mode": getattr(args, "psf_training_mode", "stochastic"), "optimizer_parameter_groups": optimizer_parameter_groups, "normalization_grid_shapes": {"respiratory": list(normalization_grid_shapes[0]), "cardiac": list(normalization_grid_shapes[1])}, "canonical_trainable": False, "encoder_trainable": False}}
+    summary = {"experiment": "exp1b_observability_oracle", "mode": args.mode, "observability": observability, "resp_direct_mbc_fit": direct_label("resp"), "card_direct_mbc_fit": direct_label("card"), "oracle_resp_recovery": recovery if args.mode == "oracle_resp_only" else "indeterminate", "oracle_resp_center_support_recovery": center_support_recovery if args.mode == "oracle_resp_only" else "indeterminate", "oracle_resp_psf_support_recovery": psf_support_recovery if args.mode == "oracle_resp_only" else "indeterminate", "oracle_card_recovery": recovery if args.mode == "oracle_card_only" else "indeterminate", "oracle_combined_recovery": recovery if args.mode == "oracle_combined" else "indeterminate", "support_mechanistic_interpretation": support_interpretation, "mechanistic_interpretation": interpretation, "observability_aggregate_by_amplitude_scale": obs_aggregate, "direct_mbc_metrics": direct, "direct_mbc_normalization_weight": float(config["training"]["loss_weights"]["mbc_normalization"]), "oracle_aggregate": oracle_aggregate, "oracle_score_scales": score_scales.summary(), "recovery_thresholds": thresholds, "training": {"steps": args.steps, "pixel_samples": args.pixel_samples, "evaluation_pixel_chunk": getattr(args, "evaluation_pixel_chunk", 64), "observations_per_update": args.observations_per_update, "psf_training_mode": getattr(args, "psf_training_mode", "stochastic"), "optimizer_parameter_groups": optimizer_parameter_groups, "normalization_grid_shapes": {"respiratory": list(normalization_grid_shapes[0]), "cardiac": list(normalization_grid_shapes[1])}, "canonical_trainable": False, "encoder_trainable": False}}
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
 

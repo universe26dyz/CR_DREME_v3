@@ -140,17 +140,28 @@ class OracleMBCMotionModel(nn.Module):
             cardiac = ScoreWeightedMBCField(self.cardiac_mbc, scores["card_scores"])
         return SequentialPullbackMotion(respiratory, cardiac)
 
+    def psf_sample_world_points(self, observation: DynamicObservation, pixel_uv: torch.Tensor, standard_normal_offsets: torch.Tensor) -> torch.Tensor:
+        """Reconstruct the exact matched-CRN NeSVoR world-mm sample points."""
+        points = SourceFirstDynamicModel._pixel_world(observation, pixel_uv.to(observation.image))
+        if standard_normal_offsets.shape != (points.shape[0], self.psf.n_samples, 3):
+            raise ValueError("cached PSF offsets must be [pixels, psf_samples, xyz]")
+        spacing = observation.pixel_spacing_mm.to(points)
+        resolution = torch.stack((spacing[1], spacing[0], points.new_tensor(observation.slice_thickness_mm))).expand(points.shape[0], 3)
+        basis = torch.stack((
+            observation.row_direction.to(points).expand(points.shape[0], -1),
+            observation.column_direction.to(points).expand(points.shape[0], -1),
+            observation.normal.to(points).expand(points.shape[0], -1),
+        ), dim=-1)
+        sigma = self.psf.sigma_mm(resolution).to(points)
+        return points[:, None] + torch.einsum("nij,nsj->nsi", basis, standard_normal_offsets.to(points) * sigma[:, None])
+
     def render(self, observation: DynamicObservation, scores: dict[str, torch.Tensor], branch: str, pixel_uv: torch.Tensor, *, standard_normal_offsets: torch.Tensor | None = None) -> torch.Tensor:
         points = SourceFirstDynamicModel._pixel_world(observation, pixel_uv.to(observation.image))
         spacing = observation.pixel_spacing_mm.to(points)
         resolution = torch.stack((spacing[1], spacing[0], points.new_tensor(observation.slice_thickness_mm))).expand(points.shape[0], 3)
         axes = {"row_direction": observation.row_direction.to(points).expand(points.shape[0], -1), "column_direction": observation.column_direction.to(points).expand(points.shape[0], -1), "normal": observation.normal.to(points).expand(points.shape[0], -1)}
         if standard_normal_offsets is not None:
-            if standard_normal_offsets.shape != (points.shape[0], self.psf.n_samples, 3):
-                raise ValueError("cached PSF offsets must be [pixels, psf_samples, xyz]")
-            sigma = self.psf.sigma_mm(resolution).to(points)
-            basis = torch.stack((axes["row_direction"], axes["column_direction"], axes["normal"]), dim=-1)
-            samples = points[:, None] + torch.einsum("nij,nsj->nsi", basis, standard_normal_offsets.to(points) * sigma[:, None])
+            samples = self.psf_sample_world_points(observation, pixel_uv, standard_normal_offsets)
             reference_points = self.motion(scores, branch)(samples)["reference_points_mm"]
             intensity, _ = self.canonical(reference_points, return_features=True)
             return intensity.mean(-1)
