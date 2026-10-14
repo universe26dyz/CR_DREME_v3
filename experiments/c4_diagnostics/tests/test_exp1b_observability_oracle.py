@@ -17,6 +17,7 @@ from experiments.c4_diagnostics.synthetic.observability import (
 from experiments.c4_diagnostics.synthetic.oracle import (
     DirectMBCFit,
     OracleScoreGenerator,
+    build_target_psf_offset_cache,
     build_oracle_motion_model,
     derive_oracle_score_scales,
 )
@@ -25,6 +26,7 @@ from experiments.c4_diagnostics.synthetic.render import GeometryFrame, render_sy
 from experiments.c4_diagnostics.exp1b_observability_oracle import (
     _aggregate_by_amplitude_scale,
     _cardiac_support_mask,
+    _direct_branch_learning_rate,
     _direct_recovery_label,
     _normalization_grid_shapes,
     _oracle_optimizer,
@@ -171,11 +173,14 @@ def test_matched_crn_reuses_target_psf_and_stochastic_redraws_samples() -> None:
     motion = GroundTruthMotion.from_domain(domain, respiratory_amplitude_mm=0.0, cardiac_amplitude_mm=0.0)
     target = render_synthetic_observation(_frame(.4), height=8, width=8, phantom=phantom, motion=motion, psf_samples=1, seed=13, dynamic_frame_id=0)
     model = build_oracle_motion_model(domain, phantom, device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1, normalization_grid_shapes=((3, 3, 3), (3, 3, 3)))
-    uv = torch.stack(torch.meshgrid(torch.arange(8), torch.arange(8), indexing="xy"), dim=-1).reshape(-1, 2).float()
-    matched = _oracle_render(model, target, {}, "zero", uv, psf_training_mode="matched_crn", target_seed=13).reshape_as(target.image[0])
-    stochastic_a = _oracle_render(model, target, {}, "zero", uv, psf_training_mode="stochastic", target_seed=13)
-    stochastic_b = _oracle_render(model, target, {}, "zero", uv, psf_training_mode="stochastic", target_seed=13)
-    assert torch.allclose(matched, target.image[0], atol=1e-6, rtol=0.0)
+    cache = build_target_psf_offset_cache(target, psf_samples=1, seed=13)
+    uv = torch.tensor([[5., 4.], [2., 0.], [7., 6.], [3., 1.]])
+    matched = _oracle_render(model, target, {}, "zero", uv, psf_training_mode="matched_crn", target_seed=13, psf_offset_cache=cache)
+    stochastic_a = _oracle_render(model, target, {}, "zero", uv, psf_training_mode="stochastic", target_seed=13, psf_offset_cache=cache)
+    stochastic_b = _oracle_render(model, target, {}, "zero", uv, psf_training_mode="stochastic", target_seed=13, psf_offset_cache=cache)
+    expected = target.image[0, uv[:, 1].long(), uv[:, 0].long()]
+    assert torch.allclose(matched, expected, atol=1e-6, rtol=0.0)
+    assert not torch.allclose(stochastic_a, expected, atol=1e-6, rtol=0.0)
     assert not torch.equal(stochastic_a, stochastic_b)
 
 
@@ -204,6 +209,12 @@ def test_combined_oracle_optimizer_keeps_resp_and_card_learning_rates_separate()
     config = {"training": {"optimizer": {"stage2": {"respiratory_mbc_lr": 1e-3}, "stage3a": {"cardiac_mbc_lr": 2e-3}, "stage3b": {"respiratory_mbc_lr": 3e-3, "cardiac_mbc_lr": 4e-3}}}}
     optimizer = _oracle_optimizer(model, "combined", config)
     assert sorted(group["lr"] for group in optimizer.param_groups) == [3e-3, 4e-3]
+
+
+def test_direct_fit_uses_branch_specific_formal_learning_rates() -> None:
+    config = {"training": {"optimizer": {"stage2": {"respiratory_mbc_lr": 1e-3}, "stage3a": {"cardiac_mbc_lr": 2e-3}}}}
+    assert _direct_branch_learning_rate(config, "resp") == 1e-3
+    assert _direct_branch_learning_rate(config, "card") == 2e-3
 
 
 def test_cpu_tiny_smoke_covers_observability_direct_and_oracle(tmp_path: Path) -> None:

@@ -32,7 +32,7 @@ from experiments.c4_diagnostics.exp1_synthetic_gt_recovery import (
 from experiments.c4_diagnostics.synthetic.metrics import aggregate_location_metrics, dvf_metrics, location_spectral_metrics
 from experiments.c4_diagnostics.synthetic.motion import GroundTruthMotion
 from experiments.c4_diagnostics.synthetic.observability import image_sequence_metrics, normalized_cross_correlation
-from experiments.c4_diagnostics.synthetic.oracle import DirectMBCFit, OracleScoreGenerator, OracleScoreScales, build_oracle_motion_model, derive_oracle_score_scales
+from experiments.c4_diagnostics.synthetic.oracle import DirectMBCFit, OracleScoreGenerator, OracleScoreScales, TargetPSFOffsetCache, build_oracle_motion_model, build_target_psf_offset_cache, derive_oracle_score_scales
 from experiments.c4_diagnostics.synthetic.phantom import AnalyticCanonicalPhantom
 from experiments.c4_diagnostics.synthetic.render import GeometryFrame, pixel_centers, rescale_frame_for_rendering, render_synthetic_observation
 
@@ -85,10 +85,11 @@ def _psf_rng(device: torch.device, seed: int):
             yield
 
 
-def _oracle_render(model, observation, scores: dict[str, torch.Tensor], branch: str, pixel_uv: torch.Tensor, *, psf_training_mode: str, target_seed: int) -> torch.Tensor:
+def _oracle_render(model, observation, scores: dict[str, torch.Tensor], branch: str, pixel_uv: torch.Tensor, *, psf_training_mode: str, target_seed: int, psf_offset_cache: TargetPSFOffsetCache | None = None) -> torch.Tensor:
     if psf_training_mode == "matched_crn":
-        with _psf_rng(observation.image.device, target_seed):
-            return model.render(observation, scores, branch, pixel_uv)
+        if psf_offset_cache is None:
+            raise ValueError("matched_crn requires cached full-image target PSF offsets")
+        return model.render(observation, scores, branch, pixel_uv, standard_normal_offsets=psf_offset_cache.for_pixel_uv(pixel_uv))
     if psf_training_mode == "stochastic":
         return model.render(observation, scores, branch, pixel_uv)
     raise ValueError("psf_training_mode must be matched_crn or stochastic")
@@ -200,18 +201,27 @@ def _normalization_grid_shapes(config: dict[str, object], smoke: bool) -> tuple[
     return tuple(int(value) for value in regularization["respiratory_evaluation_grid"]["shape"]), tuple(int(value) for value in regularization["cardiac_evaluation_grid"]["shape"])
 
 
+def _direct_branch_learning_rate(config: dict[str, object], branch: str) -> float:
+    optimizer = config["training"]["optimizer"]
+    if branch == "resp":
+        return float(optimizer["stage2"]["respiratory_mbc_lr"])
+    if branch == "card":
+        return float(optimizer["stage3a"]["cardiac_mbc_lr"])
+    raise ValueError("direct branch must be resp or card")
+
+
 def _direct_fit(domain: dict[str, object], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, config: dict[str, object], score_scales: OracleScoreScales, *, device: torch.device, steps: int, smoke: bool) -> dict[str, dict[str, float]]:
     hidden, resp_shapes, card_shape, psf_samples = _source_mbc_shapes(config, smoke)
     normalization_grid_shapes = _normalization_grid_shapes(config, smoke)
-    lr = float(config["training"]["optimizer"]["stage2"]["respiratory_mbc_lr"])
     normalization_weight = float(config["training"]["loss_weights"]["mbc_normalization"])
     output: dict[str, dict[str, float]] = {}
     for branch in ("resp", "card"):
         model = build_oracle_motion_model(domain, phantom, device=device, active_respiratory_levels=3, hidden_dim=hidden, respiratory_shapes=resp_shapes, cardiac_shape=card_shape, psf_samples=psf_samples, normalization_grid_shapes=normalization_grid_shapes)
+        lr = _direct_branch_learning_rate(config, branch)
         fitter = DirectMBCFit(model, motion, branch=branch, grid_shape=(3, 3, 3) if smoke else normalization_grid_shapes[0 if branch == "resp" else 1], lr=lr, normalization_weight=normalization_weight, score_scales=score_scales)
         for _ in range(steps):
             fitter.step()
-        output[branch] = fitter.metrics()
+        output[branch] = {**fitter.metrics(), "learning_rate": lr}
     return output
 
 
@@ -234,22 +244,28 @@ def _uv(observation, count: int, generator: torch.Generator) -> torch.Tensor:
     return torch.stack((torch.randint(width, (count,), generator=generator, device=observation.image.device), torch.randint(height, (count,), generator=generator, device=observation.image.device)), dim=-1).float()
 
 
-def _oracle_target_observations(frames: list[GeometryFrame], *, image_shape: tuple[int, int], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, branch: str, psf_samples: int, seed: int) -> list:
-    return _build_observations(frames, image_shape=image_shape, phantom=phantom, motion=_motion_for_branch(motion, branch), psf_samples=psf_samples, seed=seed)
+def _oracle_target_observations(frames: list[GeometryFrame], *, image_shape: tuple[int, int], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, branch: str, psf_samples: int, seed: int) -> tuple[list, dict[int, TargetPSFOffsetCache]]:
+    observations = _build_observations(frames, image_shape=image_shape, phantom=phantom, motion=_motion_for_branch(motion, branch), psf_samples=psf_samples, seed=seed)
+    return observations, {item.dynamic_frame_id: build_target_psf_offset_cache(item, psf_samples=psf_samples, seed=seed + item.dynamic_frame_id) for item in observations}
 
 
-def _oracle_evaluation(model, observations: list, motion: GroundTruthMotion, generator: OracleScoreGenerator, branch: str, domain: dict[str, object], pixel_samples: int) -> tuple[dict[str, dict[str, float]], dict[str, np.ndarray]]:
+def _oracle_evaluation(model, observations: list, psf_offset_caches: dict[int, TargetPSFOffsetCache], motion: GroundTruthMotion, generator: OracleScoreGenerator, branch: str, psf_training_mode: str, domain: dict[str, object], pixel_samples: int) -> tuple[dict[str, dict[str, float]], dict[str, np.ndarray]]:
     grouped = _group(observations, [GeometryFrame(item.view, item.slice_id, item.center_mm, item.row_direction, item.column_direction, item.normal, item.pixel_spacing_mm, item.slice_thickness_mm, item.timestamp_s, item.image.shape[-2], item.image.shape[-1]) for item in observations])
     result: dict[str, dict[str, float]] = {}; arrays: dict[str, np.ndarray] = {}
     resp_grid, _ = SourceFirstDynamicModel._physical_grid(model.lower_world_mm, model.upper_world_mm, (4, 4, 4))
     card_grid, _ = SourceFirstDynamicModel._physical_grid(model.cardiac_lower_world_mm, model.cardiac_upper_world_mm, (4, 4, 4))
     for location, sequence in grouped.items():
-        predicted_images: list[torch.Tensor] = []; target_images: list[torch.Tensor] = []; resp_pred: list[torch.Tensor] = []; resp_gt: list[torch.Tensor] = []; card_pred: list[torch.Tensor] = []; card_gt: list[torch.Tensor] = []; total_pred: list[torch.Tensor] = []; total_gt: list[torch.Tensor] = []; ts: list[float] = []
+        predicted_images: list[torch.Tensor] = []; independent_images: list[torch.Tensor] = []; target_images: list[torch.Tensor] = []; resp_pred: list[torch.Tensor] = []; resp_gt: list[torch.Tensor] = []; card_pred: list[torch.Tensor] = []; card_gt: list[torch.Tensor] = []; total_pred: list[torch.Tensor] = []; total_gt: list[torch.Tensor] = []; ts: list[float] = []
         for _, observation, _ in sequence:
             timestamp = resp_grid.new_tensor([observation.timestamp_s]); scores = generator(timestamp); learned_motion = model.motion(scores, branch)
             uv = torch.stack(torch.meshgrid(torch.arange(observation.image.shape[-1], device=resp_grid.device), torch.arange(observation.image.shape[-2], device=resp_grid.device), indexing="xy"), dim=-1).reshape(-1, 2).float()
-            with _psf_rng(resp_grid.device, 1000 + observation.dynamic_frame_id):
-                prediction = model.render(observation, scores, branch, uv)
+            if psf_training_mode == "matched_crn":
+                prediction = _oracle_render(model, observation, scores, branch, uv, psf_training_mode="matched_crn", target_seed=observation.dynamic_frame_id, psf_offset_cache=psf_offset_caches[observation.dynamic_frame_id])
+                with _psf_rng(resp_grid.device, 1000 + observation.dynamic_frame_id):
+                    independent_images.append(model.render(observation, scores, branch, uv).reshape(1, *observation.image.shape[-2:]))
+            else:
+                with _psf_rng(resp_grid.device, 1000 + observation.dynamic_frame_id):
+                    prediction = model.render(observation, scores, branch, uv)
             predicted_images.append(prediction.reshape(1, *observation.image.shape[-2:]))
             target_images.append(observation.image)
             if branch in {"resp", "combined"}:
@@ -260,7 +276,10 @@ def _oracle_evaluation(model, observations: list, motion: GroundTruthMotion, gen
                 total_pred.append(learned_motion(resp_grid)["reference_points_mm"] - resp_grid)
                 total_gt.append(motion.pullback_reference_mm(resp_grid, timestamp) - resp_grid)
             ts.append(observation.timestamp_s)
-        values = image_sequence_metrics(torch.stack(predicted_images), torch.stack(target_images))
+        image_prefix = "paired_psf" if psf_training_mode == "matched_crn" else "stochastic_psf"
+        values = {f"{image_prefix}_{key}": value for key, value in image_sequence_metrics(torch.stack(predicted_images), torch.stack(target_images)).items()}
+        if independent_images:
+            values.update({f"independent_psf_{key}": value for key, value in image_sequence_metrics(torch.stack(independent_images), torch.stack(target_images)).items()})
         for label, predicted, target in (("resp_dvf", resp_pred, resp_gt), ("card_dvf", card_pred, card_gt), ("total_dvf", total_pred, total_gt)):
             if predicted:
                 dvf_values = dvf_metrics(torch.cat(predicted), torch.cat(target))
@@ -278,7 +297,7 @@ def _oracle_evaluation(model, observations: list, motion: GroundTruthMotion, gen
 def _oracle_run(domain: dict[str, object], frames: list[GeometryFrame], *, image_shape: tuple[int, int], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, config: dict[str, object], score_scales: OracleScoreScales, branch: str, device: torch.device, steps: int, pixel_samples: int, observations_per_update: int, psf_training_mode: str, seed: int, smoke: bool) -> tuple[dict[str, dict[str, float]], dict[str, np.ndarray], list[dict[str, float]]]:
     hidden, resp_shapes, card_shape, psf_samples = _source_mbc_shapes(config, smoke)
     normalization_grid_shapes = _normalization_grid_shapes(config, smoke)
-    observations = _oracle_target_observations(frames, image_shape=image_shape, phantom=phantom, motion=motion, branch=branch, psf_samples=psf_samples, seed=seed)
+    observations, psf_offset_caches = _oracle_target_observations(frames, image_shape=image_shape, phantom=phantom, motion=motion, branch=branch, psf_samples=psf_samples, seed=seed)
     model = build_oracle_motion_model(domain, phantom, device=device, active_respiratory_levels=3, hidden_dim=hidden, respiratory_shapes=resp_shapes, cardiac_shape=card_shape, psf_samples=psf_samples, normalization_grid_shapes=normalization_grid_shapes)
     train_branch = {"resp": "resp", "card": "card", "combined": "combined"}[branch]
     model.configure_trainable(train_branch)
@@ -293,13 +312,13 @@ def _oracle_run(domain: dict[str, object], frames: list[GeometryFrame], *, image
             observation = observations[(offset + position) % len(observations)]
             scores = score_generator(torch.as_tensor([observation.timestamp_s], device=device))
             uv = _uv(observation, min(pixel_samples, observation.image.shape[-1] * observation.image.shape[-2]), random)
-            prediction = _oracle_render(model, observation, scores, train_branch, uv, psf_training_mode=psf_training_mode, target_seed=seed + observation.dynamic_frame_id)
+            prediction = _oracle_render(model, observation, scores, train_branch, uv, psf_training_mode=psf_training_mode, target_seed=seed + observation.dynamic_frame_id, psf_offset_cache=psf_offset_caches[observation.dynamic_frame_id])
             target = observation.image[0, uv[:, 1].long(), uv[:, 0].long()]
             losses.append((prediction - target).square().mean())
         loss = torch.stack(losses).mean() + norm_weight * model.normalization(train_branch)
         loss.backward(); optimizer.step()
     parameter_groups = [{"lr": float(group["lr"]), "parameter_count": sum(parameter.numel() for parameter in group["params"])} for group in optimizer.param_groups]
-    rows, arrays = _oracle_evaluation(model, observations, motion, score_generator, train_branch, domain, pixel_samples)
+    rows, arrays = _oracle_evaluation(model, observations, psf_offset_caches, motion, score_generator, train_branch, psf_training_mode, domain, pixel_samples)
     return rows, arrays, parameter_groups
 
 
@@ -378,7 +397,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     _write_rows(args.output_dir / "observability_per_location.csv", obs_rows)
     _write_observability_aggregate(args.output_dir / "observability_aggregate.csv", obs_aggregate)
     with (args.output_dir / "direct_mbc_fit.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["branch", "epe_mm", "gt_rms_mm", "normalized_epe", "spatial_cosine", "rms_ratio", "max_error_mm", "mbc_normalization", "mbc_normalization_weight"]); writer.writeheader(); writer.writerows({"branch": key, **value} for key, value in direct.items())
+        writer = csv.DictWriter(handle, fieldnames=["branch", "learning_rate", "epe_mm", "gt_rms_mm", "normalized_epe", "spatial_cosine", "rms_ratio", "max_error_mm", "mbc_normalization", "mbc_normalization_weight"]); writer.writeheader(); writer.writerows({"branch": key, **value} for key, value in direct.items())
     _write_rows(args.output_dir / "oracle_per_location.csv", oracle_rows)
     _write_aggregate(args.output_dir / "oracle_aggregate.csv", oracle_aggregate)
     np.savez_compressed(args.output_dir / "recovery_arrays.npz", **arrays)

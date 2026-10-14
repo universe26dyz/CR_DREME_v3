@@ -24,6 +24,36 @@ class _ZeroDisplacement(nn.Module):
 
 
 @dataclass(frozen=True)
+class TargetPSFOffsetCache:
+    """Full-image standard-normal PSF draws, indexed in row-major pixel order."""
+    standard_normal_offsets: torch.Tensor
+    height: int
+    width: int
+
+    def for_pixel_uv(self, pixel_uv: torch.Tensor) -> torch.Tensor:
+        u, v = pixel_uv[:, 0].long(), pixel_uv[:, 1].long()
+        if torch.any(u < 0) or torch.any(u >= self.width) or torch.any(v < 0) or torch.any(v >= self.height):
+            raise ValueError("pixel_uv lies outside the target image")
+        return self.standard_normal_offsets[(v * self.width + u).to(self.standard_normal_offsets.device)]
+
+
+def build_target_psf_offset_cache(observation: DynamicObservation, *, psf_samples: int, seed: int) -> TargetPSFOffsetCache:
+    """Recreate the target renderer's one full-image ``torch.randn`` stream."""
+    height, width = observation.image.shape[-2:]
+    device, dtype = observation.image.device, observation.image.dtype
+    devices = [device.index if device.index is not None else 0] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        if device.type == "cuda":
+            with torch.cuda.device(device):
+                torch.cuda.manual_seed(seed)
+                offsets = torch.randn(height * width, psf_samples, 3, device=device, dtype=dtype)
+        else:
+            offsets = torch.randn(height * width, psf_samples, 3, device=device, dtype=dtype)
+    return TargetPSFOffsetCache(offsets, height, width)
+
+
+@dataclass(frozen=True)
 class OracleScoreScales:
     """GT component RMS amplitudes measured on C4's physical norm grids."""
     respiratory_component_rms_mm: torch.Tensor
@@ -110,11 +140,20 @@ class OracleMBCMotionModel(nn.Module):
             cardiac = ScoreWeightedMBCField(self.cardiac_mbc, scores["card_scores"])
         return SequentialPullbackMotion(respiratory, cardiac)
 
-    def render(self, observation: DynamicObservation, scores: dict[str, torch.Tensor], branch: str, pixel_uv: torch.Tensor) -> torch.Tensor:
+    def render(self, observation: DynamicObservation, scores: dict[str, torch.Tensor], branch: str, pixel_uv: torch.Tensor, *, standard_normal_offsets: torch.Tensor | None = None) -> torch.Tensor:
         points = SourceFirstDynamicModel._pixel_world(observation, pixel_uv.to(observation.image))
         spacing = observation.pixel_spacing_mm.to(points)
         resolution = torch.stack((spacing[1], spacing[0], points.new_tensor(observation.slice_thickness_mm))).expand(points.shape[0], 3)
         axes = {"row_direction": observation.row_direction.to(points).expand(points.shape[0], -1), "column_direction": observation.column_direction.to(points).expand(points.shape[0], -1), "normal": observation.normal.to(points).expand(points.shape[0], -1)}
+        if standard_normal_offsets is not None:
+            if standard_normal_offsets.shape != (points.shape[0], self.psf.n_samples, 3):
+                raise ValueError("cached PSF offsets must be [pixels, psf_samples, xyz]")
+            sigma = self.psf.sigma_mm(resolution).to(points)
+            basis = torch.stack((axes["row_direction"], axes["column_direction"], axes["normal"]), dim=-1)
+            samples = points[:, None] + torch.einsum("nij,nsj->nsi", basis, standard_normal_offsets.to(points) * sigma[:, None])
+            reference_points = self.motion(scores, branch)(samples)["reference_points_mm"]
+            intensity, _ = self.canonical(reference_points, return_features=True)
+            return intensity.mean(-1)
         return self.psf(self.canonical, points, resolution, **axes, motion=self.motion(scores, branch))["predicted_intensity"]
 
     def normalization(self, branch: str) -> torch.Tensor:
