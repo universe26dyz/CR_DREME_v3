@@ -95,6 +95,40 @@ def _oracle_render(model, observation, scores: dict[str, torch.Tensor], branch: 
     raise ValueError("psf_training_mode must be matched_crn or stochastic")
 
 
+def _full_image_uv(observation) -> torch.Tensor:
+    """Return row-major image pixels as ``(u, v)`` coordinates."""
+    height, width = observation.image.shape[-2:]
+    return torch.stack(
+        torch.meshgrid(
+            torch.arange(width, device=observation.image.device),
+            torch.arange(height, device=observation.image.device),
+            indexing="xy",
+        ),
+        dim=-1,
+    ).reshape(-1, 2).to(dtype=observation.image.dtype)
+
+
+def _render_full_image_chunked(model, observation, scores: dict[str, torch.Tensor], branch: str, *, psf_training_mode: str, target_seed: int, pixel_chunk: int, psf_offset_cache: TargetPSFOffsetCache | None = None) -> torch.Tensor:
+    """Render one image without presenting all pixels as one MBC batch."""
+    if pixel_chunk < 1:
+        raise ValueError("evaluation pixel chunk must be positive")
+    chunks = []
+    for pixel_uv in _full_image_uv(observation).split(pixel_chunk):
+        chunks.append(
+            _oracle_render(
+                model,
+                observation,
+                scores,
+                branch,
+                pixel_uv,
+                psf_training_mode=psf_training_mode,
+                target_seed=target_seed,
+                psf_offset_cache=psf_offset_cache,
+            )
+        )
+    return torch.cat(chunks)
+
+
 def _roi_mse(predicted: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
     selected = (predicted - target).square()[mask]
     return float(selected.mean()) if selected.numel() else float("nan")
@@ -249,7 +283,41 @@ def _oracle_target_observations(frames: list[GeometryFrame], *, image_shape: tup
     return observations, {item.dynamic_frame_id: build_target_psf_offset_cache(item, psf_samples=psf_samples, seed=seed + item.dynamic_frame_id) for item in observations}
 
 
-def _oracle_evaluation(model, observations: list, psf_offset_caches: dict[int, TargetPSFOffsetCache], motion: GroundTruthMotion, generator: OracleScoreGenerator, branch: str, psf_training_mode: str, domain: dict[str, object], pixel_samples: int) -> tuple[dict[str, dict[str, float]], dict[str, np.ndarray]]:
+def _unavailable_spectral_metrics(channel_count: int) -> dict[str, float]:
+    return {
+        "spectral_available": 0.0,
+        "channel_count": float(channel_count),
+        "dominant_frequency_hz": float("nan"),
+        "dominant_in_target_band": float("nan"),
+        "target_band_power": float("nan"),
+        "wrong_band_power": float("nan"),
+        "correct_band_fraction": float("nan"),
+        "wrong_band_fraction": float("nan"),
+    }
+
+
+def _oracle_spectral_metrics(scores: torch.Tensor, timestamps_s: torch.Tensor, frequency_hz: float, *, formal_sequence: bool) -> dict[str, float]:
+    """Run one branch's NUDFT diagnostic only when its target is supported."""
+    band = (frequency_hz - .05, frequency_hz + .05)
+    try:
+        ordered = timestamps_s.sort().values
+        if ordered.numel() < 3:
+            raise ValueError("need at least three timestamped frames")
+        median_delta = ordered.diff().median()
+        if not torch.isfinite(median_delta) or not float(median_delta) > 0:
+            raise ValueError("timestamps need positive median spacing")
+        if band[1] > .5 / float(median_delta):
+            raise ValueError("target band exceeds timestamp Nyquist support")
+        return {"spectral_available": 1.0, **location_spectral_metrics(scores, timestamps_s, [band])}
+    except ValueError:
+        if formal_sequence:
+            raise
+        return _unavailable_spectral_metrics(scores.reshape(scores.shape[0], -1).shape[1])
+
+
+@torch.inference_mode()
+def _oracle_evaluation(model, observations: list, psf_offset_caches: dict[int, TargetPSFOffsetCache], motion: GroundTruthMotion, generator: OracleScoreGenerator, branch: str, psf_training_mode: str, domain: dict[str, object], pixel_samples: int, evaluation_pixel_chunk: int) -> tuple[dict[str, dict[str, float]], dict[str, np.ndarray]]:
+    del domain, pixel_samples
     grouped = _group(observations, [GeometryFrame(item.view, item.slice_id, item.center_mm, item.row_direction, item.column_direction, item.normal, item.pixel_spacing_mm, item.slice_thickness_mm, item.timestamp_s, item.image.shape[-2], item.image.shape[-1]) for item in observations])
     result: dict[str, dict[str, float]] = {}; arrays: dict[str, np.ndarray] = {}
     resp_grid, _ = SourceFirstDynamicModel._physical_grid(model.lower_world_mm, model.upper_world_mm, (4, 4, 4))
@@ -258,14 +326,14 @@ def _oracle_evaluation(model, observations: list, psf_offset_caches: dict[int, T
         predicted_images: list[torch.Tensor] = []; independent_images: list[torch.Tensor] = []; target_images: list[torch.Tensor] = []; resp_pred: list[torch.Tensor] = []; resp_gt: list[torch.Tensor] = []; card_pred: list[torch.Tensor] = []; card_gt: list[torch.Tensor] = []; total_pred: list[torch.Tensor] = []; total_gt: list[torch.Tensor] = []; ts: list[float] = []
         for _, observation, _ in sequence:
             timestamp = resp_grid.new_tensor([observation.timestamp_s]); scores = generator(timestamp); learned_motion = model.motion(scores, branch)
-            uv = torch.stack(torch.meshgrid(torch.arange(observation.image.shape[-1], device=resp_grid.device), torch.arange(observation.image.shape[-2], device=resp_grid.device), indexing="xy"), dim=-1).reshape(-1, 2).float()
             if psf_training_mode == "matched_crn":
-                prediction = _oracle_render(model, observation, scores, branch, uv, psf_training_mode="matched_crn", target_seed=observation.dynamic_frame_id, psf_offset_cache=psf_offset_caches[observation.dynamic_frame_id])
+                prediction = _render_full_image_chunked(model, observation, scores, branch, psf_training_mode="matched_crn", target_seed=observation.dynamic_frame_id, psf_offset_cache=psf_offset_caches[observation.dynamic_frame_id], pixel_chunk=evaluation_pixel_chunk)
                 with _psf_rng(resp_grid.device, 1000 + observation.dynamic_frame_id):
-                    independent_images.append(model.render(observation, scores, branch, uv).reshape(1, *observation.image.shape[-2:]))
+                    independent = _render_full_image_chunked(model, observation, scores, branch, psf_training_mode="stochastic", target_seed=1000 + observation.dynamic_frame_id, pixel_chunk=evaluation_pixel_chunk)
+                independent_images.append(independent.reshape(1, *observation.image.shape[-2:]))
             else:
                 with _psf_rng(resp_grid.device, 1000 + observation.dynamic_frame_id):
-                    prediction = model.render(observation, scores, branch, uv)
+                    prediction = _render_full_image_chunked(model, observation, scores, branch, psf_training_mode="stochastic", target_seed=1000 + observation.dynamic_frame_id, pixel_chunk=evaluation_pixel_chunk)
             predicted_images.append(prediction.reshape(1, *observation.image.shape[-2:]))
             target_images.append(observation.image)
             if branch in {"resp", "combined"}:
@@ -286,15 +354,16 @@ def _oracle_evaluation(model, observations: list, psf_offset_caches: dict[int, T
                 dvf_values["normalized_epe"] = dvf_values["endpoint_error_mm"] / max(dvf_values["gt_dynamic_rms_mm"], 1e-12)
                 values.update({f"{label}_{key}": value for key, value in dvf_values.items()})
         all_scores = generator(torch.as_tensor(ts, device=resp_grid.device))
-        for score_name, score_values, frequency in (("resp", all_scores["resp_scores"], motion.respiratory_frequency_hz), ("card", all_scores["card_scores"], motion.cardiac_frequency_hz)):
-            score_metrics = location_spectral_metrics(score_values, torch.as_tensor(ts, device=resp_grid.device), [(frequency - .05, frequency + .05)])
+        score_branches = (("resp", all_scores["resp_scores"], motion.respiratory_frequency_hz),) if branch == "resp" else (("card", all_scores["card_scores"], motion.cardiac_frequency_hz),) if branch == "card" else (("resp", all_scores["resp_scores"], motion.respiratory_frequency_hz), ("card", all_scores["card_scores"], motion.cardiac_frequency_hz))
+        for score_name, score_values, frequency in score_branches:
+            score_metrics = _oracle_spectral_metrics(score_values, torch.as_tensor(ts, device=resp_grid.device), frequency, formal_sequence=len(ts) >= 50)
             values.update({f"oracle_{score_name}_score_{key}": value for key, value in score_metrics.items()})
         result[location] = values
         stem = location.replace("/", "_"); arrays[f"oracle_{stem}_timestamps_s"] = np.asarray(ts); arrays[f"oracle_{stem}_predicted_images"] = torch.stack(predicted_images).detach().cpu().numpy()
     return result, arrays
 
 
-def _oracle_run(domain: dict[str, object], frames: list[GeometryFrame], *, image_shape: tuple[int, int], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, config: dict[str, object], score_scales: OracleScoreScales, branch: str, device: torch.device, steps: int, pixel_samples: int, observations_per_update: int, psf_training_mode: str, seed: int, smoke: bool) -> tuple[dict[str, dict[str, float]], dict[str, np.ndarray], list[dict[str, float]]]:
+def _oracle_run(domain: dict[str, object], frames: list[GeometryFrame], *, image_shape: tuple[int, int], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, config: dict[str, object], score_scales: OracleScoreScales, branch: str, device: torch.device, steps: int, pixel_samples: int, observations_per_update: int, psf_training_mode: str, evaluation_pixel_chunk: int, seed: int, smoke: bool) -> tuple[dict[str, dict[str, float]], dict[str, np.ndarray], list[dict[str, float]]]:
     hidden, resp_shapes, card_shape, psf_samples = _source_mbc_shapes(config, smoke)
     normalization_grid_shapes = _normalization_grid_shapes(config, smoke)
     observations, psf_offset_caches = _oracle_target_observations(frames, image_shape=image_shape, phantom=phantom, motion=motion, branch=branch, psf_samples=psf_samples, seed=seed)
@@ -318,7 +387,12 @@ def _oracle_run(domain: dict[str, object], frames: list[GeometryFrame], *, image
         loss = torch.stack(losses).mean() + norm_weight * model.normalization(train_branch)
         loss.backward(); optimizer.step()
     parameter_groups = [{"lr": float(group["lr"]), "parameter_count": sum(parameter.numel() for parameter in group["params"])} for group in optimizer.param_groups]
-    rows, arrays = _oracle_evaluation(model, observations, psf_offset_caches, motion, score_generator, train_branch, psf_training_mode, domain, pixel_samples)
+    optimizer.zero_grad(set_to_none=True)
+    loss = losses = prediction = target = scores = uv = None
+    del optimizer
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    rows, arrays = _oracle_evaluation(model, observations, psf_offset_caches, motion, score_generator, train_branch, psf_training_mode, domain, pixel_samples, evaluation_pixel_chunk)
     return rows, arrays, parameter_groups
 
 
@@ -390,7 +464,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         direct = _direct_fit(domain, phantom, motion, config, score_scales, device=device, steps=args.steps, smoke=args.smoke)
     branch_map = {"oracle_resp_only": "resp", "oracle_card_only": "card", "oracle_combined": "combined"}
     if args.mode in branch_map:
-        oracle_rows, values, optimizer_parameter_groups = _oracle_run(domain, frames, image_shape=image_shape, phantom=phantom, motion=motion, config=config, score_scales=score_scales, branch=branch_map[args.mode], device=device, steps=args.steps, pixel_samples=args.pixel_samples, observations_per_update=args.observations_per_update, psf_training_mode=args.psf_training_mode, seed=args.seed, smoke=args.smoke)
+        oracle_rows, values, optimizer_parameter_groups = _oracle_run(domain, frames, image_shape=image_shape, phantom=phantom, motion=motion, config=config, score_scales=score_scales, branch=branch_map[args.mode], device=device, steps=args.steps, pixel_samples=args.pixel_samples, observations_per_update=args.observations_per_update, psf_training_mode=args.psf_training_mode, evaluation_pixel_chunk=getattr(args, "evaluation_pixel_chunk", 64), seed=args.seed, smoke=args.smoke)
         arrays.update(values)
     obs_aggregate = _aggregate_by_amplitude_scale(obs_rows) if obs_rows else {}
     oracle_aggregate = aggregate_location_metrics(oracle_rows) if oracle_rows else {}
@@ -412,7 +486,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     elif any(direct_label(branch) == "fail" for branch in direct): interpretation = "production MBC direct representability is the limiting factor"
     elif oracle_rows and recovery == "fail": interpretation = "MBC is tested directly; oracle image-domain recovery points to reconstruction-gradient/optimization"
     elif oracle_rows and recovery == "pass": interpretation = "oracle recovery supports an encoder/state-inference explanation for original Exp1 failure"
-    summary = {"experiment": "exp1b_observability_oracle", "mode": args.mode, "observability": observability, "resp_direct_mbc_fit": direct_label("resp"), "card_direct_mbc_fit": direct_label("card"), "oracle_resp_recovery": recovery if args.mode == "oracle_resp_only" else "indeterminate", "oracle_card_recovery": recovery if args.mode == "oracle_card_only" else "indeterminate", "oracle_combined_recovery": recovery if args.mode == "oracle_combined" else "indeterminate", "mechanistic_interpretation": interpretation, "observability_aggregate_by_amplitude_scale": obs_aggregate, "direct_mbc_metrics": direct, "direct_mbc_normalization_weight": float(config["training"]["loss_weights"]["mbc_normalization"]), "oracle_aggregate": oracle_aggregate, "oracle_score_scales": score_scales.summary(), "recovery_thresholds": thresholds, "training": {"steps": args.steps, "pixel_samples": args.pixel_samples, "observations_per_update": args.observations_per_update, "psf_training_mode": getattr(args, "psf_training_mode", "stochastic"), "optimizer_parameter_groups": optimizer_parameter_groups, "normalization_grid_shapes": {"respiratory": list(normalization_grid_shapes[0]), "cardiac": list(normalization_grid_shapes[1])}, "canonical_trainable": False, "encoder_trainable": False}}
+    summary = {"experiment": "exp1b_observability_oracle", "mode": args.mode, "observability": observability, "resp_direct_mbc_fit": direct_label("resp"), "card_direct_mbc_fit": direct_label("card"), "oracle_resp_recovery": recovery if args.mode == "oracle_resp_only" else "indeterminate", "oracle_card_recovery": recovery if args.mode == "oracle_card_only" else "indeterminate", "oracle_combined_recovery": recovery if args.mode == "oracle_combined" else "indeterminate", "mechanistic_interpretation": interpretation, "observability_aggregate_by_amplitude_scale": obs_aggregate, "direct_mbc_metrics": direct, "direct_mbc_normalization_weight": float(config["training"]["loss_weights"]["mbc_normalization"]), "oracle_aggregate": oracle_aggregate, "oracle_score_scales": score_scales.summary(), "recovery_thresholds": thresholds, "training": {"steps": args.steps, "pixel_samples": args.pixel_samples, "evaluation_pixel_chunk": getattr(args, "evaluation_pixel_chunk", 64), "observations_per_update": args.observations_per_update, "psf_training_mode": getattr(args, "psf_training_mode", "stochastic"), "optimizer_parameter_groups": optimizer_parameter_groups, "normalization_grid_shapes": {"respiratory": list(normalization_grid_shapes[0]), "cardiac": list(normalization_grid_shapes[1])}, "canonical_trainable": False, "encoder_trainable": False}}
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
 
@@ -424,7 +498,7 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path); parser.add_argument("--qc-table", type=Path); parser.add_argument("--canonical-domain", type=Path)
     parser.add_argument("--mode", choices=("observability", "direct_mbc", "oracle_resp_only", "oracle_card_only", "oracle_combined", "all"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True); parser.add_argument("--device", default="cpu"); parser.add_argument("--overwrite", action="store_true"); parser.add_argument("--smoke", action="store_true"); parser.add_argument("--psf-training-mode", choices=("matched_crn", "stochastic"), default="stochastic")
-    parser.add_argument("--locations-per-view", type=int, default=3); parser.add_argument("--frames-per-location", type=int, default=50); parser.add_argument("--steps", type=int, default=400); parser.add_argument("--pixel-samples", type=int, default=256); parser.add_argument("--observations-per-update", type=int, default=32); parser.add_argument("--amplitude-scales", type=lambda value: [float(item) for item in value.split(",")], default=[1.0]); parser.add_argument("--max-normalized-epe", type=float, default=.25); parser.add_argument("--min-spatial-cosine", type=float, default=.90); parser.add_argument("--min-rms-ratio", type=float, default=.75); parser.add_argument("--max-rms-ratio", type=float, default=1.25); parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--locations-per-view", type=int, default=3); parser.add_argument("--frames-per-location", type=int, default=50); parser.add_argument("--steps", type=int, default=400); parser.add_argument("--pixel-samples", type=int, default=256); parser.add_argument("--evaluation-pixel-chunk", type=int, default=64); parser.add_argument("--observations-per-update", type=int, default=32); parser.add_argument("--amplitude-scales", type=lambda value: [float(item) for item in value.split(",")], default=[1.0]); parser.add_argument("--max-normalized-epe", type=float, default=.25); parser.add_argument("--min-spatial-cosine", type=float, default=.90); parser.add_argument("--min-rms-ratio", type=float, default=.75); parser.add_argument("--max-rms-ratio", type=float, default=1.25); parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     if (args.manifest is None) != (args.qc_table is None): parser.error("--manifest and --qc-table must be provided together")
     if args.smoke:

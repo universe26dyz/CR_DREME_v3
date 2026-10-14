@@ -30,7 +30,10 @@ from experiments.c4_diagnostics.exp1b_observability_oracle import (
     _direct_recovery_label,
     _normalization_grid_shapes,
     _oracle_optimizer,
+    _oracle_evaluation,
     _oracle_render,
+    _oracle_spectral_metrics,
+    _render_full_image_chunked,
     _observability_label,
     _roi_mse,
     run,
@@ -182,6 +185,58 @@ def test_matched_crn_reuses_target_psf_and_stochastic_redraws_samples() -> None:
     assert torch.allclose(matched, expected, atol=1e-6, rtol=0.0)
     assert not torch.allclose(stochastic_a, expected, atol=1e-6, rtol=0.0)
     assert not torch.equal(stochastic_a, stochastic_b)
+
+
+def test_chunked_oracle_evaluation_preserves_exact_crn_without_graph() -> None:
+    """Evaluation chunks must retain row-major cached target PSF pairing."""
+    domain = _domain(); phantom = AnalyticCanonicalPhantom(domain)
+    motion = GroundTruthMotion.from_domain(domain, respiratory_amplitude_mm=0.0, cardiac_amplitude_mm=0.0)
+    target = render_synthetic_observation(_frame(.4), height=8, width=8, phantom=phantom, motion=motion, psf_samples=1, seed=19, dynamic_frame_id=0)
+    model = build_oracle_motion_model(domain, phantom, device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1, normalization_grid_shapes=((3, 3, 3), (3, 3, 3)))
+    cache = build_target_psf_offset_cache(target, psf_samples=1, seed=19)
+    full_uv = torch.stack(torch.meshgrid(torch.arange(8), torch.arange(8), indexing="xy"), dim=-1).reshape(-1, 2).float()
+    with torch.inference_mode():
+        unchunked = _oracle_render(model, target, {}, "zero", full_uv, psf_training_mode="matched_crn", target_seed=19, psf_offset_cache=cache)
+        chunked = _render_full_image_chunked(model, target, {}, "zero", psf_training_mode="matched_crn", target_seed=19, psf_offset_cache=cache, pixel_chunk=3)
+    assert torch.allclose(chunked, unchunked, atol=1e-6, rtol=0.0)
+    assert not chunked.requires_grad
+    assert chunked.grad_fn is None
+
+
+def test_chunked_stochastic_and_independent_psf_render_paths_are_graph_free() -> None:
+    domain = _domain(); phantom = AnalyticCanonicalPhantom(domain)
+    motion = GroundTruthMotion.from_domain(domain, respiratory_amplitude_mm=0.0, cardiac_amplitude_mm=0.0)
+    target = render_synthetic_observation(_frame(.4), height=8, width=8, phantom=phantom, motion=motion, psf_samples=1, seed=23, dynamic_frame_id=0)
+    model = build_oracle_motion_model(domain, phantom, device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1, normalization_grid_shapes=((3, 3, 3), (3, 3, 3)))
+    with torch.inference_mode():
+        stochastic = _render_full_image_chunked(model, target, {}, "zero", psf_training_mode="stochastic", target_seed=23, pixel_chunk=5)
+        independent = _render_full_image_chunked(model, target, {}, "zero", psf_training_mode="stochastic", target_seed=1023, pixel_chunk=5)
+    assert stochastic.shape == independent.shape == (64,)
+    assert not stochastic.requires_grad and stochastic.grad_fn is None
+    assert not independent.requires_grad and independent.grad_fn is None
+
+
+def test_oracle_evaluation_returns_detached_branch_specific_outputs() -> None:
+    domain = _domain(); phantom = AnalyticCanonicalPhantom(domain)
+    motion = GroundTruthMotion.from_domain(domain, respiratory_amplitude_mm=0.0, cardiac_amplitude_mm=0.0)
+    observations = [render_synthetic_observation(_frame(.2 * index), height=8, width=8, phantom=phantom, motion=motion, psf_samples=1, seed=29 + index, dynamic_frame_id=index) for index in range(3)]
+    model = build_oracle_motion_model(domain, phantom, device=torch.device("cpu"), active_respiratory_levels=1, hidden_dim=4, logical_shape=(2, 2, 2), psf_samples=1, normalization_grid_shapes=((3, 3, 3), (3, 3, 3)))
+    generator = OracleScoreGenerator(motion, _scales(domain, motion), active_respiratory_levels=1)
+    caches = {item.dynamic_frame_id: build_target_psf_offset_cache(item, psf_samples=1, seed=29 + item.dynamic_frame_id) for item in observations}
+    rows, arrays = _oracle_evaluation(model, observations, caches, motion, generator, "resp", "matched_crn", domain, pixel_samples=4, evaluation_pixel_chunk=3)
+    values = next(iter(rows.values()))
+    assert any(key.startswith("oracle_resp_score_") for key in values)
+    assert not any(key.startswith("oracle_card_score_") for key in values)
+    assert all(not isinstance(value, torch.Tensor) for value in values.values())
+    assert all(not isinstance(value, torch.Tensor) for value in arrays.values())
+
+
+def test_smoke_spectral_diagnostic_is_unavailable_instead_of_crashing_above_nyquist() -> None:
+    timestamps = torch.tensor([0.0, 1.0, 2.0])
+    scores = torch.randn(3, 1, 3)
+    metrics = _oracle_spectral_metrics(scores, timestamps, frequency_hz=1.0, formal_sequence=False)
+    assert metrics["spectral_available"] == 0.0
+    assert math.isnan(metrics["dominant_frequency_hz"])
 
 
 def test_cardiac_roi_mse_is_not_diluted_by_whole_fov() -> None:
