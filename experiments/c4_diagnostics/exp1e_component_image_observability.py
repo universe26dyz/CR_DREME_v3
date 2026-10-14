@@ -31,6 +31,7 @@ from experiments.c4_diagnostics.synthetic.motion import GroundTruthMotion
 from experiments.c4_diagnostics.synthetic.oracle import TargetPSFOffsetCache, build_oracle_motion_model, build_target_psf_offset_cache
 from experiments.c4_diagnostics.synthetic.phantom import AnalyticCanonicalPhantom
 from experiments.c4_diagnostics.synthetic.render import GeometryFrame
+from cardioresp4d.training.model import SourceFirstDynamicModel
 
 
 COMPONENTS = ("row", "column", "normal")
@@ -83,26 +84,26 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
     return float("nan") if not math.isfinite(numerator) or not math.isfinite(denominator) or denominator <= EPSILON else numerator / denominator
 
 
-def component_image_metrics(full_gt: torch.Tensor, zero_motion: torch.Tensor, remove_component: torch.Tensor, flip_component: torch.Tensor, component_dvf_mm: torch.Tensor, total_dvf_world_mm: torch.Tensor | None = None) -> dict[str, float]:
-    """Image effects and dynamic component strength for one fixed location."""
+def component_image_metrics(full_gt: torch.Tensor, zero_motion: torch.Tensor, remove_component: torch.Tensor, flip_component: torch.Tensor, center_component_dvf_mm: torch.Tensor, center_total_dvf_world_mm: torch.Tensor | None = None) -> dict[str, float]:
+    """PSF-integrated image effects normalized by fixed center-support motion."""
     if not (full_gt.shape == zero_motion.shape == remove_component.shape == flip_component.shape) or full_gt.ndim < 2:
         raise ValueError("image variants must be matched [time, ...]")
-    if component_dvf_mm.shape[0] != full_gt.shape[0]:
-        raise ValueError("component DVF and images must share time frames")
-    dynamic = component_dvf_mm - component_dvf_mm.mean(dim=0, keepdim=True)
+    if center_component_dvf_mm.shape[0] != full_gt.shape[0]:
+        raise ValueError("center-support component DVF and images must share time frames")
+    dynamic = center_component_dvf_mm - center_component_dvf_mm.mean(dim=0, keepdim=True)
     component_rms = float(dynamic.square().mean().sqrt())
     dynamic_energy = float(dynamic.square().sum())
-    if total_dvf_world_mm is None:
+    if center_total_dvf_world_mm is None:
         total_energy = dynamic_energy
     else:
-        total_dynamic = total_dvf_world_mm - total_dvf_world_mm.mean(dim=0, keepdim=True)
+        total_dynamic = center_total_dvf_world_mm - center_total_dvf_world_mm.mean(dim=0, keepdim=True)
         total_energy = float(total_dynamic.square().sum())
     remove_mse = float((full_gt - remove_component).square().mean())
     flip_mse = float((full_gt - flip_component).square().mean())
     total_motion_mse = float((full_gt - zero_motion).square().mean())
     return {
-        "gt_component_dynamic_rms_mm": component_rms,
-        "gt_component_energy_fraction": _safe_ratio(dynamic_energy, total_energy),
+        "gt_center_component_dynamic_rms_mm": component_rms,
+        "gt_center_component_energy_fraction": _safe_ratio(dynamic_energy, total_energy),
         "remove_mse": remove_mse,
         "remove_rmse": math.sqrt(remove_mse),
         "flip_mse": flip_mse,
@@ -141,6 +142,28 @@ def _check_location_basis(frames: list[GeometryFrame]) -> GeometryFrame:
         if not (torch.allclose(frame.row_direction, reference.row_direction, atol=1e-4, rtol=0.0) and torch.allclose(frame.column_direction, reference.column_direction, atol=1e-4, rtol=0.0) and torch.allclose(frame.normal, reference.normal, atol=1e-4, rtol=0.0)):
             raise ValueError(f"DICOM basis changes within fixed location {reference.view}/{reference.slice_id}")
     return reference
+
+
+def fixed_center_support_world_points(observations: list, *, tolerance_mm: float = 1e-4) -> torch.Tensor:
+    """Reconstruct and validate the fixed rendered pixel-center support."""
+    if not observations:
+        raise ValueError("location has no observations")
+    points = torch.stack([SourceFirstDynamicModel._pixel_world(observation, _full_image_uv(observation).to(observation.image)) for observation in observations])
+    if not torch.allclose(points, points[0].expand_as(points), atol=tolerance_mm, rtol=0.0):
+        raise ValueError("pixel-center world coordinates differ across frames of one fixed location")
+    return points
+
+
+def center_support_component_fields(observations: list, motion: GroundTruthMotion) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """GT respiratory DVFs and DICOM components on temporally corresponding centers."""
+    points = fixed_center_support_world_points(observations)
+    reference = observations[0]
+    for observation in observations[1:]:
+        if not (torch.allclose(observation.row_direction, reference.row_direction, atol=1e-4, rtol=0.0) and torch.allclose(observation.column_direction, reference.column_direction, atol=1e-4, rtol=0.0) and torch.allclose(observation.normal, reference.normal, atol=1e-4, rtol=0.0)):
+            raise ValueError("DICOM basis changes within fixed location")
+    timestamps = points.new_tensor([observation.timestamp_s for observation in observations])
+    dvf = motion.respiratory_dvf_mm(points, timestamps)
+    return points, dvf, decompose_world_dvf(dvf, reference.row_direction, reference.column_direction, reference.normal)
 
 
 def _read_locations(path: Path) -> set[str]:
@@ -284,14 +307,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 raise ValueError(f"reconstructed matched-CRN full GT image differs from Exp1-C target for {location}")
         full = torch.stack([item[0]["full"] for item in rendered])
         zero = torch.stack([item[0]["zero"] for item in rendered])
-        dvf = torch.stack([item[1] for item in rendered])
-        components = decompose_world_dvf(dvf, basis.row_direction, basis.column_direction, basis.normal)
+        psf_dvf = torch.stack([item[1] for item in rendered])
+        _, center_dvf, center_components = center_support_component_fields(ordered, motion)
         for index, component in enumerate(COMPONENTS):
             remove = torch.stack([item[0][f"remove_{component}"] for item in rendered])
             flip = torch.stack([item[0][f"flip_{component}"] for item in rendered])
-            values = component_image_metrics(full, zero, remove, flip, components[..., index], dvf)
+            values = component_image_metrics(full, zero, remove, flip, center_components[..., index], center_dvf)
             joined = recovery.get(location, {}).get(component, {})
-            rows.append({"location": location, "view": basis.view, "component": component, "frame_count": len(ordered), "psf_query_count_per_frame": int(dvf.shape[1] * dvf.shape[2]), "recovery_metrics_available": float(bool(joined)), "rms_ratio": joined.get("rms_ratio", float("nan")), "correlation": joined.get("correlation", float("nan")), "normalized_epe": joined.get("normalized_epe", float("nan")), **values})
+            rows.append({"location": location, "view": basis.view, "component": component, "frame_count": len(ordered), "center_support_point_count": int(center_dvf.shape[1]), "psf_query_count_per_frame": int(psf_dvf.shape[1] * psf_dvf.shape[2]), "recovery_metrics_available": float(bool(joined)), "rms_ratio": joined.get("rms_ratio", float("nan")), "correlation": joined.get("correlation", float("nan")), "normalized_epe": joined.get("normalized_epe", float("nan")), **values})
     by_view = _aggregate_rows(rows, key="view")
     overall_rows = [dict(row, view="overall") for row in rows]
     overall = _aggregate_rows(overall_rows, key="view")
@@ -303,6 +326,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "n_locations": len(sequences),
         "per_view": by_view,
         "overall_per_component": overall,
+        "metric_support": {"component_amplitude_and_energy": "fixed rendered pixel-center acquisition support, spatially corresponding across time", "counterfactual_image_effects": "exact per-frame matched-CRN PSF support"},
         "recovery_metrics_joined": bool(recovery),
         "source_exp1c_summary": {"experiment": source_summary.get("experiment"), "mode": source_summary.get("mode")},
     }
