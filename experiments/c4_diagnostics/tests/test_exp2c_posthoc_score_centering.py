@@ -9,6 +9,7 @@ from experiments.c4_diagnostics.exp2c_posthoc_score_centering import (
     centered_spectrum,
     temporal_rms,
     render_resp_scores_from_cached_points,
+    _image_values,
 )
 from experiments.c4_diagnostics.synthetic.metrics import location_spectral_metrics
 from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField
@@ -68,3 +69,11 @@ def test_original_and_centered_renders_reuse_the_same_cached_query_points() -> N
     assert len(mbc.calls) == 2
     torch.testing.assert_close(mbc.calls[0], query.reshape(1, -1, 3))
     torch.testing.assert_close(mbc.calls[1], query.reshape(1, -1, 3))
+
+
+def test_temporal_dynamic_image_rms_excludes_static_spatial_contrast() -> None:
+    images = torch.tensor([[[0.0, 100.0]], [[0.0, 100.0]]])
+    target = images.clone()
+    values = _image_values(images, target, images)
+    assert values["temporal_dynamic_rms"] == pytest.approx(0.0)
+    assert values["temporal_image_std"] > 0.0

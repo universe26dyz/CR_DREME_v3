@@ -96,7 +96,11 @@ def _score_values(scores: torch.Tensor, timestamps: torch.Tensor, gt_state: torc
 
 def _image_values(images: torch.Tensor, target: torch.Tensor, original: torch.Tensor) -> dict[str, float]:
     values = temporal_dynamics_metrics(images, target)
-    values.update({"paired_psf_mse": float((images - target).square().mean()), "image_effect_vs_original_mse": float((images - original).square().mean()), "image_effect_vs_original_rmse": float((images - original).square().mean().sqrt()), "temporal_image_std": float(images.std(unbiased=False))})
+    dynamic = images - images.mean(dim=0, keepdim=True)
+    target_dynamic = target - target.mean(dim=0, keepdim=True)
+    dynamic_rms = float(dynamic.square().mean().sqrt())
+    target_dynamic_rms = float(target_dynamic.square().mean().sqrt())
+    values.update({"paired_psf_mse": float((images - target).square().mean()), "image_effect_vs_original_mse": float((images - original).square().mean()), "image_effect_vs_original_rmse": float((images - original).square().mean().sqrt()), "temporal_dynamic_rms": dynamic_rms, "gt_temporal_dynamic_rms": target_dynamic_rms, "temporal_dynamic_rms_ratio": float("nan") if target_dynamic_rms <= EPSILON else dynamic_rms / target_dynamic_rms, "temporal_image_std": float(images.std(unbiased=False))})
     return values
 
 
