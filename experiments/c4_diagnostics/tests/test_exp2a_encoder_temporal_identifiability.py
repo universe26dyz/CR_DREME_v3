@@ -7,6 +7,8 @@ import torch
 
 from cardioresp4d.models.film_motion_encoder import GeometryFiLMMotionEncoder
 from experiments.c4_diagnostics.exp2a_encoder_temporal_identifiability import (
+    _counterfactual_metrics,
+    build_film_encoder_from_checkpoint,
     counterfactual_encoder_inputs,
     extract_encoder_stages,
     feature_temporal_metrics,
@@ -38,6 +40,19 @@ def test_extracted_encoder_path_reproduces_production_resp_scores() -> None:
     expected = encoder(image, **geometry)["resp_scores"]
     actual = extract_encoder_stages(encoder, image, **geometry)
     torch.testing.assert_close(actual["resp_scores"], expected)
+
+
+def test_checkpoint_like_full_state_loads_only_strict_film_encoder_subset() -> None:
+    domain = {"world_min_mm": [-12.0, -12.0, -12.0], "world_max_mm": [12.0, 12.0, 12.0]}
+    config = {"model": {"film": {"channels": 4, "position_bands": 3}, "respiratory_mbc": {"hidden_dim": 7}}}
+    source = GeometryFiLMMotionEncoder(channels=4, canonical_lower_world_mm=torch.full((3,), -12.0), canonical_upper_world_mm=torch.full((3,), 12.0), position_bands=3)
+    checkpoint_state = {f"film_encoder.{name}": value.detach().clone() for name, value in source.state_dict().items()}
+    checkpoint_state["canonical.unrelated"] = torch.ones(1)
+    checkpoint_state["respiratory_mbc.unrelated"] = torch.ones(1)
+    loaded = build_film_encoder_from_checkpoint(config, domain, checkpoint_state)
+    assert loaded.position_bands == 3
+    for name, value in source.state_dict().items():
+        torch.testing.assert_close(loaded.state_dict()[name], value)
 
 
 def test_constant_geometry_within_location_is_validated() -> None:
@@ -85,3 +100,17 @@ def test_reference_geometry_counterfactual_keeps_original_image() -> None:
     torch.testing.assert_close(inputs["reference_geometry"]["image"], inputs["original"]["image"])
     torch.testing.assert_close(inputs["reference_geometry"]["center_mm"], reference.center_mm[None])
     assert not torch.equal(inputs["reference_geometry"]["center_mm"], inputs["original"]["center_mm"])
+
+
+def test_counterfactual_intervention_rms_detects_constant_score_offset() -> None:
+    base = torch.tensor([0.0, 1.0, -1.0]).reshape(3, 1, 1).expand(3, 3, 3)
+    values = _counterfactual_metrics(
+        {
+            "original": base,
+            "temporal_mean_image": base,
+            "reference_geometry": base + 5.0,
+            "temporal_mean_image_reference_geometry": base + 5.0,
+        },
+        torch.tensor([0.0, 1.0, -1.0]),
+    )
+    assert values["score_rms_difference_A_minus_C"] == pytest.approx(5.0)

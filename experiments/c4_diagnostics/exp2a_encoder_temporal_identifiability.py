@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import yaml
 
-from cardioresp4d.training.build_model import build_source_first_model
+from cardioresp4d.models.film_motion_encoder import GeometryFiLMMotionEncoder
 from experiments.c4_diagnostics.exp1_synthetic_gt_recovery import _build_observations, _load_domain, geometry_from_manifest
 from experiments.c4_diagnostics.synthetic.motion import GroundTruthMotion
 from experiments.c4_diagnostics.synthetic.phantom import AnalyticCanonicalPhantom
@@ -56,6 +56,28 @@ def _geometry_kwargs(observation) -> dict[str, torch.Tensor]:
         "pixel_spacing_mm": observation.pixel_spacing_mm.to(image)[None],
         "slice_thickness_mm": image.new_tensor([[observation.slice_thickness_mm]]),
     }
+
+
+def build_film_encoder_from_checkpoint(source_config: dict[str, object], domain: dict[str, object], checkpoint_state: dict[str, torch.Tensor]) -> GeometryFiLMMotionEncoder:
+    """Build only the production FiLM encoder and strict-load its checkpoint subset."""
+    model_config = source_config["model"]
+    film_config = model_config.get("film", {})
+    channels = int(film_config.get("channels", model_config["respiratory_mbc"]["hidden_dim"]))
+    encoder = GeometryFiLMMotionEncoder(
+        channels=channels,
+        canonical_lower_world_mm=torch.as_tensor(domain["world_min_mm"], dtype=torch.float32),
+        canonical_upper_world_mm=torch.as_tensor(domain["world_max_mm"], dtype=torch.float32),
+        position_bands=int(film_config.get("position_bands", 4)),
+    )
+    prefix = "film_encoder."
+    state = {name[len(prefix):]: value for name, value in checkpoint_state.items() if name.startswith(prefix)}
+    if not state:
+        raise ValueError("checkpoint has no film_encoder.* keys")
+    try:
+        encoder.load_state_dict(state, strict=True)
+    except RuntimeError as error:
+        raise ValueError("source config FiLM architecture disagrees with checkpoint") from error
+    return encoder
 
 
 def extract_encoder_stages(encoder, image: torch.Tensor, *, center_mm: torch.Tensor, row_direction: torch.Tensor, column_direction: torch.Tensor, normal: torch.Tensor, pixel_spacing_mm: torch.Tensor, slice_thickness_mm: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -187,17 +209,36 @@ def _location_stage_metrics(stages: dict[str, torch.Tensor], gt_state: torch.Ten
 
 def _counterfactual_metrics(scores: dict[str, torch.Tensor], gt_state: torch.Tensor) -> dict[str, float]:
     values = {name: feature_temporal_metrics(score, gt_state) for name, score in scores.items()}
-    rms = {name: value["temporal_rms"] for name, value in values.items()}
-    original, mean_image, reference, both = rms["original"], rms["temporal_mean_image"], rms["reference_geometry"], rms["temporal_mean_image_reference_geometry"]
+    original, mean_image, reference, both = (scores[name] for name in ("original", "temporal_mean_image", "reference_geometry", "temporal_mean_image_reference_geometry"))
+    original_temporal_rms = values["original"]["temporal_rms"]
+    reference_temporal_rms = values["reference_geometry"]["temporal_rms"]
+    rms = lambda value: float(value.square().mean().sqrt())
     return {
-        "original_resp_score_temporal_rms": original,
-        "score_rms_difference_original_minus_temporal_mean_image": original - mean_image,
-        "score_rms_difference_original_minus_reference_geometry": original - reference,
-        "score_rms_difference_interaction": (original - mean_image) - (reference - both),
+        "original_resp_score_temporal_rms": original_temporal_rms,
+        "score_rms_difference_A_minus_B": rms(original - mean_image),
+        "score_rms_difference_A_minus_C": rms(original - reference),
+        "score_rms_difference_interaction": rms((original - mean_image) - (reference - both)),
         "original_max_abs_gt_correlation": values["original"]["max_abs_gt_correlation"],
         "reference_geometry_max_abs_gt_correlation": values["reference_geometry"]["max_abs_gt_correlation"],
-        "temporal_variance_retained_reference_geometry": float("nan") if original <= EPSILON else (reference / original) ** 2,
+        "temporal_variance_retained_reference_geometry": float("nan") if original_temporal_rms <= EPSILON else (reference_temporal_rms / original_temporal_rms) ** 2,
     }
+
+
+def validate_source_timestamps(recovery_arrays: Path, groups: dict[str, list], *, tolerance_s: float = 1e-8) -> bool:
+    """Require Exp1's stored fixed-location timestamps when its arrays exist."""
+    if not recovery_arrays.is_file():
+        return False
+    with np.load(recovery_arrays, allow_pickle=False) as arrays:
+        stored = {name[: -len("_timestamps_s")]: arrays[name] for name in arrays.files if name.endswith("_timestamps_s")}
+    expected = {location.replace("/", "_") for location in groups}
+    if set(stored) != expected:
+        raise ValueError("source recovery arrays location names do not match recreated observations")
+    for location, sequence in groups.items():
+        timestamps = np.asarray([item.timestamp_s for item in sequence], dtype=np.float64)
+        source = np.asarray(stored[location.replace("/", "_")], dtype=np.float64)
+        if timestamps.shape != source.shape or not np.allclose(timestamps, source, atol=tolerance_s, rtol=0.0):
+            raise ValueError(f"source timestamps do not match recreated observations for {location}")
+    return True
 
 
 @torch.inference_mode()
@@ -222,11 +263,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     observations = _build_observations(frames, image_shape=image_shape, phantom=AnalyticCanonicalPhantom(domain), motion=motion, psf_samples=int(synthetic["psf_samples"]), seed=int(source_summary["provenance"]["seed"]))
     if len(observations) != int(source_summary["n_frames"]):
         raise ValueError("recreated frame count differs from the source synthetic motion-only run")
-    model = build_source_first_model(source_config, domain, n_dynamic_frames=len(observations), device=torch.device("cpu"))
-    model.load_state_dict(payload["model"]); model.eval()
     groups = _group_by_location(observations)
     if len(groups) != int(source_summary["n_locations"]):
         raise ValueError("recreated location count differs from the source synthetic motion-only run")
+    recovery_arrays = args.checkpoint.parent / "recovery_arrays.npz"
+    timestamps_validated = validate_source_timestamps(recovery_arrays, groups)
+    encoder = build_film_encoder_from_checkpoint(source_config, domain, payload["model"]).eval()
     references = {view: sorted((location for location in groups if location.split("/", 1)[0] == view))[0] for view in ("2CH", "4CH", "SAX")}
     feature_rows: list[dict[str, object]] = []; score_rows: list[dict[str, object]] = []; counter_rows: list[dict[str, object]] = []; arrays: dict[str, np.ndarray] = {}
     location_stage_means: dict[str, list[tuple[str, torch.Tensor, float]]] = defaultdict(list)
@@ -236,7 +278,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         gt_state = motion.respiratory_score(timestamps)
         stage_values: dict[str, list[torch.Tensor]] = {name: [] for name in FEATURE_STAGES}
         for observation in sequence:
-            values = extract_encoder_stages(model.film_encoder, observation.image.unsqueeze(0), **_geometry_kwargs(observation))
+            values = extract_encoder_stages(encoder, observation.image.unsqueeze(0), **_geometry_kwargs(observation))
             for name in FEATURE_STAGES:
                 stage_values[name].append(values[name][0].detach().cpu())
         stacked = {name: torch.stack(values) for name, values in stage_values.items()}
@@ -258,7 +300,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         condition_scores: dict[str, list[torch.Tensor]] = {name: [] for name in ("original", "temporal_mean_image", "reference_geometry", "temporal_mean_image_reference_geometry")}
         for observation in sequence:
             for condition, values in counterfactual_encoder_inputs(observation, temporal_mean_image, reference).items():
-                condition_scores[condition].append(extract_encoder_stages(model.film_encoder, **values)["resp_scores"][0].detach().cpu())
+                condition_scores[condition].append(extract_encoder_stages(encoder, **values)["resp_scores"][0].detach().cpu())
         counter_rows.append({"location": location, "view": view, "reference_location": references[view], "frame_count": len(sequence), **_counterfactual_metrics({name: torch.stack(values) for name, values in condition_scores.items()}, gt_state)})
     aggregate_rows: list[dict[str, object]] = []
     for stage, values in location_stage_means.items():
@@ -271,7 +313,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     _write_rows(args.output_dir / "resp_score_metrics_per_location.csv", score_rows)
     _write_rows(args.output_dir / "score_counterfactuals_per_location.csv", counter_rows)
     np.savez_compressed(args.output_dir / "feature_arrays.npz", **arrays)
-    summary = {"experiment": "exp2a_encoder_temporal_identifiability", "checkpoint": str(args.checkpoint), "checkpoint_provenance": source_summary.get("provenance", {}), "diagnostic_git_sha": _git_sha(), "source_config": str(args.source_config), "experiment_config": str(args.experiment_config), "manifest": str(args.manifest), "qc_table": str(args.qc_table), "canonical_domain": str(args.canonical_domain), "n_locations": len(groups), "n_frames": len(observations), "reference_location_by_view": references, "gt_respiratory_frequency_hz": motion.respiratory_frequency_hz, "counterfactual_interpretation": "image/geometry mismatches are diagnostic sensitivity interventions, not physical acquisitions"}
+    summary = {"experiment": "exp2a_encoder_temporal_identifiability", "checkpoint": str(args.checkpoint), "checkpoint_provenance": source_summary.get("provenance", {}), "diagnostic_git_sha": _git_sha(), "source_config": str(args.source_config), "experiment_config": str(args.experiment_config), "manifest": str(args.manifest), "qc_table": str(args.qc_table), "canonical_domain": str(args.canonical_domain), "source_recovery_arrays": str(recovery_arrays) if recovery_arrays.is_file() else None, "timestamps_validated": timestamps_validated, "n_locations": len(groups), "n_frames": len(observations), "reference_location_by_view": references, "gt_respiratory_frequency_hz": motion.respiratory_frequency_hz, "counterfactual_interpretation": "image/geometry mismatches are diagnostic sensitivity interventions, not physical acquisitions"}
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
 
