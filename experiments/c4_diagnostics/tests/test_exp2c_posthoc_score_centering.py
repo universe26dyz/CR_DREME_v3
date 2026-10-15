@@ -9,6 +9,7 @@ from experiments.c4_diagnostics.exp2c_posthoc_score_centering import (
     centered_spectrum,
     temporal_rms,
     render_resp_scores_from_cached_points,
+    rendered_frame_image,
     _image_values,
 )
 from experiments.c4_diagnostics.synthetic.metrics import location_spectral_metrics
@@ -77,3 +78,14 @@ def test_temporal_dynamic_image_rms_excludes_static_spatial_contrast() -> None:
     values = _image_values(images, target, images)
     assert values["temporal_dynamic_rms"] == pytest.approx(0.0)
     assert values["temporal_image_std"] > 0.0
+
+
+def test_counterfactual_image_frames_match_target_image_layout_for_temporal_metrics() -> None:
+    flattened = torch.tensor([0.0, 2.0, 4.0, 6.0])
+    first = rendered_frame_image(flattened, (2, 2))
+    second = rendered_frame_image(flattened + 2.0, (2, 2))
+    images = torch.stack((first, second))
+    target = images.clone()
+    assert images.shape == target.shape == (2, 2, 2)
+    values = _image_values(images, target, images)
+    assert values["temporal_dynamic_rms"] == pytest.approx(1.0)

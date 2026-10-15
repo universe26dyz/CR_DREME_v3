@@ -83,6 +83,14 @@ def render_resp_scores_from_cached_points(canonical, query_points: torch.Tensor,
     return intensity.mean(-1)
 
 
+def rendered_frame_image(flattened_intensity: torch.Tensor, image_shape: tuple[int, int]) -> torch.Tensor:
+    """Restore a respiratory renderer's row-major pixel vector to image layout."""
+    height, width = image_shape
+    if flattened_intensity.numel() != height * width:
+        raise ValueError("rendered pixel count does not match the acquired image layout")
+    return flattened_intensity.reshape(image_shape)
+
+
 def _dvf_values(predicted: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
     values = dvf_metrics(predicted, target)
     values["static_to_dynamic_ratio"] = float("nan") if values["dynamic_rms_mm"] <= EPSILON else values["static_rms_mm"] / values["dynamic_rms_mm"]
@@ -159,7 +167,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             gt_dvf = audit.motion.respiratory_dvf_mm(query, query.new_tensor([item.timestamp_s]))
             target_images.append(audit.model.canonical(query + gt_dvf).mean(-1).reshape(item.image.shape[-2:]))
             for condition, scores in conditions.items():
-                rendered[condition].append(render_resp_scores_from_cached_points(audit.model.canonical, query, model, scores[len(rendered[condition])]))
+                rendered[condition].append(rendered_frame_image(render_resp_scores_from_cached_points(audit.model.canonical, query, model, scores[len(rendered[condition])]), item.image.shape[-2:]))
         stacked = {condition: torch.stack(images) for condition, images in rendered.items()}
         target_images_tensor = torch.stack(target_images)
         for condition, images in stacked.items():
