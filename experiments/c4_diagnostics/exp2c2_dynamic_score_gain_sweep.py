@@ -49,13 +49,15 @@ def dynamic_cosine(predicted: torch.Tensor, target: torch.Tensor) -> float:
 
 
 def alpha_dvf_least_squares(predicted_alpha1: torch.Tensor, target: torch.Tensor) -> float:
-    """Float64 scalar-amplitude oracle; leaves waveform and MBC field fixed."""
+    """Float64 dynamic-amplitude oracle; leaves waveform and MBC field fixed."""
     source = predicted_alpha1.to(torch.float64)
     target64 = target.to(torch.float64)
-    denominator = (source * source).sum()
+    source_dynamic = source - source.mean(dim=0, keepdim=True)
+    target_dynamic = target64 - target64.mean(dim=0, keepdim=True)
+    denominator = (source_dynamic * source_dynamic).sum()
     if not torch.isfinite(denominator) or float(denominator) <= EPSILON:
         return float("nan")
-    numerator = (source * target64).sum()
+    numerator = (source_dynamic * target_dynamic).sum()
     return float(numerator / denominator) if torch.isfinite(numerator) else float("nan")
 
 
@@ -88,10 +90,24 @@ def _finite_metrics(predicted: torch.Tensor, target: torch.Tensor) -> dict[str, 
 
 def _oracle_metrics(predicted_alpha1: torch.Tensor, target: torch.Tensor) -> tuple[float, dict[str, float]]:
     alpha = alpha_dvf_least_squares(predicted_alpha1, target)
+    names = ("dynamic_endpoint_error_mm", "dynamic_normalized_epe", "dynamic_rms_ratio", "dynamic_cosine", "raw_field_normalized_epe")
     if not math.isfinite(alpha):
-        return alpha, {name: float("nan") for name in ("normalized_epe", "dynamic_rms_ratio", "dynamic_cosine")}
-    values = _finite_metrics(predicted_alpha1 * alpha, target)
-    return alpha, {name: values[name] for name in ("normalized_epe", "dynamic_rms_ratio", "dynamic_cosine")}
+        return alpha, {name: float("nan") for name in names}
+    predicted = predicted_alpha1 * alpha
+    values = _finite_metrics(predicted, target)
+    if not torch.isfinite(predicted).all() or not torch.isfinite(target).all():
+        return alpha, {name: float("nan") for name in names}
+    pred_dynamic = predicted - predicted.mean(dim=0, keepdim=True)
+    gt_dynamic = target - target.mean(dim=0, keepdim=True)
+    gt_dynamic_rms = gt_dynamic.square().mean().sqrt()
+    dynamic_endpoint_error = (pred_dynamic - gt_dynamic).square().sum(dim=-1).sqrt().mean()
+    return alpha, {
+        "dynamic_endpoint_error_mm": float(dynamic_endpoint_error),
+        "dynamic_normalized_epe": float(dynamic_endpoint_error / gt_dynamic_rms.clamp_min(EPSILON)),
+        "dynamic_rms_ratio": float(pred_dynamic.square().mean().sqrt() / gt_dynamic_rms.clamp_min(EPSILON)),
+        "dynamic_cosine": dynamic_cosine(predicted, target),
+        "raw_field_normalized_epe": values["normalized_epe"],
+    }
 
 
 def _aggregate_oracle_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -172,14 +188,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         alpha_image, image_mse, boundary = gain_grid_best(mse_by_gain, gains)
         alpha_full, full_values = oracle["full_volume"]
         alpha_center, center_values = oracle["pixel_center"]
-        oracle_rows.append({"location": location, "view": view, "alpha_dvf_full_volume": alpha_full, "alpha_dvf_pixel_center": alpha_center, "nepe_at_alpha_dvf_full_volume": full_values["normalized_epe"], "nepe_at_alpha_dvf_pixel_center": center_values["normalized_epe"], "dynamic_rms_ratio_at_alpha_dvf_full_volume": full_values["dynamic_rms_ratio"], "dynamic_rms_ratio_at_alpha_dvf_pixel_center": center_values["dynamic_rms_ratio"], "dynamic_cosine_full_volume": full_values["dynamic_cosine"], "dynamic_cosine_pixel_center": center_values["dynamic_cosine"], "alpha_image_grid_best": alpha_image, "image_grid_best_mse": image_mse, "image_optimum_at_boundary": boundary, "alpha_image_over_alpha_dvf_full": float("nan") if not math.isfinite(alpha_image) or not math.isfinite(alpha_full) or abs(alpha_full) <= EPSILON else alpha_image / alpha_full, "alpha_image_over_alpha_dvf_center": float("nan") if not math.isfinite(alpha_image) or not math.isfinite(alpha_center) or abs(alpha_center) <= EPSILON else alpha_image / alpha_center})
+        oracle_rows.append({"location": location, "view": view, "alpha_dvf_full_volume": alpha_full, "alpha_dvf_pixel_center": alpha_center, "dynamic_endpoint_error_mm_at_alpha_dvf_full_volume": full_values["dynamic_endpoint_error_mm"], "dynamic_endpoint_error_mm_at_alpha_dvf_pixel_center": center_values["dynamic_endpoint_error_mm"], "dynamic_normalized_epe_at_alpha_dvf_full_volume": full_values["dynamic_normalized_epe"], "dynamic_normalized_epe_at_alpha_dvf_pixel_center": center_values["dynamic_normalized_epe"], "raw_field_normalized_epe_at_alpha_dvf_full_volume": full_values["raw_field_normalized_epe"], "raw_field_normalized_epe_at_alpha_dvf_pixel_center": center_values["raw_field_normalized_epe"], "dynamic_rms_ratio_at_alpha_dvf_full_volume": full_values["dynamic_rms_ratio"], "dynamic_rms_ratio_at_alpha_dvf_pixel_center": center_values["dynamic_rms_ratio"], "dynamic_cosine_at_alpha_dvf_full_volume": full_values["dynamic_cosine"], "dynamic_cosine_at_alpha_dvf_pixel_center": center_values["dynamic_cosine"], "alpha_image_grid_best": alpha_image, "image_grid_best_mse": image_mse, "image_optimum_at_boundary": boundary, "alpha_image_over_alpha_dvf_full": float("nan") if not math.isfinite(alpha_image) or not math.isfinite(alpha_full) or abs(alpha_full) <= EPSILON else alpha_image / alpha_full, "alpha_image_over_alpha_dvf_center": float("nan") if not math.isfinite(alpha_image) or not math.isfinite(alpha_center) or abs(alpha_center) <= EPSILON else alpha_image / alpha_center})
     assert_parameters_unchanged(model, before)
     aggregate = _aggregate_oracle_rows(oracle_rows)
     _write_rows(args.output_dir / "gain_sweep_dvf_per_location.csv", dvf_rows)
     _write_rows(args.output_dir / "gain_sweep_image_per_location.csv", image_rows)
     _write_rows(args.output_dir / "gain_oracle_per_location.csv", oracle_rows)
     _write_rows(args.output_dir / "gain_sweep_aggregate.csv", aggregate)
-    summary = {"experiment": "exp2c2_dynamic_score_gain_sweep", "checkpoint": str(args.checkpoint), "source_checkpoint_git_sha": audit.payload["summary"].get("provenance", {}).get("git_sha"), "diagnostic_git_sha": _git_sha(), "source_config": str(args.source_config), "experiment_config": str(args.experiment_config), "manifest": str(args.manifest), "qc_table": str(args.qc_table), "canonical_domain": str(args.canonical_domain), "source_recovery_arrays": str(audit.recovery_arrays), "timestamps_validated": audit.timestamps_validated, "n_locations": len(audit.groups), "n_frames": len(audit.observations), "gains": gains, "full_volume_grid_shape": list(args.full_grid_shape), "matched_crn": True, "optimizer_created": False, "parameters_unchanged": True, "respiratory_score_definition": "alpha * (score - per_location_temporal_mean)", "image_rendering": "respiratory-only analytic GT and frozen respiratory MBC render on identical per-frame cached matched-CRN PSF query points", "aggregate": aggregate}
+    summary = {"experiment": "exp2c2_dynamic_score_gain_sweep", "checkpoint": str(args.checkpoint), "source_checkpoint_git_sha": audit.payload["summary"].get("provenance", {}).get("git_sha"), "diagnostic_git_sha": _git_sha(), "source_config": str(args.source_config), "experiment_config": str(args.experiment_config), "manifest": str(args.manifest), "qc_table": str(args.qc_table), "canonical_domain": str(args.canonical_domain), "source_recovery_arrays": str(audit.recovery_arrays), "timestamps_validated": audit.timestamps_validated, "n_locations": len(audit.groups), "n_frames": len(audit.observations), "gains": gains, "full_volume_grid_shape": list(args.full_grid_shape), "matched_crn": True, "optimizer_created": False, "parameters_unchanged": True, "respiratory_score_definition": "alpha * (score - per_location_temporal_mean)", "dvf_oracle": "float64 least-squares dynamic-amplitude fit after temporal centering of predicted and GT DVFs; primary residual metrics are dynamic-only", "image_rendering": "respiratory-only analytic GT and frozen respiratory MBC render on identical per-frame cached matched-CRN PSF query points", "aggregate": aggregate}
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
 

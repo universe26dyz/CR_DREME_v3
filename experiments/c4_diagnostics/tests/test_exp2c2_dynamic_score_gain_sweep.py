@@ -7,6 +7,7 @@ import torch
 
 from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField
 from experiments.c4_diagnostics.exp2c2_dynamic_score_gain_sweep import (
+    _oracle_metrics,
     alpha_dvf_least_squares,
     dynamic_cosine,
     gain_grid_best,
@@ -61,6 +62,25 @@ def test_gain_scales_linear_score_weighted_mbc_field() -> None:
 def test_dvf_least_squares_gain_recovers_known_scale() -> None:
     base = torch.tensor([[[1.0, -2.0, 3.0]], [[-1.0, 4.0, 2.0]]])
     assert alpha_dvf_least_squares(base, 12.5 * base) == pytest.approx(12.5)
+
+
+def test_dynamic_dvf_oracle_ignores_static_target_offset() -> None:
+    source = torch.tensor([[[1.0, -2.0, 3.0]], [[-1.0, 4.0, 2.0]], [[5.0, 1.0, -3.0]]])
+    source_dynamic = source - source.mean(dim=0, keepdim=True)
+    scale = 12.5
+    target = scale * source_dynamic + torch.tensor([[[7.0, -11.0, 13.0]]])
+
+    alpha, values = _oracle_metrics(source, target)
+    shifted_alpha, shifted_values = _oracle_metrics(source, target + torch.tensor([[[19.0, 23.0, -29.0]]]))
+
+    assert alpha == pytest.approx(scale)
+    assert shifted_alpha == pytest.approx(scale)
+    assert values["dynamic_endpoint_error_mm"] == pytest.approx(0.0, abs=1e-5)
+    assert values["dynamic_normalized_epe"] == pytest.approx(0.0, abs=1e-6)
+    assert values["dynamic_rms_ratio"] == pytest.approx(1.0)
+    assert values["dynamic_cosine"] == pytest.approx(1.0)
+    assert shifted_values["dynamic_endpoint_error_mm"] == pytest.approx(0.0, abs=1e-5)
+    assert shifted_values["dynamic_normalized_epe"] == pytest.approx(0.0, abs=1e-6)
 
 
 def test_dynamic_cosine_is_invariant_for_positive_gain() -> None:
