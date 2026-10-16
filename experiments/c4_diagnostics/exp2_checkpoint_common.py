@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import yaml
 
-from cardioresp4d.training.build_model import build_source_first_model
+from cardioresp4d.training.build_model import build_source_first_model, uses_s2v_style_film
 from cardioresp4d.training.model import SourceFirstDynamicModel
 from experiments.c4_diagnostics.exp1_synthetic_gt_recovery import _build_observations, _load_domain, geometry_from_manifest
 from experiments.c4_diagnostics.exp2a_encoder_temporal_identifiability import validate_source_timestamps
@@ -89,6 +89,7 @@ def prepare_frozen_motion_audit(args, *, require_static_collapse: bool = True) -
         motion=motion,
         psf_samples=int(synthetic["psf_samples"]),
         seed=int(summary["provenance"]["seed"]),
+        assign_slice_positions=uses_s2v_style_film(config),
     )
     groups = group_by_location(observations)
     if len(groups) != 9 or len(observations) != 450 or any(len(sequence) != 50 for sequence in groups.values()):

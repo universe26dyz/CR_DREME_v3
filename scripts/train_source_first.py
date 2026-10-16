@@ -22,14 +22,14 @@ from cardioresp4d.frequency.training_prior import load_training_frequency_prior
 from cardioresp4d.frequency.pca_waveform_prior import PCAWaveformPrior
 from cardioresp4d.geometry.world_geometry import DicomPlane
 from cardioresp4d.training.sampler import DynamicObservation, ViewLocationBalancedSampler, assign_normalized_slice_positions
-from cardioresp4d.training.build_model import build_source_first_model, effective_model_config
+from cardioresp4d.training.build_model import build_source_first_model, effective_model_config, uses_s2v_style_film
 from cardioresp4d.training.runtime_state import capture_rng_state, checkpoint_compatible_dynamic_frame_count, is_hard_invalid_reason, restore_rng_state, set_reproducibility, validate_dynamic_frame_rows
 from cardioresp4d.training.source_first_config import validate_source_dependencies, validate_source_first_config
 from cardioresp4d.training.stage_contract import paperaligned_segment
 from cardioresp4d.training.trainer import UnifiedProgressiveTrainer
 
 
-def observations_from_manifest(manifest: Path, qc_table: Path, device: torch.device, *, normalization_mode: str) -> tuple[list[DynamicObservation], dict[str, dict[str, float]], list[dict]]:
+def observations_from_manifest(manifest: Path, qc_table: Path, device: torch.device, *, normalization_mode: str, assign_slice_positions: bool = False) -> tuple[list[DynamicObservation], dict[str, dict[str, float]], list[dict]]:
     dataset = CardioRespDataset(manifest, valid_only=False, qc_table_path=qc_table, normalization_mode=normalization_mode)
     validate_dynamic_frame_rows(dataset._rows)
     valid_tokens = sorted(row["source_file_token"] for row in dataset._rows if str(row.get("qc_valid", "1")).lower() not in {"0", "false"} and not is_hard_invalid_reason(row.get("qc_reason")))
@@ -39,7 +39,8 @@ def observations_from_manifest(manifest: Path, qc_table: Path, device: torch.dev
         sample = dataset[index]; plane = DicomPlane.from_geometry(sample["geometry"])
         token = row["source_file_token"]
         observations.append(DynamicObservation(image=torch.from_numpy(sample["image"])[None].to(device), view=sample["view"].upper(), slice_id=sample["slice_id"], dynamic_frame_id=ids.get(token, -1), center_mm=torch.from_numpy(plane.pixel_to_world((plane.columns - 1) / 2., (plane.rows - 1) / 2.)).float().to(device), row_direction=torch.from_numpy(plane.row_direction).float().to(device), column_direction=torch.from_numpy(plane.column_direction).float().to(device), normal=torch.from_numpy(plane.normal).float().to(device), pixel_spacing_mm=torch.from_numpy(plane.pixel_spacing).float().to(device), slice_thickness_mm=float(plane.slice_thickness or row["slice_thickness"]), qc_valid=bool(sample["qc_valid"]), qc_reason=str(sample["qc_reason"]), timestamp_s=float(sample["timestamp_s"])))
-    return assign_normalized_slice_positions(observations), dataset.normalization_parameters, dataset.normalization_group_report
+    result = assign_normalized_slice_positions(observations) if assign_slice_positions else observations
+    return result, dataset.normalization_parameters, dataset.normalization_group_report
 
 
 def optional_pca_waveform_prior(loss_weights: dict, frequency_bands: Path):
@@ -79,7 +80,7 @@ def main() -> None:
         if checkpoint.get("checkpoint_schema") != 1:
             raise ValueError("--resume requires source-first checkpoint_schema=1")
         checkpoint_backend = detect_checkpoint_encoding_backend(checkpoint["model"])
-    observations, normalization_parameters, normalization_groups = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=source_config["training"]["normalization"]["mode"])
+    observations, normalization_parameters, normalization_groups = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=source_config["training"]["normalization"]["mode"], assign_slice_positions=uses_s2v_style_film(source_config))
     n_dynamic_frames = checkpoint_compatible_dynamic_frame_count(checkpoint, observations)
     model = build_source_first_model(source_config, domain, n_dynamic_frames=n_dynamic_frames, device=device, canonical_encoding_backend=checkpoint_backend).to(device)
     bands_path = (args.frequency_bands or (args.source_config.parent / source_config["training"]["temporal_auxiliary"]["frequency_bands_json"])).resolve()

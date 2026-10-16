@@ -18,6 +18,11 @@ def _triple(value: Any, label: str) -> tuple[int, int, int]:
     return result
 
 
+def uses_s2v_style_film(config: Mapping[str, Any]) -> bool:
+    """Whether this configuration requires list-level slice-position assignment."""
+    return str(config.get("model", {}).get("film", {}).get("implementation", "full_geometry_single_film")) == "s2v_style_single_frame"
+
+
 def build_source_first_model(config: Mapping[str, Any], domain: Mapping[str, Any], *, n_dynamic_frames: int, device: torch.device, canonical_encoding_backend: str | None = None) -> SourceFirstDynamicModel:
     """Construct every formal source-backed object from the validated config."""
     model = config["model"]

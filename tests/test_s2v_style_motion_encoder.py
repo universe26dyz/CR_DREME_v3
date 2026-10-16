@@ -9,9 +9,12 @@ from cardioresp4d.models.s2v_style_motion_encoder import S2VStyleSingleFrameFiLM
 from cardioresp4d.training.sampler import DynamicObservation, assign_normalized_slice_positions, view_id_for
 from cardioresp4d.training.build_model import build_source_first_model
 from cardioresp4d.models.film_motion_encoder import GeometryFiLMMotionEncoder
+from cardioresp4d.adapters.film import FiLMAdapter
 from experiments.c4_diagnostics.exp2_checkpoint_common import reconstruct_motion_only_model
+from experiments.c4_diagnostics.exp1_synthetic_gt_recovery import _build_observations
+from experiments.c4_diagnostics.synthetic.motion import GroundTruthMotion
 from experiments.c4_diagnostics.synthetic.phantom import AnalyticCanonicalPhantom
-from experiments.c4_diagnostics.synthetic.render import PhantomCanonicalAdapter
+from experiments.c4_diagnostics.synthetic.render import GeometryFrame, PhantomCanonicalAdapter
 
 
 def _observation(*, view: str, slice_id: str, center_z: float, normal: tuple[float, float, float] = (0.0, 0.0, 1.0), timestamp_s: float = 0.0) -> DynamicObservation:
@@ -67,6 +70,17 @@ def test_s2v_encoder_uses_only_image_view_and_position() -> None:
     assert all(torch.isfinite(value).all() for value in output.values())
     assert len(encoder.film_heads) == 4
     assert [head.out_features for head in encoder.film_heads] == [8, 16, 16, 16]
+    assert isinstance(encoder.film, FiLMAdapter)
+
+
+def test_baseline_synthetic_observations_skip_s2v_position_validation() -> None:
+    domain = {"world_min_mm": [-4.0, -4.0, -4.0], "world_max_mm": [4.0, 4.0, 4.0], "cardiac_box": {"min_mm": [-2.0, -2.0, -2.0], "max_mm": [2.0, 2.0, 2.0]}}
+    frames = [
+        GeometryFrame("SAX", "a", torch.tensor([0.0, 0.0, -1.0]), torch.tensor([1.0, 0.0, 0.0]), torch.tensor([0.0, 1.0, 0.0]), torch.tensor([0.0, 0.0, 1.0]), torch.ones(2), 2.0, 0.0, 4, 4),
+        GeometryFrame("SAX", "b", torch.tensor([1.0, 0.0, 1.0]), torch.tensor([0.0, 1.0, 0.0]), torch.tensor([0.0, 0.0, 1.0]), torch.tensor([1.0, 0.0, 0.0]), torch.ones(2), 2.0, 1.0, 4, 4),
+    ]
+    observations = _build_observations(frames, image_shape=(4, 4), phantom=AnalyticCanonicalPhantom(domain), motion=GroundTruthMotion.from_domain(domain), psf_samples=1, seed=0, assign_slice_positions=False)
+    assert all(item.normalized_slice_position is None for item in observations)
 
 
 def test_factory_preserves_baseline_encoder_and_selects_s2v_config() -> None:

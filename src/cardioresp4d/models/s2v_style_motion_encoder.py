@@ -6,6 +6,8 @@ import math
 import torch
 from torch import nn
 
+from cardioresp4d.adapters.film import FiLMAdapter
+
 
 class S2VStyleSingleFrameFiLMEncoder(nn.Module):
     """Infer motion scores from one image conditioned only on view and stack position."""
@@ -23,6 +25,7 @@ class S2VStyleSingleFrameFiLMEncoder(nn.Module):
         inputs = (1, *block_channels[:-1])
         self.blocks = nn.ModuleList(nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1) for in_channels, out_channels, stride in zip(inputs, block_channels, block_strides))
         self.film_heads = nn.ModuleList(nn.Linear(condition_dim, 2 * channels) for channels in block_channels)
+        self.film = FiLMAdapter()
         self.head = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(block_channels[-1], block_channels[-1]), nn.ReLU())
         self.resp = nn.Linear(block_channels[-1], 9)
         self.card = nn.Linear(block_channels[-1], 3)
@@ -53,7 +56,7 @@ class S2VStyleSingleFrameFiLMEncoder(nn.Module):
         for block, film_head in zip(self.blocks, self.film_heads):
             pre_film = block(feature)
             gamma, beta = film_head(condition).chunk(2, dim=-1)
-            post_film = pre_film * (1.0 + gamma[..., None, None]) + beta[..., None, None]
+            post_film = self.film(pre_film, 1.0 + gamma, beta)
             feature = torch.relu(post_film)
             if capture:
                 records.append({"pre_film": pre_film, "gamma": gamma, "beta": beta, "post_film": post_film})

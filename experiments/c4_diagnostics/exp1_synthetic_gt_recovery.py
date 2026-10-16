@@ -22,7 +22,7 @@ sys.path[:0] = [str(PROJECT_ROOT), str(PROJECT_ROOT / "src")]
 
 from cardioresp4d.geometry.world_geometry import DicomPlane
 from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField
-from cardioresp4d.training.build_model import build_source_first_model
+from cardioresp4d.training.build_model import build_source_first_model, uses_s2v_style_film
 from cardioresp4d.training.sampler import DynamicObservation, ViewLocationBalancedSampler, assign_normalized_slice_positions
 from cardioresp4d.training.stage_contract import StageSegment, paperaligned_segments
 from cardioresp4d.training.trainer import UnifiedProgressiveTrainer
@@ -86,9 +86,9 @@ def _load_domain(path: Path | None) -> dict[str, object]:
     return {"world_min_mm": [-64., -64., -64.], "world_max_mm": [64., 64., 64.], "cardiac_box": {"min_mm": [-24., -24., -28.], "max_mm": [32., 24., 30.]}}
 
 
-def _build_observations(frames: list[GeometryFrame], *, image_shape: tuple[int, int], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, psf_samples: int, seed: int) -> list[DynamicObservation]:
+def _build_observations(frames: list[GeometryFrame], *, image_shape: tuple[int, int], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, psf_samples: int, seed: int, assign_slice_positions: bool = False) -> list[DynamicObservation]:
     observations = [render_synthetic_observation(frame, height=image_shape[0], width=image_shape[1], phantom=phantom, motion=motion, psf_samples=psf_samples, seed=seed + index, dynamic_frame_id=index) for index, frame in enumerate(frames)]
-    return assign_normalized_slice_positions(observations)
+    return assign_normalized_slice_positions(observations) if assign_slice_positions else observations
 
 
 def preflight_observations(observations: list[DynamicObservation], motion: GroundTruthMotion) -> dict[str, float | bool]:
@@ -186,7 +186,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     domain = _load_domain(args.canonical_domain); motion = GroundTruthMotion.from_domain(domain, respiratory_frequency_hz=float(synthetic["respiratory_frequency_hz"]), cardiac_frequency_hz=float(synthetic["cardiac_frequency_hz"]), respiratory_amplitude_mm=float(synthetic["respiratory_amplitude_mm"]), cardiac_amplitude_mm=float(synthetic["cardiac_amplitude_mm"]))
     image_shape = tuple(synthetic["image_shape"])
     frames = geometry_from_manifest(args.manifest, args.qc_table, locations_per_view=args.locations_per_view, frames_per_location=args.frames_per_location, device=device) if args.manifest else fallback_geometry(locations_per_view=args.locations_per_view, frames_per_location=args.frames_per_location, image_shape=image_shape, motion=motion, device=device)
-    phantom = AnalyticCanonicalPhantom(domain).to(device); observations = _build_observations(frames, image_shape=image_shape, phantom=phantom, motion=motion, psf_samples=int(synthetic["psf_samples"]), seed=args.seed)
+    phantom = AnalyticCanonicalPhantom(domain).to(device); observations = _build_observations(frames, image_shape=image_shape, phantom=phantom, motion=motion, psf_samples=int(synthetic["psf_samples"]), seed=args.seed, assign_slice_positions=uses_s2v_style_film(config))
     preflight = preflight_observations(observations, motion)
     if not preflight["valid"]: raise ValueError(f"synthetic geometry preflight failed: {preflight}")
     prior = build_synthetic_frequency_prior(motion.respiratory_frequency_hz, motion.cardiac_frequency_hz, {(item.view, item.slice_id) for item in observations})
