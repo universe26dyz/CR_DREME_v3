@@ -23,7 +23,7 @@ sys.path[:0] = [str(PROJECT_ROOT), str(PROJECT_ROOT / "src")]
 from cardioresp4d.geometry.world_geometry import DicomPlane
 from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField
 from cardioresp4d.training.build_model import build_source_first_model
-from cardioresp4d.training.sampler import DynamicObservation, ViewLocationBalancedSampler
+from cardioresp4d.training.sampler import DynamicObservation, ViewLocationBalancedSampler, assign_normalized_slice_positions
 from cardioresp4d.training.stage_contract import StageSegment, paperaligned_segments
 from cardioresp4d.training.trainer import UnifiedProgressiveTrainer
 
@@ -87,7 +87,8 @@ def _load_domain(path: Path | None) -> dict[str, object]:
 
 
 def _build_observations(frames: list[GeometryFrame], *, image_shape: tuple[int, int], phantom: AnalyticCanonicalPhantom, motion: GroundTruthMotion, psf_samples: int, seed: int) -> list[DynamicObservation]:
-    return [render_synthetic_observation(frame, height=image_shape[0], width=image_shape[1], phantom=phantom, motion=motion, psf_samples=psf_samples, seed=seed + index, dynamic_frame_id=index) for index, frame in enumerate(frames)]
+    observations = [render_synthetic_observation(frame, height=image_shape[0], width=image_shape[1], phantom=phantom, motion=motion, psf_samples=psf_samples, seed=seed + index, dynamic_frame_id=index) for index, frame in enumerate(frames)]
+    return assign_normalized_slice_positions(observations)
 
 
 def preflight_observations(observations: list[DynamicObservation], motion: GroundTruthMotion) -> dict[str, float | bool]:
@@ -135,7 +136,7 @@ def _per_location_metrics(model, observations: list[DynamicObservation], motion:
             sequence = sorted(sequence, key=lambda item: item.timestamp_s)
             resp_scores = []; card_scores = []; resp_pred = []; card_pred = []; resp_gt = []; card_gt = []; images = []; targets = []; timestamps = []
             for observation in sequence:
-                encoded = model.film_encoder(observation.image.unsqueeze(0), **_geometry_kwargs(observation)); resp_field = ScoreWeightedMBCField(model.respiratory_mbc, encoded["resp_scores"]); card_field = ScoreWeightedMBCField(model.cardiac_mbc, encoded["card_scores"]); timestamp = full_grid.new_tensor([observation.timestamp_s])
+                encoded = model.encode_motion_scores(observation); resp_field = ScoreWeightedMBCField(model.respiratory_mbc, encoded["resp_scores"]); card_field = ScoreWeightedMBCField(model.cardiac_mbc, encoded["card_scores"]); timestamp = full_grid.new_tensor([observation.timestamp_s])
                 resp_scores.append(encoded["resp_scores"].reshape(-1)); card_scores.append(encoded["card_scores"].reshape(-1)); resp_pred.append(resp_field(full_grid)); card_pred.append(card_field(cardiac_grid)); resp_gt.append(motion.respiratory_dvf_mm(full_grid, timestamp)); card_gt.append(motion.cardiac_dvf_mm(cardiac_grid, timestamp)); timestamps.append(observation.timestamp_s)
                 height, width = observation.image.shape[-2:]; uv = torch.stack(torch.meshgrid(torch.arange(width, dtype=observation.image.dtype), torch.arange(height, dtype=observation.image.dtype), indexing="xy"), dim=-1).reshape(-1, 2)
                 images.append(model.predict(observation, uv, "stage3b")["predicted_intensity"].reshape(height, width)); targets.append(observation.image[0])

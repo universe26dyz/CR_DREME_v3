@@ -55,15 +55,17 @@ def reconstruct_motion_only_model(config: dict[str, Any], domain: dict[str, Any]
     return model
 
 
-def prepare_frozen_motion_audit(args) -> FrozenMotionAudit:
-    """Recreate the exact formal Exp1 observations and frozen model, CPU only."""
+def prepare_frozen_motion_audit(args, *, require_static_collapse: bool = True) -> FrozenMotionAudit:
+    """Recreate exact formal Exp1 observations and a frozen motion-only model."""
     if args.device != "cpu":
         raise ValueError("Exp2 checkpoint diagnostics are offline CPU diagnostics; use --device cpu")
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or "model" not in payload or "summary" not in payload:
         raise ValueError("checkpoint must be an Exp1 synthetic_recovery_last.pt payload")
     summary = payload["summary"]
-    if summary.get("mode") != "motion_only" or summary.get("failure_signature") != "static_collapse":
+    if summary.get("mode") != "motion_only":
+        raise ValueError("checkpoint must be an Exp1 motion_only checkpoint")
+    if require_static_collapse and summary.get("failure_signature") != "static_collapse":
         raise ValueError("Exp2-B/C require the Exp1 motion_only static_collapse checkpoint")
     if int(summary.get("n_locations", -1)) != 9 or int(summary.get("n_frames", -1)) != 450:
         raise ValueError("Exp2-B/C require the formal 9-location / 450-frame source checkpoint")

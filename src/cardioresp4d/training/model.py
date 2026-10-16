@@ -11,6 +11,7 @@ from cardioresp4d.adapters.nesvor_uncertainty import NeSVoRDynamicFrameUncertain
 from cardioresp4d.adapters.sinr_mbc import CardiacSINRMBCAdapter, RespiratorySINRMBCAdapter
 from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField, SequentialPullbackMotion
 from cardioresp4d.models.film_motion_encoder import GeometryFiLMMotionEncoder
+from cardioresp4d.models.s2v_style_motion_encoder import S2VStyleSingleFrameFiLMEncoder
 from .sampler import DynamicObservation
 from .stage_contract import stage_contract
 
@@ -23,13 +24,19 @@ class _ZeroDisplacement(nn.Module):
 
 class SourceFirstDynamicModel(nn.Module):
     """No initial volume or mean-slice supervision; all inputs are acquired frames."""
-    def __init__(self, lower_world_mm: torch.Tensor, upper_world_mm: torch.Tensor, *, cardiac_lower_world_mm: torch.Tensor, cardiac_upper_world_mm: torch.Tensor, n_dynamic_frames: int, inr_width: int = 64, inr_depth: int = 2, latent_dim: int = 16, motion_hidden_dim: int = 64, respiratory_grid_shapes: tuple[tuple[int, int, int], ...] = ((8, 8, 8), (12, 12, 12), (16, 16, 16)), cardiac_grid_shape: tuple[int, int, int] = (16, 16, 16), psf_samples: int = 8, canonical_coarsest_resolution: float = 8., canonical_finest_resolution: float = 1., canonical_level_scale: float = 1.5, canonical_features_per_level: int = 2, canonical_log2_hashmap_size: int = 19, canonical_spatial_scaling: float = 1., canonical_encoding_backend: str | None = None, respiratory_cps: int | tuple[int, int, int] = 2, cardiac_cps: int | tuple[int, int, int] = 2, cardiac_taper_mm: float = 4., film_channels: int | None = None, film_position_bands: int = 4, uncertainty_frame_embedding_dim: int = 8, uncertainty_width: int | None = None, uncertainty_depth: int | None = None, respiratory_smoothness_shape: tuple[int, int, int] = (16, 16, 16), cardiac_smoothness_shape: tuple[int, int, int] = (16, 16, 16), image_regularization_mode: str = "edge", image_regularization_delta: float = 1.) -> None:
+    def __init__(self, lower_world_mm: torch.Tensor, upper_world_mm: torch.Tensor, *, cardiac_lower_world_mm: torch.Tensor, cardiac_upper_world_mm: torch.Tensor, n_dynamic_frames: int, inr_width: int = 64, inr_depth: int = 2, latent_dim: int = 16, motion_hidden_dim: int = 64, respiratory_grid_shapes: tuple[tuple[int, int, int], ...] = ((8, 8, 8), (12, 12, 12), (16, 16, 16)), cardiac_grid_shape: tuple[int, int, int] = (16, 16, 16), psf_samples: int = 8, canonical_coarsest_resolution: float = 8., canonical_finest_resolution: float = 1., canonical_level_scale: float = 1.5, canonical_features_per_level: int = 2, canonical_log2_hashmap_size: int = 19, canonical_spatial_scaling: float = 1., canonical_encoding_backend: str | None = None, respiratory_cps: int | tuple[int, int, int] = 2, cardiac_cps: int | tuple[int, int, int] = 2, cardiac_taper_mm: float = 4., film_channels: int | None = None, film_position_bands: int = 4, film_implementation: str = "full_geometry_single_film", film_view_embedding_dim: int = 8, film_condition_dim: int = 64, film_block_channels: tuple[int, int, int, int] = (32, 64, 64, 64), film_block_strides: tuple[int, int, int, int] = (1, 2, 1, 2), uncertainty_frame_embedding_dim: int = 8, uncertainty_width: int | None = None, uncertainty_depth: int | None = None, respiratory_smoothness_shape: tuple[int, int, int] = (16, 16, 16), cardiac_smoothness_shape: tuple[int, int, int] = (16, 16, 16), image_regularization_mode: str = "edge", image_regularization_delta: float = 1.) -> None:
         super().__init__()
         bounds = torch.stack((lower_world_mm, upper_world_mm))
         self.register_buffer("canonical_lower_world_mm", lower_world_mm.to(dtype=torch.float32))
         self.register_buffer("canonical_upper_world_mm", upper_world_mm.to(dtype=torch.float32))
         self.canonical = NeSVoRCanonicalAdapter(bounds, coarsest_resolution=canonical_coarsest_resolution, finest_resolution=canonical_finest_resolution, level_scale=canonical_level_scale, n_features_per_level=canonical_features_per_level, log2_hashmap_size=canonical_log2_hashmap_size, width=inr_width, depth=inr_depth, n_features_z=latent_dim, spatial_scaling=canonical_spatial_scaling, encoding_backend=canonical_encoding_backend)
-        self.film_encoder = GeometryFiLMMotionEncoder(channels=motion_hidden_dim if film_channels is None else film_channels, canonical_lower_world_mm=lower_world_mm, canonical_upper_world_mm=upper_world_mm, position_bands=film_position_bands)
+        self.film_implementation = film_implementation
+        if film_implementation == "full_geometry_single_film":
+            self.film_encoder = GeometryFiLMMotionEncoder(channels=motion_hidden_dim if film_channels is None else film_channels, canonical_lower_world_mm=lower_world_mm, canonical_upper_world_mm=upper_world_mm, position_bands=film_position_bands)
+        elif film_implementation == "s2v_style_single_frame":
+            self.film_encoder = S2VStyleSingleFrameFiLMEncoder(position_bands=film_position_bands, view_embedding_dim=film_view_embedding_dim, condition_dim=film_condition_dim, block_channels=film_block_channels, block_strides=film_block_strides)
+        else:
+            raise ValueError(f"unsupported film implementation {film_implementation!r}")
         self.respiratory_mbc = RespiratorySINRMBCAdapter(lower_world_mm, upper_world_mm, grid_shapes=respiratory_grid_shapes, cps=respiratory_cps, hidden_dim=motion_hidden_dim)
         if torch.any(cardiac_lower_world_mm < lower_world_mm) or torch.any(cardiac_upper_world_mm > upper_world_mm) or torch.any(cardiac_upper_world_mm <= cardiac_lower_world_mm):
             raise ValueError("cardiac MBC box must be a proper local subdomain of canonical full-FOV bounds")
@@ -46,14 +53,13 @@ class SourceFirstDynamicModel(nn.Module):
         contract = stage_contract(stage)
         image = observation.image.unsqueeze(0)
         device, dtype = image.device, image.dtype
-        geometry = {"center_mm": observation.center_mm.to(device=device, dtype=dtype)[None], "row_direction": observation.row_direction.to(device=device, dtype=dtype)[None], "column_direction": observation.column_direction.to(device=device, dtype=dtype)[None], "normal": observation.normal.to(device=device, dtype=dtype)[None], "pixel_spacing_mm": observation.pixel_spacing_mm.to(device=device, dtype=dtype)[None], "slice_thickness_mm": torch.tensor([[observation.slice_thickness_mm]], device=device, dtype=dtype)}
         points = self._pixel_world(observation, pixel_uv.to(device=device, dtype=dtype))
         resolution = torch.tensor([observation.pixel_spacing_mm[1], observation.pixel_spacing_mm[0], observation.slice_thickness_mm], device=device, dtype=dtype).expand(points.shape[0], 3)
         plane_batch = points.shape[0]
         motion = None
         scores: dict[str, torch.Tensor] = {}
         if contract.enable_film:
-            encoded = self.film_encoder(image, **geometry)
+            encoded = self.encode_motion_scores(observation)
             self.respiratory_mbc.set_active_levels(contract.active_respiratory_levels)
             respiratory_scores = encoded["resp_scores"][:, :contract.active_respiratory_levels]
             respiratory = ScoreWeightedMBCField(self.respiratory_mbc, respiratory_scores)
@@ -69,6 +75,20 @@ class SourceFirstDynamicModel(nn.Module):
         if contract.enable_uncertainty:
             render["uncertainty"] = self.uncertainty(render["latent_samples"], torch.tensor([observation.dynamic_frame_id], device=device, dtype=torch.long))
         return render
+
+    def encode_motion_scores(self, observation: DynamicObservation) -> dict[str, torch.Tensor]:
+        """Dispatch immutable observation metadata to the selected score encoder."""
+        image = observation.image.unsqueeze(0)
+        device, dtype = image.device, image.dtype
+        if self.film_implementation == "full_geometry_single_film":
+            geometry = {"center_mm": observation.center_mm.to(device=device, dtype=dtype)[None], "row_direction": observation.row_direction.to(device=device, dtype=dtype)[None], "column_direction": observation.column_direction.to(device=device, dtype=dtype)[None], "normal": observation.normal.to(device=device, dtype=dtype)[None], "pixel_spacing_mm": observation.pixel_spacing_mm.to(device=device, dtype=dtype)[None], "slice_thickness_mm": torch.tensor([[observation.slice_thickness_mm]], device=device, dtype=dtype)}
+            return self.film_encoder(image, **geometry)
+        if observation.normalized_slice_position is None:
+            raise ValueError("S2V-style encoder requires normalized_slice_position assigned from the full observation list")
+        from .sampler import view_id_for
+        position = image.new_tensor([[observation.normalized_slice_position]])
+        view_id = torch.tensor([view_id_for(observation.view)], device=device, dtype=torch.long)
+        return self.film_encoder(image, normalized_slice_position=position, view_id=view_id)
 
     @staticmethod
     def _pixel_world(observation: DynamicObservation, pixel_uv: torch.Tensor) -> torch.Tensor:

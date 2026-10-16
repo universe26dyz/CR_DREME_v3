@@ -5,6 +5,7 @@ from typing import Any, Mapping
 
 import torch
 
+from cardioresp4d.models.film_motion_encoder import GeometryFiLMMotionEncoder
 from .model import SourceFirstDynamicModel
 
 
@@ -57,6 +58,11 @@ def build_source_first_model(config: Mapping[str, Any], domain: Mapping[str, Any
         psf_samples=int(psf["n_samples"]),
         film_channels=int(film.get("channels", respiratory["hidden_dim"])),
         film_position_bands=int(film.get("position_bands", 4)),
+        film_implementation=str(film.get("implementation", "full_geometry_single_film")),
+        film_view_embedding_dim=int(film.get("view_embedding_dim", 8)),
+        film_condition_dim=int(film.get("condition_dim", 64)),
+        film_block_channels=tuple(int(value) for value in film.get("block_channels", (32, 64, 64, 64))),
+        film_block_strides=tuple(int(value) for value in film.get("block_strides", (1, 2, 1, 2))),
         uncertainty_frame_embedding_dim=int(uncertainty.get("frame_embedding_dim", 8)),
         uncertainty_width=int(uncertainty.get("width", canonical["width"])),
         uncertainty_depth=int(uncertainty.get("depth", canonical["depth"])),
@@ -83,7 +89,7 @@ def effective_model_config(model: SourceFirstDynamicModel) -> dict[str, Any]:
         "psf": {"n_samples": model.psf.n_samples},
         "respiratory_mbc": {"logical_control_shapes": [list(level.logical_control_shape) for level in resp.levels], "cps": list(resp.levels[0].cps), "dense_evaluation_shapes": [list(level.dense_evaluation_shape) for level in resp.levels], "padded_control_shapes": [list(level.padded_control_shape) for level in resp.levels], "grid_spacing_mm": [level.grid_spacing_mm.detach().cpu().tolist() for level in resp.levels]},
         "cardiac_mbc": {"logical_control_shape": list(cardiac.basis.logical_control_shape), "cps": list(cardiac.basis.cps), "dense_evaluation_shape": list(cardiac.basis.dense_evaluation_shape), "padded_control_shape": list(cardiac.basis.padded_control_shape), "taper_mm": cardiac.taper_mm},
-        "film": {"channels": model.film_encoder.image[0].out_channels, "position_bands": model.film_encoder.position_bands},
+        "film": ({"implementation": "full_geometry_single_film", "channels": model.film_encoder.image[0].out_channels, "position_bands": model.film_encoder.position_bands} if isinstance(model.film_encoder, GeometryFiLMMotionEncoder) else {"implementation": "s2v_style_single_frame", "position_bands": model.film_encoder.position_bands, "view_embedding_dim": model.film_encoder.view_embedding.embedding_dim, "condition_dim": model.film_encoder.condition_mlp[0].out_features, "block_channels": [block.out_channels for block in model.film_encoder.blocks], "block_strides": [block.stride[0] for block in model.film_encoder.blocks]}),
         "uncertainty": {"frame_embedding_dim": model.uncertainty.frame_embedding.embedding_dim, "width": model.uncertainty.sigma_net[0].out_features if len(model.uncertainty.sigma_net) else None},
         "smoothness": {"respiratory_shape": list(model.respiratory_smoothness_shape), "cardiac_shape": list(model.cardiac_smoothness_shape)},
         "image_regularization": {"mode": model.image_regularization_mode, "delta": model.image_regularization_delta},

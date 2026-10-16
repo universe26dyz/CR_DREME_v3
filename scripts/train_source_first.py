@@ -21,7 +21,7 @@ from cardioresp4d.adapters.source_lock import verify_vendored_source_lock
 from cardioresp4d.frequency.training_prior import load_training_frequency_prior
 from cardioresp4d.frequency.pca_waveform_prior import PCAWaveformPrior
 from cardioresp4d.geometry.world_geometry import DicomPlane
-from cardioresp4d.training.sampler import DynamicObservation, ViewLocationBalancedSampler
+from cardioresp4d.training.sampler import DynamicObservation, ViewLocationBalancedSampler, assign_normalized_slice_positions
 from cardioresp4d.training.build_model import build_source_first_model, effective_model_config
 from cardioresp4d.training.runtime_state import capture_rng_state, checkpoint_compatible_dynamic_frame_count, is_hard_invalid_reason, restore_rng_state, set_reproducibility, validate_dynamic_frame_rows
 from cardioresp4d.training.source_first_config import validate_source_dependencies, validate_source_first_config
@@ -39,7 +39,7 @@ def observations_from_manifest(manifest: Path, qc_table: Path, device: torch.dev
         sample = dataset[index]; plane = DicomPlane.from_geometry(sample["geometry"])
         token = row["source_file_token"]
         observations.append(DynamicObservation(image=torch.from_numpy(sample["image"])[None].to(device), view=sample["view"].upper(), slice_id=sample["slice_id"], dynamic_frame_id=ids.get(token, -1), center_mm=torch.from_numpy(plane.pixel_to_world((plane.columns - 1) / 2., (plane.rows - 1) / 2.)).float().to(device), row_direction=torch.from_numpy(plane.row_direction).float().to(device), column_direction=torch.from_numpy(plane.column_direction).float().to(device), normal=torch.from_numpy(plane.normal).float().to(device), pixel_spacing_mm=torch.from_numpy(plane.pixel_spacing).float().to(device), slice_thickness_mm=float(plane.slice_thickness or row["slice_thickness"]), qc_valid=bool(sample["qc_valid"]), qc_reason=str(sample["qc_reason"]), timestamp_s=float(sample["timestamp_s"])))
-    return observations, dataset.normalization_parameters, dataset.normalization_group_report
+    return assign_normalized_slice_positions(observations), dataset.normalization_parameters, dataset.normalization_group_report
 
 
 def optional_pca_waveform_prior(loss_weights: dict, frequency_bands: Path):

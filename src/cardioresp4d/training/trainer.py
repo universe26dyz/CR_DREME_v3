@@ -241,7 +241,7 @@ class UnifiedProgressiveTrainer:
             if stage == "stage3a":
                 result.update({"cardiac_target_concentration": zero, "cardiac_target_fraction": zero, "cardiac_target_power": zero, "cardiac_total_power": zero, "cardiac_pca_waveform": zero, "cardiac_pca_waveform_r2": zero, "cardiac_pca_waveform_matched_frames": zero})
             return result
-        scores = [self.model.film_encoder(item.image.unsqueeze(0), center_mm=item.center_mm[None], row_direction=item.row_direction[None], column_direction=item.column_direction[None], normal=item.normal[None], pixel_spacing_mm=item.pixel_spacing_mm[None], slice_thickness_mm=torch.tensor([[item.slice_thickness_mm]], device=item.image.device, dtype=item.image.dtype)) for item in sequence]
+        scores = [self.model.encode_motion_scores(item) for item in sequence]
         timestamps = torch.tensor([item.timestamp_s for item in sequence], device=sequence[0].image.device, dtype=torch.float64)
         resp = torch.cat([score["resp_scores"][:, :contract.active_respiratory_levels] for score in scores], 0); card = torch.cat([score["card_scores"] for score in scores], 0)
         prior = self.frequency_prior.for_location(sequence[0].view, sequence[0].slice_id) if hasattr(self.frequency_prior, "for_location") else self.frequency_prior
