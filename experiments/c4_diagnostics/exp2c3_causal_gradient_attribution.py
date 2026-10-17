@@ -198,6 +198,19 @@ def _selected_pixels(observation, pixels_per_frame: int) -> torch.Tensor:
     return torch.stack((linear.remainder(width), torch.div(linear, width, rounding_mode="floor")), dim=-1).to(observation.image.dtype)
 
 
+def cardiac_data_support(model: SourceFirstDynamicModel, sequence: list, *, data_frame_count: int, pixels_per_frame: int) -> dict[str, int | bool]:
+    """Cardiac-box occupancy of the exact deterministic data-MSE support."""
+    inside_points = 0
+    total_points = 0
+    for index in deterministic_indices(len(sequence), data_frame_count):
+        observation = sequence[index]
+        points = SourceFirstDynamicModel._pixel_world(observation, _selected_pixels(observation, pixels_per_frame))
+        inside = ((points >= model.cardiac_lower_world_mm.to(points)) & (points <= model.cardiac_upper_world_mm.to(points))).all(dim=-1)
+        inside_points += int(inside.sum())
+        total_points += int(inside.numel())
+    return {"intersects": inside_points > 0, "inside_points": inside_points, "total_points": total_points}
+
+
 @contextmanager
 def _diagnostic_psf_rng(seed: int):
     with torch.random.fork_rng(devices=[]):
@@ -339,6 +352,13 @@ def _assert_zero(label: str, vector: torch.Tensor) -> None:
         raise RuntimeError(f"C3 expected structural zero gradient for {label}: {value}")
 
 
+def _assert_stage3b_data_connectivity(location: str, vectors: dict[str, torch.Tensor], cardiac_support: dict[str, int | bool]) -> None:
+    _assert_nonzero(f"{location} stage3b data encoder", vectors["encoder_all"])
+    _assert_nonzero(f"{location} stage3b data respiratory MBC", vectors["respiratory_mbc_all"])
+    if bool(cardiac_support["intersects"]):
+        _assert_nonzero(f"{location} stage3b data cardiac MBC", vectors["cardiac_mbc"])
+
+
 def _write_rows(path: Path, rows: list[dict[str, object]]) -> None:
     fields = sorted({field for row in rows for field in row})
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -387,6 +407,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     selected_frames: dict[str, list[int]] = {}
     selected_timestamps: dict[str, list[float]] = {}
     psf_seeds: dict[str, int] = {}
+    cardiac_data_support_by_location: dict[str, dict[str, int | bool]] = {}
     active_terms = ("weighted_data_mse", "weighted_mbc_normalization", "weighted_zero_mean_score", "weighted_cardiac_leakage_in_resp", "weighted_respiratory_leakage_in_card", "weighted_regularizer_sum")
     comparisons = (("weighted_data_mse", "weighted_mbc_normalization"), ("weighted_data_mse", "weighted_zero_mean_score"), ("weighted_data_mse", "weighted_cardiac_leakage_in_resp"), ("weighted_data_mse", "weighted_respiratory_leakage_in_card"), ("weighted_zero_mean_score", "weighted_cardiac_leakage_in_resp"), ("weighted_regularizer_sum", "weighted_data_mse"))
     for location_index, (location, sequence) in enumerate(sorted(audit.groups.items())):
@@ -395,8 +416,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         psf_seeds[location] = seed
         selected_frames[location] = deterministic_indices(len(sequence), args.data_frames_per_location)
         selected_timestamps[location] = [float(sequence[index].timestamp_s) for index in selected_frames[location]]
+        cardiac_data_support_by_location[location] = cardiac_data_support(model, sequence, data_frame_count=args.data_frames_per_location, pixels_per_frame=args.pixels_per_frame)
         for row in _state_rows(model, sequence, audit.motion, dvf_frames=args.dvf_frames_per_location, grid=grid):
-            state_rows.append({"location": location, "view": view, "frame_count": len(sequence), **row})
+            state_rows.append({"location": location, "view": view, "frame_count": len(sequence), "data_support_intersects_cardiac_box": cardiac_data_support_by_location[location]["intersects"], "cardiac_support_point_count": cardiac_data_support_by_location[location]["inside_points"], "data_support_point_count": cardiac_data_support_by_location[location]["total_points"], **row})
         for objective_view in ("stage2c_counterfactual", "stage3b_joint"):
             terms, _ = _loss_terms(model, sequence, objective_view=objective_view, data_frame_count=args.data_frames_per_location, pixels_per_frame=args.pixels_per_frame, prior=prior, weights=weights, data_psf_seed=seed)
             values = {name: float(value.detach()) for name, value in terms.items()}
@@ -422,9 +444,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         raise RuntimeError(f"non-finite gradient norm for {term_name}/{group_name}")
                     gradient_rows.append({"location": location, "view": view, "objective_view": objective_view, "loss_term": term_name, "parameter_group": group_name, **statistics})
             if objective_view == "stage3b_joint":
-                _assert_nonzero(f"{location} stage3b data encoder", vectors_by_term["weighted_data_mse"]["encoder_all"])
-                _assert_nonzero(f"{location} stage3b data respiratory MBC", vectors_by_term["weighted_data_mse"]["respiratory_mbc_all"])
-                _assert_nonzero(f"{location} stage3b data cardiac MBC", vectors_by_term["weighted_data_mse"]["cardiac_mbc"])
+                _assert_stage3b_data_connectivity(location, vectors_by_term["weighted_data_mse"], cardiac_data_support_by_location[location])
                 _assert_zero(f"{location} MBC normalization encoder", vectors_by_term["weighted_mbc_normalization"]["encoder_all"])
                 _assert_zero(f"{location} zero mean respiratory MBC", vectors_by_term["weighted_zero_mean_score"]["respiratory_mbc_all"])
                 _assert_zero(f"{location} card leakage respiratory MBC", vectors_by_term["weighted_cardiac_leakage_in_resp"]["respiratory_mbc_all"])
@@ -470,6 +490,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "stage3b_objective_definition": "data_mse + weighted image/MBC/smoothness/temporal terms on deterministic matched support",
         "stage2c_counterfactual_definition": "final frozen checkpoint evaluated under respiratory-only Stage2c forward and objective semantics; not a saved Stage2c state",
         "deterministic_support_policy": {"data_frames_per_location": args.data_frames_per_location, "pixels_per_frame": args.pixels_per_frame, "dvf_frames_per_location": args.dvf_frames_per_location, "dvf_grid_shape": list(args.dvf_grid_shape), "selected_frame_indices_by_location": selected_frames, "selected_timestamps_by_location": selected_timestamps, "pixel_sampling": "evenly spaced row-major pixels", "psf_rng": "fork_rng reset before every loss graph", "psf_seed_by_location": psf_seeds},
+        "cardiac_data_support_by_location": cardiac_data_support_by_location,
         "parameter_groups": {name: [parameter_name for parameter_name, parameter in model.named_parameters() if any(id(parameter) == id(member) for member in members)] for name, members in groups.items()},
         "optimizer_created": False,
         "parameters_unchanged": True,

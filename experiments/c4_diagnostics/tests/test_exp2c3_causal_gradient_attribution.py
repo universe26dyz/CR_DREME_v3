@@ -7,6 +7,8 @@ import yaml
 from cardioresp4d.training.build_model import build_source_first_model
 from cardioresp4d.training.sampler import DynamicObservation
 from experiments.c4_diagnostics.exp2c3_causal_gradient_attribution import (
+    _assert_stage3b_data_connectivity,
+    cardiac_data_support,
     _gradient_vectors,
     _loss_terms,
     directional_effect,
@@ -95,3 +97,37 @@ def test_production_data_gradient_reaches_encoder_and_respiratory_mbc_while_scor
     assert torch.equal(mbc_vectors["encoder_all"], torch.zeros_like(mbc_vectors["encoder_all"]))
     assert torch.equal(zero_vectors["respiratory_mbc_all"], torch.zeros_like(zero_vectors["respiratory_mbc_all"]))
     assert_parameters_unchanged(model, before)
+
+
+def test_cardiac_support_uses_the_same_deterministic_data_pixels_and_requires_cardiac_connectivity() -> None:
+    root = __import__("pathlib").Path(__file__).resolve().parents[3]
+    config = yaml.safe_load((root / "configs/source_first_change4_paperaligned.yaml").read_text())
+    model = build_source_first_model(config, _domain(), n_dynamic_frames=1, device=torch.device("cpu"))
+    observation = DynamicObservation(
+        image=torch.ones(1, 8, 8), view="SAX", slice_id="supported", dynamic_frame_id=0,
+        center_mm=torch.zeros(3), row_direction=torch.tensor([1.0, 0.0, 0.0]),
+        column_direction=torch.tensor([0.0, 1.0, 0.0]), normal=torch.tensor([0.0, 0.0, 1.0]),
+        pixel_spacing_mm=torch.ones(2), slice_thickness_mm=2.0, qc_valid=True, qc_reason="valid", timestamp_s=0.0,
+    )
+    support = cardiac_data_support(model, [observation], data_frame_count=1, pixels_per_frame=8)
+    assert support == {"intersects": True, "inside_points": 4, "total_points": 8}
+    vectors = {"encoder_all": torch.ones(1), "respiratory_mbc_all": torch.ones(1), "cardiac_mbc": torch.zeros(1)}
+    with pytest.raises(RuntimeError, match="cardiac MBC"):
+        _assert_stage3b_data_connectivity("SAX/supported", vectors, support)
+
+
+def test_outside_cardiac_box_allows_zero_cardiac_gradient_without_weakening_other_connectivity_checks() -> None:
+    root = __import__("pathlib").Path(__file__).resolve().parents[3]
+    config = yaml.safe_load((root / "configs/source_first_change4_paperaligned.yaml").read_text())
+    model = build_source_first_model(config, _domain(), n_dynamic_frames=1, device=torch.device("cpu"))
+    observation = DynamicObservation(
+        image=torch.ones(1, 8, 8), view="SAX", slice_id="outside", dynamic_frame_id=0,
+        center_mm=torch.tensor([0.0, 0.0, 5.0]), row_direction=torch.tensor([1.0, 0.0, 0.0]),
+        column_direction=torch.tensor([0.0, 1.0, 0.0]), normal=torch.tensor([0.0, 0.0, 1.0]),
+        pixel_spacing_mm=torch.ones(2), slice_thickness_mm=2.0, qc_valid=True, qc_reason="valid", timestamp_s=0.0,
+    )
+    support = cardiac_data_support(model, [observation], data_frame_count=1, pixels_per_frame=8)
+    assert support == {"intersects": False, "inside_points": 0, "total_points": 8}
+    _assert_stage3b_data_connectivity("SAX/outside", {"encoder_all": torch.ones(1), "respiratory_mbc_all": torch.ones(1), "cardiac_mbc": torch.zeros(1)}, support)
+    with pytest.raises(RuntimeError, match="encoder"):
+        _assert_stage3b_data_connectivity("SAX/outside", {"encoder_all": torch.zeros(1), "respiratory_mbc_all": torch.ones(1), "cardiac_mbc": torch.zeros(1)}, support)
