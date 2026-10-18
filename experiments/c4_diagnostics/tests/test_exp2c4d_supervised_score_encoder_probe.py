@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 
 from experiments.c4_diagnostics.exp1_synthetic_gt_recovery import _build_observations, fallback_geometry
-from experiments.c4_diagnostics.exp2c4b_oracle_field_encoder_only import _respiratory_only_motion, _score_values
-from experiments.c4_diagnostics.exp2c4d_supervised_score_encoder_probe import _build_model, _configure_encoder_only, _direct_score_loss, _gt_score, _parameter_audit, run
+from experiments.c4_diagnostics.exp2c4b_oracle_field_encoder_only import _respiratory_only_motion
+from experiments.c4_diagnostics.exp2c4d_supervised_score_encoder_probe import _build_model, _configure_encoder_only, _direct_score_loss, _gt_score, _parameter_audit, _pooled_score_values, run
 from experiments.c4_diagnostics.exp2_checkpoint_common import parameter_snapshot
 from experiments.c4_diagnostics.synthetic.motion import GroundTruthMotion
 from experiments.c4_diagnostics.synthetic.phantom import AnalyticCanonicalPhantom
@@ -62,6 +62,20 @@ def test_fresh_initialization_is_deterministic() -> None:
         torch.testing.assert_close(value, second.state_dict()[name])
 
 
+def test_pooled_metrics_center_each_location_before_temporal_aggregation() -> None:
+    waveform = torch.tensor([-1.0, 1.0])[:, None, None].expand(-1, 1, 3)
+    target_a, target_b = waveform.clone(), waveform.clone()
+    prediction_a, prediction_b = target_a + 100.0, target_b - 300.0
+    values = _pooled_score_values([(prediction_a, target_a), (prediction_b, target_b)])
+    assert values["predicted_score_temporal_rms"] == pytest.approx(1.0)
+    assert values["gt_score_temporal_rms"] == pytest.approx(1.0)
+    assert values["temporal_rms_ratio"] == pytest.approx(1.0)
+    assert values["gt_correlation"] == pytest.approx(1.0)
+    assert values["x_gt_correlation"] == pytest.approx(1.0)
+    assert values["x_temporal_rms_ratio"] == pytest.approx(1.0)
+    assert values["predicted_score_static_rms"] == pytest.approx((50000.0) ** .5)
+
+
 def test_cpu_smoke_writes_outputs_and_only_changes_encoder(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[3]
     args = Namespace(source_config=root / "configs/source_first_change4_paperaligned.yaml", experiment_config=root / "experiments/c4_diagnostics/configs/exp1_synthetic_gt.yaml", manifest=None, qc_table=None, canonical_domain=None, output_dir=tmp_path / "c4d", device="cpu", overwrite=False, seed=0, locations_per_view=1, frames_per_location=3, steps=1, observations_per_update=3, smoke=True)
@@ -70,9 +84,7 @@ def test_cpu_smoke_writes_outputs_and_only_changes_encoder(tmp_path: Path) -> No
     assert all(name.startswith(("film_encoder.image.", "film_encoder.geometry_mlp.", "film_encoder.head.", "film_encoder.resp.")) for name in summary["parameters_changed"])
     assert all(summary["frozen_module_audit"].values())
     arrays = np.load(args.output_dir / "recovery_arrays.npz")
-    predicted = torch.cat([torch.from_numpy(arrays[key]) for key in arrays.files if key.endswith("_predicted_scores") and not key.startswith("final_")])
-    target = torch.cat([torch.from_numpy(arrays[key]) for key in arrays.files if key.endswith("_gt_scores") and not key.startswith("final_")])
-    expected = _score_values(predicted, target)
+    expected = _pooled_score_values([(torch.from_numpy(arrays[key]), torch.from_numpy(arrays[key.replace("_predicted_scores", "_gt_scores")])) for key in arrays.files if key.endswith("_predicted_scores") and not key.startswith("final_")])
     for name, value in expected.items():
         assert summary["initial_metrics"]["overall"][name] == pytest.approx(value)
     for name in ("summary.json", "training_curve.csv", "metrics_initial.json", "metrics_final.json", "recovery_arrays.npz"):

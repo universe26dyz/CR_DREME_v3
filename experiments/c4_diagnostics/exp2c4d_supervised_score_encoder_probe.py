@@ -76,6 +76,35 @@ def _component_values(prediction: torch.Tensor, target: torch.Tensor) -> dict[st
     return result
 
 
+def _pooled_score_values(location_scores: list[tuple[torch.Tensor, torch.Tensor]]) -> dict[str, float]:
+    """Pool score metrics after temporal centering at each fixed location."""
+    if not location_scores:
+        raise ValueError("pooled score metrics require at least one location")
+    raw_prediction = torch.cat([prediction for prediction, _ in location_scores])
+    raw_target = torch.cat([target for _, target in location_scores])
+    pred_dynamic = torch.cat([prediction - prediction.mean(dim=0, keepdim=True) for prediction, _ in location_scores])
+    gt_dynamic = torch.cat([target - target.mean(dim=0, keepdim=True) for _, target in location_scores])
+    pred_temporal_rms = pred_dynamic.square().mean().sqrt()
+    gt_temporal_rms = gt_dynamic.square().mean().sqrt()
+    static_rms = torch.cat([prediction.mean(dim=0, keepdim=True) for prediction, _ in location_scores]).square().mean().sqrt()
+    values = {
+        "predicted_score_temporal_mean": float(raw_prediction.mean()),
+        "predicted_score_static_rms": float(static_rms),
+        "predicted_score_temporal_rms": float(pred_temporal_rms),
+        "gt_score_temporal_rms": float(gt_temporal_rms),
+        "temporal_rms_ratio": float(pred_temporal_rms / gt_temporal_rms.clamp_min(EPSILON)),
+        "gt_correlation": float((pred_dynamic * gt_dynamic).sum() / (pred_dynamic.norm() * gt_dynamic.norm()).clamp_min(EPSILON)),
+        "score_mse": float((raw_prediction - raw_target).square().mean()),
+        "score_mae": float((raw_prediction - raw_target).abs().mean()),
+        "static_to_temporal_rms_ratio": float(static_rms / pred_temporal_rms.clamp_min(EPSILON)),
+    }
+    for index, name in enumerate(("x", "y", "z")):
+        prediction, target = pred_dynamic[..., index], gt_dynamic[..., index]
+        values[f"{name}_gt_correlation"] = float((prediction * target).sum() / (prediction.norm() * target.norm()).clamp_min(EPSILON))
+        values[f"{name}_temporal_rms_ratio"] = float(prediction.square().mean().sqrt() / target.square().mean().sqrt().clamp_min(EPSILON))
+    return values
+
+
 @torch.inference_mode()
 def _evaluate(model, groups: dict[str, list], motion: GroundTruthMotion) -> tuple[dict[str, dict[str, float]], dict[str, np.ndarray], dict[str, dict[str, float]], dict[str, float]]:
     rows: dict[str, dict[str, float]] = {}; arrays: dict[str, np.ndarray] = {}; all_predicted: list[torch.Tensor] = []; all_target: list[torch.Tensor] = []; by_view_scores: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
@@ -87,10 +116,8 @@ def _evaluate(model, groups: dict[str, list], motion: GroundTruthMotion) -> tupl
         stem = location.replace("/", "_"); arrays[f"{stem}_timestamps_s"] = np.asarray([observation.timestamp_s for observation in sequence]); arrays[f"{stem}_predicted_scores"] = predicted.cpu().numpy(); arrays[f"{stem}_gt_scores"] = target.cpu().numpy()
     by_view: dict[str, dict[str, float]] = {}
     for view, values in by_view_scores.items():
-        predicted, target = torch.cat([item[0] for item in values]), torch.cat([item[1] for item in values])
-        by_view[view] = {**_score_values(predicted, target), **_component_values(predicted, target)}
-    overall_prediction, overall_target = torch.cat(all_predicted), torch.cat(all_target)
-    return rows, arrays, by_view, {**_score_values(overall_prediction, overall_target), **_component_values(overall_prediction, overall_target)}
+        by_view[view] = _pooled_score_values(values)
+    return rows, arrays, by_view, _pooled_score_values(list(zip(all_predicted, all_target)))
 
 
 def _parameter_audit(model, before: dict[str, torch.Tensor], *, require_change: bool = True) -> list[str]:
