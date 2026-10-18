@@ -13,6 +13,7 @@ from experiments.c4_diagnostics.exp2c4a_gt_score_mbc_only import (
     _assert_only_level0_changed,
     _build_intervention_model,
     _configure_level0_only,
+    _dvf_values,
     _gt_respiratory_scores,
     _intervention_loss_terms,
     _respiratory_only_motion,
@@ -56,6 +57,17 @@ def test_respiratory_only_target_has_exactly_zero_cardiac_dvf() -> None:
     points = torch.randn(2, 5, 3)
     assert motion.cardiac_amplitude_mm == 0.0
     assert torch.equal(motion.cardiac_dvf_mm(points, torch.tensor([0.1, 0.2])), torch.zeros_like(points))
+
+
+def test_dynamic_normalized_epe_ignores_constant_spatial_offset() -> None:
+    target = torch.tensor([
+        [[1.0, -2.0, 0.5], [3.0, 1.0, -1.0]],
+        [[2.0, -1.0, 1.5], [4.0, 2.0, 0.0]],
+    ])
+    prediction = target + torch.tensor([5.0, -3.0, 2.0])
+    values = _dvf_values(prediction, target)
+    assert values["endpoint_error_mm"] > 0.0
+    assert values["dynamic_normalized_epe"] == pytest.approx(0.0, abs=1e-7)
 
 
 def test_only_level0_is_trainable_and_owned_by_optimizer() -> None:

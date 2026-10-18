@@ -189,7 +189,11 @@ def _validate_observations(observations: list, *, locations_per_view: int, frame
 
 def _dvf_values(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
     values = dvf_metrics(prediction, target)
-    values["dynamic_normalized_epe"] = values["endpoint_error_mm"] / max(values["gt_dynamic_rms_mm"], EPSILON)
+    pred_dynamic = prediction - prediction.mean(dim=0, keepdim=True)
+    gt_dynamic = target - target.mean(dim=0, keepdim=True)
+    dynamic_epe = (pred_dynamic - gt_dynamic).square().sum(dim=-1).sqrt().mean()
+    gt_dynamic_rms = gt_dynamic.square().mean().sqrt()
+    values["dynamic_normalized_epe"] = float(dynamic_epe / gt_dynamic_rms.clamp_min(EPSILON))
     return values
 
 
