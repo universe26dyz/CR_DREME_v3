@@ -47,11 +47,13 @@ def _accumulate_full_batch(model, observations: list, motion: GroundTruthMotion,
     observation_ids: list[int] = []
     scale = 1.0 / len(observations)
     for start in range(0, len(observations), accumulation_chunk_size):
+        chunk_losses: list[torch.Tensor] = []
         for observation in observations[start : start + accumulation_chunk_size]:
             loss, _ = _direct_score_loss(model, observation, motion)
-            (loss * scale).backward()
+            chunk_losses.append(loss)
             total = total + loss.detach()
             observation_ids.append(int(observation.dynamic_frame_id))
+        (torch.stack(chunk_losses).sum() * scale).backward()
     return {"full_batch_score_mse": total / len(observations), "observation_ids": observation_ids}
 
 
@@ -126,15 +128,28 @@ def _write_curve(path: Path, rows: list[dict[str, float | int]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
 
 
+def _checkpoint_state(*, model, optimizer, step: int, protocol: dict[str, Any], observation_audit: dict[str, Any], thresholds: dict[str, int | None], curve: list[dict[str, float | int]], initial: dict[str, Any], initial_arrays: dict[str, np.ndarray]) -> dict[str, Any]:
+    return {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step, "git_sha": _git_sha(), "protocol": protocol, "observation_audit": observation_audit, "thresholds": thresholds, "curve": curve, "initial_metrics": initial, "initial_arrays": {name: torch.from_numpy(value) for name, value in initial_arrays.items()}}
+
+
+def _save_checkpoint(path: Path, **kwargs: Any) -> None:
+    torch.save(_checkpoint_state(**kwargs), path)
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA requested but unavailable")
-    if args.steps <= 0 or args.eval_every <= 0 or args.accumulation_chunk_size <= 0:
-        raise ValueError("C4g steps, eval interval, and accumulation chunk size must be positive")
+    checkpoint_every = int(getattr(args, "checkpoint_every", 1000)); resume_from = getattr(args, "resume_from", None)
+    if args.steps <= 0 or args.eval_every <= 0 or args.accumulation_chunk_size <= 0 or checkpoint_every <= 0:
+        raise ValueError("C4g steps, eval interval, accumulation chunk size, and checkpoint interval must be positive")
     if not args.smoke and (args.manifest is None or args.qc_table is None or args.canonical_domain is None):
         raise ValueError("formal C4g requires --manifest, --qc-table, and --canonical-domain")
-    _prepare_output(args.output_dir, args.overwrite); _set_seed(args.seed)
+    if resume_from is None:
+        _prepare_output(args.output_dir, args.overwrite)
+    elif args.overwrite or not args.output_dir.is_dir():
+        raise ValueError("C4g resume requires an existing output directory without --overwrite")
+    _set_seed(args.seed)
     config = yaml.safe_load(args.source_config.read_text(encoding="utf-8")); synthetic = yaml.safe_load(args.experiment_config.read_text(encoding="utf-8"))["synthetic"]; domain = _load_domain(args.canonical_domain)
     motion = _respiratory_only_motion(GroundTruthMotion.from_domain(domain, respiratory_frequency_hz=float(synthetic["respiratory_frequency_hz"]), cardiac_frequency_hz=float(synthetic["cardiac_frequency_hz"]), respiratory_amplitude_mm=float(synthetic["respiratory_amplitude_mm"]), cardiac_amplitude_mm=float(synthetic["cardiac_amplitude_mm"])))
     if motion.cardiac_amplitude_mm != 0.0:
@@ -152,20 +167,39 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if model.film_implementation != "full_geometry_single_film":
         raise RuntimeError("C4g requires production GeometryFiLMMotionEncoder")
     learning_rate = float(config["training"]["optimizer"]["stage2"]["film_lr"])
-    optimizer = _configure_encoder_only(model, learning_rate=learning_rate); before = parameter_snapshot(model)
+    protocol = {"exact_full_batch": True, "accumulation_chunk_size": args.accumulation_chunk_size, "optimizer_step_after_all_observations": True, "uses_sampler": False, "direct_gt_score_mse": True, "original_geometry_preserved": True}
+    optimizer = _configure_encoder_only(model, learning_rate=learning_rate)
+    checkpoint: dict[str, Any] | None = None
+    if resume_from is not None:
+        checkpoint = torch.load(Path(resume_from), map_location=device, weights_only=True)
+        saved_protocol = checkpoint.get("protocol", {})
+        if checkpoint.get("observation_audit") != observation_audit or not all(saved_protocol.get(name) == protocol[name] for name in ("exact_full_batch", "optimizer_step_after_all_observations", "uses_sampler", "direct_gt_score_mse", "original_geometry_preserved")):
+            raise ValueError("C4g resume checkpoint is incompatible with this observation protocol")
+        if not 0 <= int(checkpoint.get("step", -1)) < args.steps:
+            raise ValueError("C4g resume checkpoint step must be smaller than requested --steps")
+        model.load_state_dict(checkpoint["model"]); optimizer.load_state_dict(checkpoint["optimizer"])
+    before = parameter_snapshot(model)
     renderer_calls = [0]; mbc_calls = [0]
     renderer_hook = model.psf.register_forward_hook(lambda *_: renderer_calls.__setitem__(0, renderer_calls[0] + 1)); mbc_hook = model.respiratory_mbc.register_forward_hook(lambda *_: mbc_calls.__setitem__(0, mbc_calls[0] + 1))
     try:
-        initial_rows, initial_arrays, initial_by_view, initial_overall = _evaluate(model, groups, motion)
-        initial = {"overall": initial_overall, "per_location": initial_rows, "by_location": aggregate_location_metrics(initial_rows), "by_view": initial_by_view}
-        thresholds = _update_thresholds(None, initial_overall, step=0)
-        curve = [_curve_row(0, initial_overall, full_batch_score_mse=initial_overall["score_mse"], encoder_parameter_norm=_parameter_norm(model))]
-        for step in range(1, args.steps + 1):
+        if checkpoint is None:
+            initial_rows, initial_arrays, initial_by_view, initial_overall = _evaluate(model, groups, motion)
+            initial = {"overall": initial_overall, "per_location": initial_rows, "by_location": aggregate_location_metrics(initial_rows), "by_view": initial_by_view}
+            thresholds = _update_thresholds(None, initial_overall, step=0)
+            curve = [_curve_row(0, initial_overall, full_batch_score_mse=initial_overall["score_mse"], encoder_parameter_norm=_parameter_norm(model))]
+            _write_curve(args.output_dir / "training_curve.csv", curve)
+            (args.output_dir / "metrics_initial.json").write_text(json.dumps(initial, indent=2) + "\n", encoding="utf-8")
+            start_step = 0
+        else:
+            initial = checkpoint["initial_metrics"]
+            initial_arrays = {name: value.cpu().numpy() for name, value in checkpoint["initial_arrays"].items()}
+            thresholds = checkpoint["thresholds"]; curve = checkpoint["curve"]; start_step = int(checkpoint["step"])
+        for step in range(start_step + 1, args.steps + 1):
             optimizer.zero_grad(set_to_none=True)
             batch = _accumulate_full_batch(model, observations, motion, accumulation_chunk_size=args.accumulation_chunk_size)
             if batch["observation_ids"] != [observation.dynamic_frame_id for observation in observations]:
                 raise RuntimeError("C4g full-batch pass did not use every observation exactly once")
-            if step == 1:
+            if step == start_step + 1:
                 for prefix in _ENCODER_PREFIXES:
                     if not any(name.startswith(prefix) and parameter.grad is not None and torch.isfinite(parameter.grad).all() and float(parameter.grad.norm()) > 0.0 for name, parameter in model.named_parameters()):
                         raise RuntimeError(f"C4g direct score loss did not reach {prefix}")
@@ -176,6 +210,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 rows, _, by_view, overall = _evaluate(model, groups, motion)
                 thresholds = _update_thresholds(thresholds, overall, step=step)
                 curve.append(_curve_row(step, overall, full_batch_score_mse=float(batch["full_batch_score_mse"]), encoder_parameter_norm=_parameter_norm(model)))
+                _write_curve(args.output_dir / "training_curve.csv", curve)
+            if step % checkpoint_every == 0:
+                checkpoint_path = args.output_dir / f"checkpoint_{step}.pt"
+                checkpoint_kwargs = {"model": model, "optimizer": optimizer, "step": step, "protocol": protocol, "observation_audit": observation_audit, "thresholds": thresholds, "curve": curve, "initial": initial, "initial_arrays": initial_arrays}
+                _save_checkpoint(checkpoint_path, **checkpoint_kwargs); _save_checkpoint(args.output_dir / "checkpoint_last.pt", **checkpoint_kwargs)
         final_rows, final_arrays, final_by_view, final_overall = _evaluate(model, groups, motion)
     finally:
         renderer_hook.remove(); mbc_hook.remove()
@@ -190,12 +229,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     (args.output_dir / "metrics_initial.json").write_text(json.dumps(initial, indent=2) + "\n", encoding="utf-8")
     (args.output_dir / "metrics_final.json").write_text(json.dumps(final, indent=2) + "\n", encoding="utf-8")
     np.savez_compressed(args.output_dir / "recovery_arrays.npz", **initial_arrays, **{f"final_{name}": value for name, value in final_arrays.items()})
-    protocol = {"exact_full_batch": True, "accumulation_chunk_size": args.accumulation_chunk_size, "optimizer_step_after_all_observations": True, "uses_sampler": False, "direct_gt_score_mse": True, "original_geometry_preserved": True}
-    torch.save({"model": model.state_dict(), "step": args.steps, "git_sha": _git_sha(), "protocol": protocol, "observation_audit": observation_audit}, args.output_dir / "checkpoint_last.pt")
+    _save_checkpoint(args.output_dir / "checkpoint_last.pt", model=model, optimizer=optimizer, step=args.steps, protocol=protocol, observation_audit=observation_audit, thresholds=thresholds, curve=curve, initial=initial, initial_arrays=initial_arrays)
     summary = {
         "experiment": "Exp2-C4g multi-location exact-full-batch encoder overfit", "git_sha": _git_sha(), "seed": args.seed, "supervision": "direct_gt_respiratory_score", "model": "GeometryFiLMMotionEncoder", "film_implementation": model.film_implementation,
         "observation_audit": observation_audit, "original_geometry_preserved": True, "multi_location_images_preserved": True, "multi_location_timestamps_preserved": True, "multi_location_gt_scores_preserved": True,
-        "trainable_modules": list(_ENCODER_PREFIXES), "film_lr": learning_rate, "steps": args.steps, "eval_every": args.eval_every, "full_batch_protocol": protocol, "exposure_accounting": exposure_accounting,
+        "trainable_modules": list(_ENCODER_PREFIXES), "film_lr": learning_rate, "steps": args.steps, "eval_every": args.eval_every, "checkpoint_every": checkpoint_every, "resumed_from": None if resume_from is None else str(resume_from), "full_batch_protocol": protocol, "exposure_accounting": exposure_accounting,
         "renderer_used": False, "mbc_used": False, "renderer_calls": renderer_calls[0], "learned_respiratory_mbc_calls": mbc_calls[0], "parameters_changed": changed, "frozen_module_audit": frozen_audit,
         "threshold_steps": thresholds, **classification, "initial_metrics": initial, "final_metrics": final,
         "interpretation_contract": "Full-batch recovery supports optimization-budget/sampling dynamics as the main C4d/C4f confound; failure after 10000 exact full-batch steps supports shared multi-location representation or optimization conflict as a primary blocker.",
@@ -206,7 +244,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Exp2-C4g multi-location exact-full-batch encoder overfit")
-    parser.add_argument("--source-config", type=Path, default=PROJECT_ROOT / "configs/source_first_change4_paperaligned.yaml"); parser.add_argument("--experiment-config", type=Path, default=PROJECT_ROOT / "experiments/c4_diagnostics/configs/exp1_synthetic_gt.yaml"); parser.add_argument("--manifest", type=Path); parser.add_argument("--qc-table", type=Path); parser.add_argument("--canonical-domain", type=Path); parser.add_argument("--output-dir", type=Path, required=True); parser.add_argument("--device", default="cpu"); parser.add_argument("--overwrite", action="store_true"); parser.add_argument("--seed", type=int, default=0); parser.add_argument("--locations-per-view", type=int, default=3); parser.add_argument("--frames-per-location", type=int, default=50); parser.add_argument("--steps", type=int, default=10000); parser.add_argument("--eval-every", type=int, default=100); parser.add_argument("--accumulation-chunk-size", type=int, default=25); parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--source-config", type=Path, default=PROJECT_ROOT / "configs/source_first_change4_paperaligned.yaml"); parser.add_argument("--experiment-config", type=Path, default=PROJECT_ROOT / "experiments/c4_diagnostics/configs/exp1_synthetic_gt.yaml"); parser.add_argument("--manifest", type=Path); parser.add_argument("--qc-table", type=Path); parser.add_argument("--canonical-domain", type=Path); parser.add_argument("--output-dir", type=Path, required=True); parser.add_argument("--device", default="cpu"); parser.add_argument("--overwrite", action="store_true"); parser.add_argument("--seed", type=int, default=0); parser.add_argument("--locations-per-view", type=int, default=3); parser.add_argument("--frames-per-location", type=int, default=50); parser.add_argument("--steps", type=int, default=10000); parser.add_argument("--eval-every", type=int, default=100); parser.add_argument("--accumulation-chunk-size", type=int, default=25); parser.add_argument("--checkpoint-every", type=int, default=1000); parser.add_argument("--resume-from", type=Path); parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args(); summary = run(args); print(f"Exp2-C4g: {args.output_dir / 'summary.json'} ({summary['observation_audit']['n_locations']} locations)")
 
 

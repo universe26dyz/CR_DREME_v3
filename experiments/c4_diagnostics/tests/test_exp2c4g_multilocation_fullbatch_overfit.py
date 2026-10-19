@@ -76,3 +76,16 @@ def test_cpu_smoke_writes_outputs_checkpoint_and_uses_no_renderer_or_mbc(tmp_pat
     assert checkpoint["step"] == 2 and checkpoint["protocol"]["exact_full_batch"]
     with (args.output_dir / "training_curve.csv").open() as handle:
         assert {"step", "full_batch_score_mse", "gt_correlation", "temporal_rms_ratio"} <= set(csv.DictReader(handle).fieldnames or ())
+
+
+def test_resume_restores_optimizer_curve_and_threshold_state(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[3]
+    output_dir = tmp_path / "c4g_resume"
+    common = {"source_config": root / "configs/source_first_change4_paperaligned.yaml", "experiment_config": root / "experiments/c4_diagnostics/configs/exp1_synthetic_gt.yaml", "manifest": None, "qc_table": None, "canonical_domain": None, "output_dir": output_dir, "device": "cpu", "overwrite": False, "seed": 0, "locations_per_view": 1, "frames_per_location": 3, "eval_every": 1, "accumulation_chunk_size": 2, "checkpoint_every": 1, "smoke": True}
+    run(Namespace(**common, steps=2, resume_from=None))
+    checkpoint = torch.load(output_dir / "checkpoint_last.pt", map_location="cpu", weights_only=True)
+    assert checkpoint["step"] == 2 and "optimizer" in checkpoint and checkpoint["curve"][-1]["step"] == 2
+    summary = run(Namespace(**common, steps=3, resume_from=output_dir / "checkpoint_last.pt"))
+    resumed = torch.load(output_dir / "checkpoint_last.pt", map_location="cpu", weights_only=True)
+    assert resumed["step"] == 3 and resumed["curve"][-1]["step"] == 3
+    assert summary["exposure_accounting"]["optimizer_steps"] == 3
