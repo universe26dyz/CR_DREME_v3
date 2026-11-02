@@ -46,8 +46,9 @@ def _configure_phase(model, phase: str, *, film_lr: float, respiratory_mbc_lr: f
 
 def _phase_loss(model, observation, phase: str, motion, uv):
     target = observation.image[0, uv[:, 1].long(), uv[:, 0].long()]
-    prediction = _render_with_gt_score(model, observation, uv, motion) if phase == "A" else _prediction_loss_terms(model, observation, uv)["data_mse"].new_tensor(0.)
-    return (prediction - target).square().mean() if phase == "A" else _prediction_loss_terms(model, observation, uv)["data_mse"]
+    if phase == "A":
+        return (_render_with_gt_score(model, observation, uv, motion) - target).square().mean()
+    return _prediction_loss_terms(model, observation, uv)["data_mse"]
 
 def _accumulate_full_batch(model, observations: list, *, phase: str, motion, pixel_samples: int, accumulation_chunk_size: int) -> dict[str, Any]:
     total = observations[0].image.new_zeros(()); ids: list[int] = []
@@ -90,6 +91,11 @@ def _snapshot_changed(before, after, allowed):
     return {"changed":changed,"unexpected":sorted(set(changed)-set(allowed))}
 def _norm(model,prefix,grad=False):
     values=[(p.grad if grad else p.detach()).reshape(-1) for n,p in model.named_parameters() if n.startswith(prefix) and (not grad or p.grad is not None)]; return float(torch.cat(values).norm()) if values else 0.
+def _thresholds_update(values, metric, step):
+    values = dict(values); c,r,n=metric["full_fov_dynamic_cosine"],metric["full_fov_dynamic_rms_ratio"],metric["full_fov_dynamic_normalized_epe"]
+    for name,ok in {"first_full_fov_cosine_ge_0p80_step":c>=.8,"first_full_fov_cosine_ge_0p90_step":c>=.9,"first_full_fov_cosine_ge_0p95_step":c>=.95,"first_full_fov_rms_ratio_in_0p5_1p5_step":.5<=r<=1.5,"first_full_fov_rms_ratio_in_0p8_1p2_step":.8<=r<=1.2,"first_full_fov_nepe_le_0p75_step":n<=.75,"first_full_fov_nepe_le_0p5_step":n<=.5}.items():
+        if ok and values.get(name) is None: values[name]=step
+    return values
 
 def run(args):
     device=torch.device(args.device); resume=getattr(args,"resume_from",None); schedule={"A":args.phase_a_steps,"B":args.phase_b_steps,"C":args.phase_c_steps}; total=sum(schedule.values())
@@ -106,9 +112,9 @@ def run(args):
     if checkpoint:
         model.load_state_dict(checkpoint["model"]); _restore_rng(checkpoint["rng_state"])
         if checkpoint["phase"]==next_phase: optimizer.load_state_dict(checkpoint["optimizer"])
-        curve=checkpoint["curve"]; initial=checkpoint["initial_metrics"]; phase_metrics=checkpoint["phase_metrics"]; snapshots=checkpoint["snapshots"]
+        curve=checkpoint["curve"]; initial=checkpoint["initial_metrics"]; phase_metrics=checkpoint["phase_metrics"]; snapshots=checkpoint["snapshots"]; thresholds=checkpoint.get("thresholds", {})
     else:
-        initial,_=_metrics(model,groups,motion,grid_shape=tuple(args.evaluation_grid_shape)); curve=[]; phase_metrics={}; snapshots={"start":parameter_snapshot(model)}
+        initial,_=_metrics(model,groups,motion,grid_shape=tuple(args.evaluation_grid_shape)); curve=[]; phase_metrics={}; snapshots={"start":parameter_snapshot(model)}; thresholds={}
     calls={"A":0,"B":0,"C":0}; renderer=[0]; mbc=[0]; card=[0]; unc=[0]; hooks=[model.psf.register_forward_hook(lambda *_:renderer.__setitem__(0,renderer[0]+1)),model.respiratory_mbc.register_forward_hook(lambda *_:mbc.__setitem__(0,mbc[0]+1)),model.cardiac_mbc.register_forward_hook(lambda *_:card.__setitem__(0,card[0]+1)),model.uncertainty.register_forward_hook(lambda *_:unc.__setitem__(0,unc[0]+1))]
     try:
         for step in range(start+1,total+1):
@@ -117,19 +123,25 @@ def run(args):
             optimizer.zero_grad(set_to_none=True); before_mbc=mbc[0]; batch=_accumulate_full_batch(model,observations,phase=phase,motion=motion if phase=="A" else None,pixel_samples=args.pixel_samples,accumulation_chunk_size=args.accumulation_chunk_size); calls[phase]+=mbc[0]-before_mbc
             frozen_grads = [n for n,p in model.named_parameters() if not n.startswith(_prefixes(phase)) and p.grad is not None]
             if batch["observation_ids"] != [o.dynamic_frame_id for o in observations] or frozen_grads: raise RuntimeError("full-batch or frozen-gradient audit failed: " + ", ".join(frozen_grads))
-            optimizer.step(); metrics=_phase_a_metrics(model,groups,motion,tuple(args.evaluation_grid_shape)) if phase=="A" else _metrics(model,groups,motion,grid_shape=tuple(args.evaluation_grid_shape))[0]; dvf=_aggregate_dvf(metrics); curve.append({"global_step":step,"phase":phase,"phase_step":step-(0 if phase=="A" else schedule["A"] if phase=="B" else schedule["A"]+schedule["B"]),"full_batch_reconstruction_mse":float(batch["full_batch_reconstruction_mse"]),**dvf,"encoder_parameter_norm":_norm(model,"film_encoder."),"respiratory_mbc_level0_parameter_norm":_norm(model,_LEVEL0),"encoder_grad_norm":_norm(model,"film_encoder.",True),"respiratory_mbc_level0_grad_norm":_norm(model,_LEVEL0,True),"film_lr":optimizer.param_groups[0]["lr"] if phase!="A" else 0.,"respiratory_mbc_lr":optimizer.param_groups[-1]["lr"] if phase!="B" else 0.})
-            if step in {schedule["A"],schedule["A"]+schedule["B"],total}:
-                key={schedule["A"]:"A",schedule["A"]+schedule["B"]:"B",total:"C"}[step]; phase_metrics[key]=metrics; snapshots[key]=parameter_snapshot(model); _save(args.output_dir/f"checkpoint_phase_{key.lower()}_end.pt",model=model.state_dict(),optimizer=optimizer.state_dict(),global_step=step,phase=phase,protocol=protocol,pixel_protocol=pixel,observation_audit=audit,curve=curve,initial_metrics=initial,phase_metrics=phase_metrics,snapshots=snapshots)
-            if step%args.checkpoint_every==0: _save(args.output_dir/f"checkpoint_{step}.pt",model=model.state_dict(),optimizer=optimizer.state_dict(),global_step=step,phase=phase,protocol=protocol,pixel_protocol=pixel,observation_audit=audit,curve=curve,initial_metrics=initial,phase_metrics=phase_metrics,snapshots=snapshots)
+            if not any(n.startswith(prefix) and p.grad is not None and torch.isfinite(p.grad).all() and float(p.grad.norm()) > 0 for n,p in model.named_parameters() for prefix in _prefixes(phase)): raise RuntimeError("missing expected phase gradient")
+            optimizer.step(); boundary = step in {schedule["A"],schedule["A"]+schedule["B"],total}
+            if boundary or step % args.eval_every == 0:
+                metrics=_phase_a_metrics(model,groups,motion,tuple(args.evaluation_grid_shape)) if phase=="A" else _metrics(model,groups,motion,grid_shape=tuple(args.evaluation_grid_shape))[0]; dvf=_aggregate_dvf(metrics); thresholds=_thresholds_update(thresholds,dvf,step); curve.append({"global_step":step,"phase":phase,"phase_step":step-(0 if phase=="A" else schedule["A"] if phase=="B" else schedule["A"]+schedule["B"]),"full_batch_reconstruction_mse":float(batch["full_batch_reconstruction_mse"]),**dvf,"encoder_parameter_norm":_norm(model,"film_encoder."),"respiratory_mbc_level0_parameter_norm":_norm(model,_LEVEL0),"encoder_grad_norm":_norm(model,"film_encoder.",True),"respiratory_mbc_level0_grad_norm":_norm(model,_LEVEL0,True),"film_lr":optimizer.param_groups[0]["lr"] if phase!="A" else 0.,"respiratory_mbc_lr":optimizer.param_groups[-1]["lr"] if phase!="B" else 0.})
+            if boundary:
+                key={schedule["A"]:"A",schedule["A"]+schedule["B"]:"B",total:"C"}[step]; phase_metrics[key]=metrics; snapshots[key]=parameter_snapshot(model); _save(args.output_dir/f"checkpoint_phase_{key.lower()}_end.pt",model=model.state_dict(),optimizer=optimizer.state_dict(),global_step=step,phase=phase,protocol=protocol,pixel_protocol=pixel,observation_audit=audit,curve=curve,initial_metrics=initial,phase_metrics=phase_metrics,snapshots=snapshots,thresholds=thresholds)
+            if step%args.checkpoint_every==0:
+                state=dict(model=model.state_dict(),optimizer=optimizer.state_dict(),global_step=step,phase=phase,protocol=protocol,pixel_protocol=pixel,observation_audit=audit,curve=curve,initial_metrics=initial,phase_metrics=phase_metrics,snapshots=snapshots,thresholds=thresholds); _save(args.output_dir/f"checkpoint_{step}.pt",**state); _save(args.output_dir/"checkpoint_last.pt",**state)
     finally:
         for hook in hooks: hook.remove()
+    required_phases = {phase_for(step) for step in range(start + 1, total + 1)}
+    if renderer[0] <= 0 or any(calls[key] <= 0 for key in required_phases) or card[0] != 0 or unc[0] != 0: raise RuntimeError("Exp3-B1 runtime module-call audit failed")
     stage_audit={"A":_snapshot_changed(snapshots["start"],snapshots["A"],[n for n in snapshots["start"] if n.startswith(_LEVEL0)]),"B":_snapshot_changed(snapshots["A"],snapshots["B"],[n for n in snapshots["A"] if n.startswith(_ENCODER_PREFIXES)]),"C":_snapshot_changed(snapshots["B"],snapshots["C"],[n for n in snapshots["B"] if n.startswith(_ALLOWED)])}
     if any(value["unexpected"] for value in stage_audit.values()): raise RuntimeError("Exp3-B1 phase parameter-change audit failed")
-    a,b,c=(_aggregate_dvf(phase_metrics[key]) for key in "ABC"); classification=_classify_stages(a,b,c); frozen={"film_encoder_card_unchanged":True,"canonical_unchanged":True,"respiratory_mbc_higher_levels_unchanged":True,"cardiac_mbc_unchanged":True,"uncertainty_unchanged":True}
+    a,b,c=(_aggregate_dvf(phase_metrics[key]) for key in "ABC"); classification=_classify_stages(a,b,c); final_snapshot=snapshots["C"]; frozen={"film_encoder_card_unchanged":all(torch.equal(snapshots["start"][n],final_snapshot[n]) for n in snapshots["start"] if n.startswith("film_encoder.card.")),"canonical_unchanged":all(torch.equal(snapshots["start"][n],final_snapshot[n]) for n in snapshots["start"] if n.startswith("canonical.")),"respiratory_mbc_higher_levels_unchanged":all(torch.equal(snapshots["start"][n],final_snapshot[n]) for n in snapshots["start"] if n.startswith("respiratory_mbc.levels.1.") or n.startswith("respiratory_mbc.levels.2.")),"cardiac_mbc_unchanged":all(torch.equal(snapshots["start"][n],final_snapshot[n]) for n in snapshots["start"] if n.startswith("cardiac_mbc.")),"uncertainty_unchanged":all(torch.equal(snapshots["start"][n],final_snapshot[n]) for n in snapshots["start"] if n.startswith("uncertainty."))}
     with (args.output_dir/"training_curve.csv").open("w",newline="") as h: w=csv.DictWriter(h,fieldnames=list(curve[0])); w.writeheader(); w.writerows(curve)
     for key,name in (("A","metrics_phase_a_end.json"),("B","metrics_phase_b_end.json"),("C","metrics_final.json")): (args.output_dir/name).write_text(json.dumps(phase_metrics[key],indent=2)+"\n")
-    (args.output_dir/"metrics_initial.json").write_text(json.dumps(initial,indent=2)+"\n"); (args.output_dir/"stage_transition_audit.json").write_text(json.dumps(stage_audit,indent=2)+"\n"); factor={"encoder_parameter_norm":curve[-1]["encoder_parameter_norm"],"respiratory_mbc_level0_parameter_norm":curve[-1]["respiratory_mbc_level0_parameter_norm"],"basis_field_metric_supported":False}; (args.output_dir/"factor_diagnostics.json").write_text(json.dumps(factor,indent=2)+"\n"); np.savez_compressed(args.output_dir/"recovery_arrays.npz")
-    _save(args.output_dir/"checkpoint_last.pt",model=model.state_dict(),optimizer=optimizer.state_dict(),global_step=total,phase="C",protocol=protocol,pixel_protocol=pixel,observation_audit=audit,curve=curve,initial_metrics=initial,phase_metrics=phase_metrics,snapshots=snapshots)
+    (args.output_dir/"metrics_initial.json").write_text(json.dumps(initial,indent=2)+"\n"); (args.output_dir/"stage_transition_audit.json").write_text(json.dumps(stage_audit,indent=2)+"\n"); factor={"encoder_parameter_norm":curve[-1]["encoder_parameter_norm"],"respiratory_mbc_level0_parameter_norm":curve[-1]["respiratory_mbc_level0_parameter_norm"],"basis_field_metric_supported":False}; (args.output_dir/"factor_diagnostics.json").write_text(json.dumps(factor,indent=2)+"\n"); np.savez_compressed(args.output_dir/"recovery_arrays.npz",initial_dvf=np.asarray(list(_aggregate_dvf(initial).values())),phase_a_dvf=np.asarray(list(a.values())),phase_b_dvf=np.asarray(list(b.values())),phase_c_dvf=np.asarray(list(c.values())))
+    _save(args.output_dir/"checkpoint_last.pt",model=model.state_dict(),optimizer=optimizer.state_dict(),global_step=total,phase="C",protocol=protocol,pixel_protocol=pixel,observation_audit=audit,curve=curve,initial_metrics=initial,phase_metrics=phase_metrics,snapshots=snapshots,thresholds=thresholds)
     summary={"experiment":"Exp3-B1 staged bootstrap recovery","scientific_question":"Can staged MBC then encoder training escape joint cold-start?","git_sha":_git_sha(),"seed":args.seed,"observation_audit":audit,"pixel_protocol":pixel,"scientific_protocol":protocol,"phase_schedule":{"phase_a_steps":schedule["A"],"phase_b_steps":schedule["B"],"phase_c_steps":schedule["C"]},"phase_a":{"oracle_use":"GT respiratory score as coefficient only","trainable_modules":[_LEVEL0],"lr":5e-4,"final_dvf":a,"escape":_escape(a),"strict":_strict(a)},"phase_b":{"oracle_use":"evaluation only","trainable_modules":list(_ENCODER_PREFIXES),"film_lr":5e-4,"final_dvf":b,"escape":_escape(b),"strict":_strict(b)},"phase_c":{"oracle_use":"evaluation only","film_lr":low,"respiratory_mbc_lr":low,"final_dvf":c,"escape":_escape(c),"strict":_strict(c)},**classification,"frozen_module_audit":frozen,"stage_parameter_change_audit":stage_audit,"renderer_calls":{"total":renderer[0]},"mbc_calls":calls,"cardiac_mbc_calls":card[0],"uncertainty_calls":unc[0],"threshold_steps":{},"best_metrics":min(curve,key=lambda x:x["full_batch_reconstruction_mse"]),"interpretation_contract":"Raw score amplitude/sign are gauge-dependent diagnostics. DVF metrics determine recovery."}; (args.output_dir/"summary.json").write_text(json.dumps(summary,indent=2)+"\n"); return summary
 
 def main():

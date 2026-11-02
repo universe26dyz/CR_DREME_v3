@@ -95,3 +95,17 @@ def test_checkpoint_loader_forces_cpu_map_location_for_rng_state(tmp_path: Path)
     with patch.object(torch, "load", side_effect=tracked):
         payload = _load_checkpoint(checkpoint)
     assert observed["map_location"] == "cpu" and payload["rng_state"]["torch"].device.type == "cpu"
+
+
+def test_eval_cadence_and_phase_c_do_not_use_gt_score(tmp_path: Path) -> None:
+    root, output_dir = Path(__file__).resolve().parents[3], tmp_path / "cadence"
+    common = {"source_config": root / "configs/source_first_change4_paperaligned.yaml", "experiment_config": root / "experiments/c4_diagnostics/configs/exp1_synthetic_gt.yaml", "manifest": None, "qc_table": None, "canonical_domain": None, "output_dir": output_dir, "device": "cpu", "overwrite": False, "seed": 0, "locations_per_view": 1, "frames_per_location": 3, "phase_a_steps": 1, "phase_b_steps": 1, "phase_c_steps": 2, "eval_every": 9, "pixel_mode": "fixed_grid", "pixel_samples": 256, "accumulation_chunk_size": 2, "checkpoint_every": 1, "evaluation_grid_shape": (3, 3, 3), "smoke": True}
+    original = b1._gt_respiratory_scores
+    calls = {"count": 0}
+    def guarded(*args, **kwargs):
+        calls["count"] += 1; return original(*args, **kwargs)
+    with patch.object(b1, "_gt_respiratory_scores", side_effect=guarded):
+        run(Namespace(**common, resume_from=None))
+    with (output_dir / "training_curve.csv").open() as handle:
+        rows = list(__import__("csv").DictReader(handle))
+    assert [row["global_step"] for row in rows] == ["1", "2", "4"]
