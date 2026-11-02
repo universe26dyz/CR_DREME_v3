@@ -120,3 +120,24 @@ def test_thresholds_include_escape_and_strict_crossings() -> None:
 def test_phase_b_gradient_audit_requires_each_encoder_prefix() -> None:
     model = _model(9); _configure_phase(model, "B", film_lr=5e-4, respiratory_mbc_lr=5e-4)
     assert not _assert_expected_gradients(model, "B")
+
+
+def test_expected_gradient_audit_runs_once_per_phase_per_invocation(tmp_path: Path) -> None:
+    root, output_dir = Path(__file__).resolve().parents[3], tmp_path / "gradient-audit"
+    common = {"source_config": root / "configs/source_first_change4_paperaligned.yaml", "experiment_config": root / "experiments/c4_diagnostics/configs/exp1_synthetic_gt.yaml", "manifest": None, "qc_table": None, "canonical_domain": None, "output_dir": output_dir, "device": "cpu", "overwrite": False, "seed": 0, "locations_per_view": 1, "frames_per_location": 3, "phase_a_steps": 2, "phase_b_steps": 2, "phase_c_steps": 2, "eval_every": 9, "pixel_mode": "fixed_grid", "pixel_samples": 256, "accumulation_chunk_size": 2, "checkpoint_every": 1, "evaluation_grid_shape": (3, 3, 3), "smoke": True}
+    calls: list[str] = []; original = b1._assert_expected_gradients
+    with patch.object(b1, "_assert_expected_gradients", side_effect=lambda model, phase: calls.append(phase) or original(model, phase)):
+        summary = run(Namespace(**common, resume_from=None))
+    assert calls == ["A", "B", "C"]
+    assert summary["gradient_connectivity_audit"] == {"A": True, "B": True, "C": True}
+
+
+def test_midphase_resume_reaudits_first_executed_phase(tmp_path: Path) -> None:
+    root, output_dir = Path(__file__).resolve().parents[3], tmp_path / "gradient-resume"
+    common = {"source_config": root / "configs/source_first_change4_paperaligned.yaml", "experiment_config": root / "experiments/c4_diagnostics/configs/exp1_synthetic_gt.yaml", "manifest": None, "qc_table": None, "canonical_domain": None, "output_dir": output_dir, "device": "cpu", "overwrite": False, "seed": 0, "locations_per_view": 1, "frames_per_location": 3, "phase_a_steps": 1, "phase_b_steps": 2, "phase_c_steps": 1, "eval_every": 9, "pixel_mode": "fixed_grid", "pixel_samples": 256, "accumulation_chunk_size": 2, "checkpoint_every": 1, "evaluation_grid_shape": (3, 3, 3), "smoke": True}
+    run(Namespace(**common, resume_from=None))
+    calls: list[str] = []; original = b1._assert_expected_gradients
+    with patch.object(b1, "_assert_expected_gradients", side_effect=lambda model, phase: calls.append(phase) or original(model, phase)):
+        summary = run(Namespace(**common, resume_from=output_dir / "checkpoint_2.pt"))
+    assert calls == ["B", "C"]
+    assert summary["gradient_connectivity_audit"] == {"A": None, "B": True, "C": True}
