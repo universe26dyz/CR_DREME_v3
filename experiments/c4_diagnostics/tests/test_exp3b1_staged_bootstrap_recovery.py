@@ -10,7 +10,7 @@ import yaml
 
 from experiments.c4_diagnostics.exp1_synthetic_gt_recovery import _build_observations, fallback_geometry
 from experiments.c4_diagnostics.exp2c4b_oracle_field_encoder_only import _build_intervention_model, _respiratory_only_motion
-from experiments.c4_diagnostics.exp3b1_staged_bootstrap_recovery import _accumulate_full_batch, _classify_stages, _configure_phase, _fixed_pixel_grid, _load_checkpoint, run
+from experiments.c4_diagnostics.exp3b1_staged_bootstrap_recovery import _accumulate_full_batch, _assert_expected_gradients, _classify_stages, _configure_phase, _fixed_pixel_grid, _load_checkpoint, _thresholds_update, run
 import experiments.c4_diagnostics.exp3b1_staged_bootstrap_recovery as b1
 from experiments.c4_diagnostics.synthetic.motion import GroundTruthMotion
 from experiments.c4_diagnostics.synthetic.phantom import AnalyticCanonicalPhantom
@@ -109,3 +109,14 @@ def test_eval_cadence_and_phase_c_do_not_use_gt_score(tmp_path: Path) -> None:
     with (output_dir / "training_curve.csv").open() as handle:
         rows = list(__import__("csv").DictReader(handle))
     assert [row["global_step"] for row in rows] == ["1", "2", "4"]
+
+
+def test_thresholds_include_escape_and_strict_crossings() -> None:
+    metric = {"full_fov_dynamic_cosine": .96, "full_fov_dynamic_rms_ratio": 1., "full_fov_dynamic_normalized_epe": .4}
+    values = _thresholds_update({}, metric, 7)
+    assert values["first_coldstart_escape_step"] == 7 and values["first_strict_recovery_step"] == 7
+
+
+def test_phase_b_gradient_audit_requires_each_encoder_prefix() -> None:
+    model = _model(9); _configure_phase(model, "B", film_lr=5e-4, respiratory_mbc_lr=5e-4)
+    assert not _assert_expected_gradients(model, "B")
