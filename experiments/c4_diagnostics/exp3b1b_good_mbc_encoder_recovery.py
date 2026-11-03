@@ -39,6 +39,28 @@ def _exposure_accounting(*, steps: int, observations_per_update: int, pixels_per
     return {"optimizer_steps": steps, "observations_per_update": observations_per_update, "pixels_per_observation": pixels_per_observation, "observation_exposures": steps * observations_per_update, "pixel_observation_exposures": steps * observations_per_update * pixels_per_observation}
 
 
+def _executed_exposure_accounting(*, phase_a_steps: int, phase_b_steps_executed: int) -> dict[str, Any]:
+    phase_a = _exposure_accounting(steps=phase_a_steps, observations_per_update=32, pixels_per_observation=256)
+    phase_b = _exposure_accounting(steps=phase_b_steps_executed, observations_per_update=450, pixels_per_observation=256)
+    return {"phase_a": phase_a, "phase_b": phase_b, "total_observation_exposures": phase_a["observation_exposures"] + phase_b["observation_exposures"], "total_pixel_observation_exposures": phase_a["pixel_observation_exposures"] + phase_b["pixel_observation_exposures"]}
+
+
+def _completed_curve_phase_steps(curve: list[dict[str, Any]], phase: str, *, phase_a_steps: int) -> int:
+    completed_steps: list[int] = []
+    for row in curve:
+        if row.get("phase") != phase:
+            continue
+        try:
+            completed_steps.append(int(row["phase_step"]))
+        except (KeyError, TypeError, ValueError):
+            try:
+                global_step = int(row["global_step"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            completed_steps.append(global_step if phase == "A" else global_step - phase_a_steps)
+    return max(completed_steps, default=0)
+
+
 def _phase_a_protocol() -> dict[str, Any]:
     return {"steps": 750, "observations_per_update": 32, "pixel_mode": "fixed_grid", "pixel_samples": 256, "objective": "data_only", "trainable_modules": [_LEVEL0], "gt_respiratory_score_for_training": True, "exposure_accounting": _exposure_accounting(steps=750, observations_per_update=32, pixels_per_observation=256)}
 
@@ -310,7 +332,8 @@ def _finish(args, initial_metrics, phase_metrics, phase_arrays, snapshots, stage
         historical_pair_available = True
     factor = {"encoder_parameter_norm": _state_norm(final_snapshot, _ENCODER_PREFIXES), "respiratory_mbc_level0_parameter_norm": _state_norm(final_snapshot, _LEVEL0), "basis_field_metric_supported": False}
     _write_json(args.output_dir / "factor_diagnostics.json", factor)
-    summary = {"experiment": "Exp3-B1b Good-MBC to Encoder Recovery", "git_sha": old_b1._git_sha(), "output_dir": str(args.output_dir), "seed": args.seed, "scientific_protocol": protocol, "exposure_accounting": {"phase_a": _phase_a_protocol()["exposure_accounting"], "phase_b": _phase_b_protocol()["exposure_accounting"], "total_observation_exposures": 474000}, "observation_audit": observation_audit, "pixel_protocol": pixel_protocol, "phase_a": {"final_dvf": a_dvf, "escape": _escape(a_dvf)}, "phase_b": None if b_dvf is None else {"final_dvf": b_dvf, "escape": _escape(b_dvf), "strict": _strict(b_dvf), "first_phase_b_escape_step": first_escape, "first_phase_b_strict_step": first_strict}, "phase_b_entered": phase_b_entered, "historical_pair_available": historical_pair_available, "stage_parameter_change_audit": stage_audit, "frozen_module_audit": frozen, "runtime_audit": module_calls, **classification}
+    executed_exposure_accounting = _executed_exposure_accounting(phase_a_steps=_completed_curve_phase_steps(curve, "A", phase_a_steps=args.phase_a_steps), phase_b_steps_executed=_completed_curve_phase_steps(curve, "B", phase_a_steps=args.phase_a_steps))
+    summary = {"experiment": "Exp3-B1b Good-MBC to Encoder Recovery", "git_sha": old_b1._git_sha(), "output_dir": str(args.output_dir), "seed": args.seed, "scientific_protocol": protocol, "exposure_accounting": executed_exposure_accounting, "observation_audit": observation_audit, "pixel_protocol": pixel_protocol, "phase_a": {"final_dvf": a_dvf, "escape": _escape(a_dvf)}, "phase_b": None if b_dvf is None else {"final_dvf": b_dvf, "escape": _escape(b_dvf), "strict": _strict(b_dvf), "first_phase_b_escape_step": first_escape, "first_phase_b_strict_step": first_strict}, "phase_b_entered": phase_b_entered, "historical_pair_available": historical_pair_available, "stage_parameter_change_audit": stage_audit, "frozen_module_audit": frozen, "runtime_audit": module_calls, **classification}
     _write_json(args.output_dir / "summary.json", summary)
     return summary
 

@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import experiments.c4_diagnostics.exp3b1b_good_mbc_encoder_recovery as b1b
-from experiments.c4_diagnostics.exp3b1b_good_mbc_encoder_recovery import _classify, _formal_fresh_args_valid, _formal_resume_args_valid, _parse_existing_b1_phase_b_at_step, _phase_a_protocol, _phase_b_eval_steps, _phase_b_protocol, _write_paired_comparison, run
+from experiments.c4_diagnostics.exp3b1b_good_mbc_encoder_recovery import _classify, _executed_exposure_accounting, _formal_fresh_args_valid, _formal_resume_args_valid, _parse_existing_b1_phase_b_at_step, _phase_a_protocol, _phase_b_eval_steps, _phase_b_protocol, _write_paired_comparison, run
 
 
 PRIMARY = {
@@ -32,6 +32,24 @@ def test_b1b_protocols_fix_the_two_phase_budgets_and_ownership() -> None:
     phase_a, phase_b = _phase_a_protocol(), _phase_b_protocol()
     assert phase_a == {"steps": 750, "observations_per_update": 32, "pixel_mode": "fixed_grid", "pixel_samples": 256, "objective": "data_only", "trainable_modules": ["respiratory_mbc.levels.0."], "gt_respiratory_score_for_training": True, "exposure_accounting": {"optimizer_steps": 750, "observations_per_update": 32, "pixels_per_observation": 256, "observation_exposures": 24000, "pixel_observation_exposures": 6144000}}
     assert phase_b == {"steps": 1000, "observations_per_update": 450, "pixel_mode": "fixed_grid", "pixel_samples": 256, "accumulation_chunk_size": 5, "film_lr": 5e-4, "objective": "reconstruction_image_data_mse_only", "trainable_modules": ["film_encoder.image.", "film_encoder.geometry_mlp.", "film_encoder.head.", "film_encoder.resp."], "gt_respiratory_score_for_training": False, "exposure_accounting": {"optimizer_steps": 1000, "observations_per_update": 450, "pixels_per_observation": 256, "observation_exposures": 450000, "pixel_observation_exposures": 115200000}}
+
+
+@pytest.mark.parametrize(
+    ("phase_b_steps", "expected_phase_b_observation_exposures", "expected_total_observation_exposures"),
+    [(1000, 450000, 474000), (0, 0, 24000), (2000, 900000, 924000)],
+)
+def test_executed_exposure_accounting_tracks_completed_phase_b_steps(
+    phase_b_steps: int,
+    expected_phase_b_observation_exposures: int,
+    expected_total_observation_exposures: int,
+) -> None:
+    accounting = _executed_exposure_accounting(phase_a_steps=750, phase_b_steps_executed=phase_b_steps)
+    assert accounting["phase_a"]["optimizer_steps"] == 750
+    assert accounting["phase_a"]["observation_exposures"] == 24000
+    assert accounting["phase_b"]["optimizer_steps"] == phase_b_steps
+    assert accounting["phase_b"]["observation_exposures"] == expected_phase_b_observation_exposures
+    assert accounting["phase_b"]["pixel_observation_exposures"] == expected_phase_b_observation_exposures * 256
+    assert accounting["total_observation_exposures"] == expected_total_observation_exposures
 
 
 def test_historical_parser_reads_only_phase_b_phase_step_1000(tmp_path: Path) -> None:
@@ -98,7 +116,7 @@ def test_good_mbc_gate_enters_imported_phase_b_with_frozen_mbc(tmp_path: Path, m
     assert summary["runtime_audit"]["phase_b_encoder_calls"] > 0
     assert summary["git_sha"] == b1b.old_b1._git_sha()
     assert summary["historical_pair_available"] is False
-    assert summary["exposure_accounting"]["total_observation_exposures"] == 474000
+    assert summary["exposure_accounting"]["total_observation_exposures"] == 932
     assert summary["frozen_module_audit"]["respiratory_mbc_unchanged_during_b"] is True
     assert (Path(summary["output_dir"]) / "checkpoint_phase_b_2.pt").is_file()
     assert not (Path(summary["output_dir"]) / "paired_phase_b_1000_comparison.json").exists()
