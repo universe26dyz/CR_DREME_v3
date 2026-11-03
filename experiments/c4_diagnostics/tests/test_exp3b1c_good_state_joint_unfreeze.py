@@ -16,7 +16,7 @@ STRICT = {"full_fov_dynamic_cosine": .96, "full_fov_dynamic_rms_ratio": 1.0, "fu
 FAIL = {"full_fov_dynamic_cosine": .7, "full_fov_dynamic_rms_ratio": .2, "full_fov_dynamic_normalized_epe": 1.2, "full_fov_static_rms_mm": .6}
 
 
-def _formal_source_checkpoint(*, phase: str = "B", global_step: int = 2750, phase_a_steps: int = 750, phase_b_steps: int = 2000) -> dict:
+def _formal_source_checkpoint(*, phase: str = "B", global_step: int = 2750, phase_a_steps: int = 750, phase_b_steps: int = 2000, include_metrics: bool = True, include_curve: bool = True) -> dict:
     return {
         "phase": phase,
         "global_step": global_step,
@@ -24,6 +24,8 @@ def _formal_source_checkpoint(*, phase: str = "B", global_step: int = 2750, phas
         "protocol": {"phase_a": b1b._phase_a_protocol(), "phase_b": b1b._phase_b_protocol(), "phase_schedule": {"phase_a_steps": phase_a_steps, "phase_b_steps": phase_b_steps}, "no_phase_c": True},
         "observation_audit": {"n_locations": 9, "n_frames": 450, "frames_per_location": 50},
         "pixel_protocol": {"pixel_mode": "fixed_grid", "actual_pixel_count": 256},
+        "phase_metrics": {"B2000": {}} if include_metrics else {},
+        "curve": [{"phase": "B", "phase_step": 2000}] if include_curve else [],
     }
 
 
@@ -37,6 +39,16 @@ def test_formal_source_admission_requires_b2000_but_accepts_static_phase_b_1000_
     invalid_schedule = _formal_source_checkpoint(phase_b_steps=1000)
     with pytest.raises(ValueError):
         b1c._admit_source_checkpoint(invalid_schedule, seed=0, observation_audit=invalid_schedule["observation_audit"], pixel_protocol=invalid_schedule["pixel_protocol"], formal=True)
+    for keyword, message in (("include_metrics", "missing B2000 metrics"), ("include_curve", "missing B2000 curve evidence")):
+        invalid = _formal_source_checkpoint(**{keyword: False})
+        with pytest.raises(ValueError, match=message):
+            b1c._admit_source_checkpoint(invalid, seed=0, observation_audit=invalid["observation_audit"], pixel_protocol=invalid["pixel_protocol"], formal=True)
+
+
+def test_lineage_global_step_keeps_source_b2000_and_c_steps_distinct() -> None:
+    assert b1c._lineage_global_step(2750, 0) == 2750
+    assert b1c._lineage_global_step(2750, 250) == 3000
+    assert b1c._lineage_global_step(2750, 1000) == 3750
 
 
 def test_joint_trajectory_classification_uses_only_escape_and_strict_thresholds() -> None:
@@ -111,6 +123,8 @@ def test_joint_c_uses_fresh_phase_c_optimizer_and_writes_cadence_outputs(tmp_pat
     provenance = json.loads((output / "source_checkpoint_provenance.json").read_text())
     assert provenance["source_checkpoint_path"] == str(source)
     assert provenance["source_checkpoint_sha256"]
+    payload = b1c.old_b1._load_checkpoint(output / "checkpoint_c_2.pt")
+    assert (payload["phase_step"], payload["global_step"]) == (2, 5)
 
 
 def test_mid_c_resume_restores_c_optimizer_rng_and_reaudits_gradients(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -129,3 +143,19 @@ def test_mid_c_resume_restores_c_optimizer_rng_and_reaudits_gradients(tmp_path: 
     payload = b1c.old_b1._load_checkpoint(resumed.output_dir / "checkpoint_c_2.pt")
     assert payload["phase"] == "C"
     assert payload["optimizer"]["state"]
+
+
+def test_corrupted_resume_global_step_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _make_smoke_source(tmp_path, monkeypatch)
+    monkeypatch.setattr(b1b, "_escape", lambda _metric: True)
+    first = _b1c_smoke_args(tmp_path, "corrupt", source)
+    first.phase_c_steps = 1
+    b1c.run(first)
+    checkpoint = first.output_dir / "checkpoint_c_1.pt"
+    payload = b1c.old_b1._load_checkpoint(checkpoint)
+    payload["global_step"] = payload["phase_step"]
+    torch.save(payload, checkpoint)
+    resumed = _b1c_smoke_args(tmp_path, "corrupt", source)
+    resumed.resume_from = checkpoint
+    with pytest.raises(ValueError, match="resume step provenance"):
+        b1c.run(resumed)

@@ -44,6 +44,10 @@ def _formal_args_valid(args) -> bool:
     return (args.phase_c_steps, args.locations_per_view, args.frames_per_location, args.pixel_mode, args.pixel_samples, args.accumulation_chunk_size, args.film_lr, args.respiratory_mbc_lr, args.eval_every, args.checkpoint_every) == (1000, 3, 50, "fixed_grid", 256, 5, 5e-5, 5e-5, 250, 250)
 
 
+def _lineage_global_step(source_global_step: int, phase_step: int) -> int:
+    return source_global_step + phase_step
+
+
 def _admit_source_checkpoint(checkpoint: dict[str, Any], *, seed: int, observation_audit: dict[str, Any], pixel_protocol: dict[str, Any], formal: bool) -> None:
     if checkpoint.get("phase") != "B":
         raise ValueError("B1c source checkpoint must be a B1b Phase-B checkpoint")
@@ -56,6 +60,10 @@ def _admit_source_checkpoint(checkpoint: dict[str, Any], *, seed: int, observati
     if formal:
         if checkpoint.get("global_step") != 2750 or schedule.get("phase_a_steps") != 750 or schedule.get("phase_b_steps") != 2000:
             raise ValueError("formal B1c requires a B1b B2000 checkpoint at global step 2750")
+        if "B2000" not in checkpoint.get("phase_metrics", {}):
+            raise ValueError("formal B1c source checkpoint is missing B2000 metrics")
+        if not any(row.get("phase") == "B" and int(row.get("phase_step", -1)) == 2000 for row in checkpoint.get("curve", [])):
+            raise ValueError("formal B1c source checkpoint is missing B2000 curve evidence")
         if (observation_audit.get("n_locations"), observation_audit.get("n_frames"), observation_audit.get("frames_per_location")) != (9, 450, 50) or (pixel_protocol.get("pixel_mode"), pixel_protocol.get("actual_pixel_count")) != ("fixed_grid", 256):
             raise ValueError("formal B1c requires the prescribed B1b 9-location, 450-frame fixed-grid source")
 
@@ -66,13 +74,13 @@ def _metric_agrees(current: dict[str, float], saved: dict[str, float]) -> bool:
 
 def _source_provenance(path: Path, checkpoint: dict[str, Any], source_dvf: dict[str, float]) -> dict[str, Any]:
     schedule = checkpoint["protocol"]["phase_schedule"]
-    return {"source_checkpoint_path": str(path), "source_checkpoint_sha256": _sha256(path), "source_checkpoint_git_sha": checkpoint.get("git_sha"), "source_checkpoint_phase": checkpoint["phase"], "source_checkpoint_global_step": checkpoint["global_step"], "source_checkpoint_seed": checkpoint["seed"], "source_phase_a_steps": schedule["phase_a_steps"], "source_phase_b_steps": schedule["phase_b_steps"], "source_observation_audit": checkpoint["observation_audit"], "source_pixel_protocol": checkpoint["pixel_protocol"], "source_B2000_DVF": source_dvf, "source_escape": b1b._escape(source_dvf), "source_strict": b1b._strict(source_dvf)}
+    return {"source_checkpoint_path": str(path), "source_checkpoint_sha256": _sha256(path), "source_checkpoint_git_sha": checkpoint.get("git_sha"), "source_checkpoint_phase": checkpoint["phase"], "source_checkpoint_global_step": checkpoint["global_step"], "b1c_lineage_c0_global_step": checkpoint["global_step"], "b1c_lineage_c1000_global_step": _lineage_global_step(int(checkpoint["global_step"]), 1000), "source_checkpoint_seed": checkpoint["seed"], "source_phase_a_steps": schedule["phase_a_steps"], "source_phase_b_steps": schedule["phase_b_steps"], "source_observation_audit": checkpoint["observation_audit"], "source_pixel_protocol": checkpoint["pixel_protocol"], "source_B2000_DVF": source_dvf, "source_escape": b1b._escape(source_dvf), "source_strict": b1b._strict(source_dvf)}
 
 
-def _curve_entry(*, step: int, metrics: dict[str, Any], reconstruction_mse: float | None, model, optimizer=None) -> dict[str, Any]:
+def _curve_entry(*, step: int, source_global_step: int, metrics: dict[str, Any], reconstruction_mse: float | None, model, optimizer=None) -> dict[str, Any]:
     aggregate = metrics["aggregate"]
     values = {name: float(aggregate[name]["mean"]) for name in _CURVE_METRICS}
-    return {"phase": "C", "phase_step": step, "global_step": step, "full_batch_reconstruction_mse": reconstruction_mse, **values, "encoder_parameter_norm": old_b1._norm(model, "film_encoder."), "respiratory_mbc_level0_parameter_norm": old_b1._norm(model, _LEVEL0), "encoder_grad_norm": None if optimizer is None else old_b1._norm(model, "film_encoder.", True), "respiratory_mbc_level0_grad_norm": None if optimizer is None else old_b1._norm(model, _LEVEL0, True), "film_lr": None if optimizer is None else optimizer.param_groups[0]["lr"], "respiratory_mbc_lr": None if optimizer is None else optimizer.param_groups[-1]["lr"]}
+    return {"phase": "C", "phase_step": step, "global_step": _lineage_global_step(source_global_step, step), "full_batch_reconstruction_mse": reconstruction_mse, **values, "encoder_parameter_norm": old_b1._norm(model, "film_encoder."), "respiratory_mbc_level0_parameter_norm": old_b1._norm(model, _LEVEL0), "encoder_grad_norm": None if optimizer is None else old_b1._norm(model, "film_encoder.", True), "respiratory_mbc_level0_grad_norm": None if optimizer is None else old_b1._norm(model, _LEVEL0, True), "film_lr": None if optimizer is None else optimizer.param_groups[0]["lr"], "respiratory_mbc_lr": None if optimizer is None else optimizer.param_groups[-1]["lr"]}
 
 
 def _classify_joint_trajectory(source: dict[str, float], c_metrics: list[dict[str, float]]) -> dict[str, Any]:
@@ -111,8 +119,8 @@ def _save_checkpoint(path: Path, **state: Any) -> None:
     old_b1._save(path, **state)
 
 
-def _checkpoint_state(*, model, optimizer, step: int, protocol: dict[str, Any], provenance: dict[str, Any], observation_audit: dict[str, Any], pixel_protocol: dict[str, Any], curve: list[dict[str, Any]], phase_metrics: dict[str, Any], snapshots: dict[str, Any]) -> dict[str, Any]:
-    return {"kind": "Exp3-B1c", "model": model.state_dict(), "optimizer": optimizer.state_dict(), "global_step": step, "phase": "C", "protocol": protocol, "source_provenance": provenance, "observation_audit": observation_audit, "pixel_protocol": pixel_protocol, "curve": curve, "phase_metrics": phase_metrics, "snapshots": snapshots}
+def _checkpoint_state(*, model, optimizer, step: int, source_global_step: int, protocol: dict[str, Any], provenance: dict[str, Any], observation_audit: dict[str, Any], pixel_protocol: dict[str, Any], curve: list[dict[str, Any]], phase_metrics: dict[str, Any], snapshots: dict[str, Any]) -> dict[str, Any]:
+    return {"kind": "Exp3-B1c", "model": model.state_dict(), "optimizer": optimizer.state_dict(), "phase_step": step, "global_step": _lineage_global_step(source_global_step, step), "phase": "C", "protocol": protocol, "source_provenance": provenance, "observation_audit": observation_audit, "pixel_protocol": pixel_protocol, "curve": curve, "phase_metrics": phase_metrics, "snapshots": snapshots}
 
 
 def _write_outputs(args, metrics_by_step: dict[int, dict[str, Any]], curve: list[dict[str, Any]], source_provenance: dict[str, Any], stage_audit: dict[str, Any], factor: dict[str, Any], summary: dict[str, Any]) -> None:
@@ -145,17 +153,19 @@ def run(args) -> dict[str, Any]:
     _, motion, observations, groups, observation_audit, pixel_protocol, model = b1b._build_runtime(args)
     source_checkpoint = old_b1._load_checkpoint(args.source_checkpoint)
     _admit_source_checkpoint(source_checkpoint, seed=args.seed, observation_audit=observation_audit, pixel_protocol=pixel_protocol, formal=formal)
+    source_global_step = int(source_checkpoint["global_step"])
     model.load_state_dict(source_checkpoint["model"]); old_b1._restore_rng(source_checkpoint["rng_state"])
     source_metrics, _source_arrays = _metrics(model, groups, motion, grid_shape=tuple(args.evaluation_grid_shape)); source_dvf = _aggregate_dvf(source_metrics)
     source_key = f"B{source_checkpoint['protocol']['phase_schedule']['phase_b_steps']}"
-    if source_key in source_checkpoint.get("phase_metrics", {}) and not _metric_agrees(source_dvf, _aggregate_dvf(source_checkpoint["phase_metrics"][source_key])):
+    saved_source_metrics = source_checkpoint["phase_metrics"]["B2000"] if formal else source_checkpoint.get("phase_metrics", {}).get(source_key)
+    if saved_source_metrics is not None and not _metric_agrees(source_dvf, _aggregate_dvf(saved_source_metrics)):
         raise ValueError("source_checkpoint_metric_mismatch")
     provenance = _source_provenance(args.source_checkpoint, source_checkpoint, source_dvf); _write_json(args.output_dir / "source_checkpoint_provenance.json", provenance)
     protocol = {"phase_c_steps": args.phase_c_steps, "observations_per_update": 450, "pixel_mode": "fixed_grid", "pixel_samples": 256, "accumulation_chunk_size": args.accumulation_chunk_size, "film_lr": args.film_lr, "respiratory_mbc_lr": args.respiratory_mbc_lr, "objective": "reconstruction_image_data_mse_only", "trainable_modules": list(old_b1._prefixes("C")), "gt_respiratory_score_for_training": False}
     if args.resume_from is None and not b1b._escape(source_dvf):
         classification = _classify_joint_trajectory(source_dvf, [source_dvf])
         summary = {"experiment": "Exp3-B1c Good-Staged-State Joint Low-LR Unfreeze", "git_sha": old_b1._git_sha(), "scientific_protocol": protocol, "source_checkpoint_provenance": provenance, "phase_c_entered": False, "phase_c": None, "exposure_accounting": {"inherited_source": _inherited_exposure(source_checkpoint), "phase_c_incremental": b1b._exposure_accounting(steps=0, observations_per_update=450, pixels_per_observation=256), "cumulative_observation_exposures": _inherited_exposure(source_checkpoint)["total_observation_exposures"]}, **classification}
-        _write_outputs(args, {0: source_metrics}, [_curve_entry(step=0, metrics=source_metrics, reconstruction_mse=None, model=model)], provenance, {}, {}, summary)
+        _write_outputs(args, {0: source_metrics}, [_curve_entry(step=0, source_global_step=source_global_step, metrics=source_metrics, reconstruction_mse=None, model=model)], provenance, {}, {}, summary)
         return summary
     resume = old_b1._load_checkpoint(args.resume_from) if args.resume_from is not None else None
     if resume is not None:
@@ -164,13 +174,18 @@ def run(args) -> dict[str, Any]:
         saved_protocol = resume.get("protocol", {})
         if formal and saved_protocol != protocol:
             raise ValueError("incompatible formal B1c resume protocol")
-        start = int(resume["global_step"])
-        if start > args.phase_c_steps:
+        try:
+            start = int(resume["phase_step"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("incompatible B1c resume step provenance") from exc
+        if resume.get("global_step") != _lineage_global_step(source_global_step, start):
+            raise ValueError("incompatible B1c resume step provenance")
+        if start < 0 or start > args.phase_c_steps:
             raise ValueError("B1c resume checkpoint exceeds requested C target")
         model.load_state_dict(resume["model"]); old_b1._restore_rng(resume["rng_state"])
         curve, phase_metrics, snapshots = resume["curve"], resume["phase_metrics"], resume["snapshots"]
     else:
-        start = 0; curve = [_curve_entry(step=0, metrics=source_metrics, reconstruction_mse=None, model=model)]; phase_metrics = {"C0": source_metrics}; snapshots = {"source": parameter_snapshot(model)}
+        start = 0; curve = [_curve_entry(step=0, source_global_step=source_global_step, metrics=source_metrics, reconstruction_mse=None, model=model)]; phase_metrics = {"C0": source_metrics}; snapshots = {"source": parameter_snapshot(model)}
     optimizer = old_b1._configure_phase(model, "C", film_lr=args.film_lr, respiratory_mbc_lr=args.respiratory_mbc_lr)
     fresh_optimizer_state_empty = len(optimizer.state) == 0
     if resume is not None:
@@ -192,10 +207,10 @@ def run(args) -> dict[str, Any]:
             optimizer.step()
             if step % args.eval_every == 0 or step == args.phase_c_steps:
                 metrics, _arrays = _metrics(model, groups, motion, grid_shape=tuple(args.evaluation_grid_shape)); phase_metrics[f"C{step}"] = metrics
-                curve.append(_curve_entry(step=step, metrics=metrics, reconstruction_mse=float(batch["full_batch_reconstruction_mse"]), model=model, optimizer=optimizer))
+                curve.append(_curve_entry(step=step, source_global_step=source_global_step, metrics=metrics, reconstruction_mse=float(batch["full_batch_reconstruction_mse"]), model=model, optimizer=optimizer))
                 _write_json(args.output_dir / f"metrics_c_{step}.json", metrics)
                 snapshots["C"] = parameter_snapshot(model)
-                state = _checkpoint_state(model=model, optimizer=optimizer, step=step, protocol=protocol, provenance=provenance, observation_audit=observation_audit, pixel_protocol=pixel_protocol, curve=curve, phase_metrics=phase_metrics, snapshots=snapshots)
+                state = _checkpoint_state(model=model, optimizer=optimizer, step=step, source_global_step=source_global_step, protocol=protocol, provenance=provenance, observation_audit=observation_audit, pixel_protocol=pixel_protocol, curve=curve, phase_metrics=phase_metrics, snapshots=snapshots)
                 _save_checkpoint(args.output_dir / f"checkpoint_c_{step}.pt", **state); _save_checkpoint(args.output_dir / "checkpoint_last.pt", **state)
     finally:
         for hook in hooks:
