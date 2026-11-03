@@ -33,7 +33,7 @@ def dreme_zero_mean_scores(scores: torch.Tensor) -> torch.Tensor:
     return scores.mean(dim=0).square().mean()
 
 
-def cardiac_pca_waveform_subspace_loss(card_scores: torch.Tensor, target_waveform: torch.Tensor, *, ridge: float = 1e-4, eps: float = 1e-8, min_frames: int = 8) -> dict[str, torch.Tensor]:
+def pca_waveform_subspace_loss(scores: torch.Tensor, target_waveform: torch.Tensor, *, ridge: float = 1e-4, eps: float = 1e-8, min_frames: int = 8) -> dict[str, torch.Tensor]:
     """Sign/scale/basis-invariant agreement with one local image-derived PC.
 
     The 3-D cardiac score space is fitted with a per-location differentiable
@@ -42,10 +42,10 @@ def cardiac_pca_waveform_subspace_loss(card_scores: torch.Tensor, target_wavefor
     """
     if ridge < 0 or eps <= 0 or min_frames < 3:
         raise ValueError("PCA waveform ridge, eps, or min_frames is invalid")
-    scores = card_scores[:, 0, :] if card_scores.ndim == 3 and card_scores.shape[1] == 1 else card_scores
+    scores = scores[:, 0, :] if scores.ndim == 3 and scores.shape[1] == 1 else scores
     target = torch.as_tensor(target_waveform, device=scores.device, dtype=scores.dtype).reshape(-1).detach()
     if scores.ndim != 2 or scores.shape[1] != 3 or scores.shape[0] != target.numel():
-        raise ValueError("card_scores must be [T,3] or [T,1,3] aligned with target_waveform")
+        raise ValueError("scores must be [T,3] or [T,1,3] aligned with target_waveform")
     # A skipped non-finite observation must still be a finite, connected
     # zero-gradient scalar rather than NaN multiplied by zero.
     zero = scores.nan_to_num().sum() * 0.
@@ -69,3 +69,11 @@ def cardiac_pca_waveform_subspace_loss(card_scores: torch.Tensor, target_wavefor
     correlation = (prediction * y).sum() / torch.sqrt(prediction_energy * target_energy + eps)
     r2 = correlation.square().clamp(0., 1.)
     return {"loss": 1. - r2, "r2": r2, "skipped": zero, "matched_frame_count": count}
+
+
+def cardiac_pca_waveform_subspace_loss(card_scores: torch.Tensor, target_waveform: torch.Tensor, **kwargs) -> dict[str, torch.Tensor]:
+    return pca_waveform_subspace_loss(card_scores, target_waveform, **kwargs)
+
+
+def respiratory_pca_waveform_subspace_loss(respiratory_scores: torch.Tensor, target_waveform: torch.Tensor, **kwargs) -> dict[str, torch.Tensor]:
+    return pca_waveform_subspace_loss(respiratory_scores, target_waveform, **kwargs)

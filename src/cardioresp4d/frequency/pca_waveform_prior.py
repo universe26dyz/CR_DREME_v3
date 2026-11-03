@@ -25,24 +25,27 @@ class _LocationWaveform:
 
 
 class PCAWaveformPrior:
-    """One cached selected-PC waveform per reliable ``view/slice_id`` only."""
-    def __init__(self, source_path: Path, locations: dict[str, _LocationWaveform], reliable_candidate_count: int) -> None:
+    """One cached selected-PC waveform for one explicitly named motion component."""
+    def __init__(self, source_path: Path, locations: dict[str, _LocationWaveform], reliable_candidate_count: int, component: str) -> None:
         self.source_path = str(source_path)
         self.locations = locations
         self.metadata = {
             "source_frequency_bands": str(source_path),
+            "component": component,
             "selected_pc_convention": "1-based in frequency_bands.json",
             "reliable_candidate_count": reliable_candidate_count,
             "available_location_count": len(locations),
         }
 
     @classmethod
-    def load(cls, frequency_bands_json: str | Path, *, strict: bool = True) -> "PCAWaveformPrior":
+    def load(cls, frequency_bands_json: str | Path, *, strict: bool = True, component: str = "cardiac") -> "PCAWaveformPrior":
         source = Path(frequency_bands_json).resolve()
         payload = json.loads(source.read_text(encoding="utf-8"))
-        candidates = payload.get("cardiac", {}).get("per_slice_candidates", [])
+        if component not in {"cardiac", "respiratory"}:
+            raise ValueError("PCA waveform component must be cardiac or respiratory")
+        candidates = payload.get(component, {}).get("per_slice_candidates", [])
         if not isinstance(candidates, list):
-            raise ValueError("cardiac.per_slice_candidates must be a list for PCA waveform supervision")
+            raise ValueError(f"{component}.per_slice_candidates must be a list for PCA waveform supervision")
         locations: dict[str, _LocationWaveform] = {}
         reliable_count = 0
         for candidate in candidates:
@@ -76,7 +79,7 @@ class PCAWaveformPrior:
             if index >= temporal_pcs.shape[1]:
                 raise ValueError(f"PCA artifact {artifact} cannot select PC {selected_pc}")
             locations[key] = _LocationWaveform(timestamps, temporal_pcs[:, index].copy(), selected_pc, str(artifact))
-        return cls(source, locations, reliable_count)
+        return cls(source, locations, reliable_count, component)
 
     def match(self, view: str, slice_id: str, timestamps_s: torch.Tensor, *, tolerance_s: float = 1e-6, device: torch.device | None = None, dtype: torch.dtype | None = None) -> PCAWaveformMatch | None:
         """Strictly pair current valid timestamps with the same location's PC.
