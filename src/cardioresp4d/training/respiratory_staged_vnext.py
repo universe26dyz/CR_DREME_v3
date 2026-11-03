@@ -7,7 +7,9 @@ from typing import Any, Mapping
 
 import torch
 
+from cardioresp4d.diagnostics.stage_visual import dvf_static_dynamic_metrics
 from cardioresp4d.losses.motion_loss import respiratory_pca_waveform_subspace_loss
+from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField
 from cardioresp4d.training.stage_contract import stage_contract
 
 
@@ -89,11 +91,13 @@ class RespiratoryStagedVNextRunner:
         self.loss_weights = loss_weights
         self.global_step = 0
         self.completed: list[dict[str, object]] = []
+        self.last_optimizer_state: dict[str, object] | None = None
 
     def run_segment(self, segment: RespiratoryStagedSegment) -> dict[str, object]:
         optimizer = configure_respiratory_staged_segment(self.trainer.model, segment, self.trainer.optimizer_config)
         before = {name: parameter.detach().cpu().clone() for name, parameter in self.trainer.model.named_parameters()}
         stage = segment.stage; contract = stage_contract(stage); losses: list[float] = []
+        waveform_losses: list[float] = []; waveform_r2: list[float] = []
         for step in range(1, segment.steps + 1):
             optimizer.zero_grad(set_to_none=True)
             total = next(self.trainer.model.parameters()).sum() * 0.
@@ -117,6 +121,8 @@ class RespiratoryStagedVNextRunner:
                 scores = torch.cat([self.trainer.model.encode_motion_scores(item)["resp_scores"][:, 0, :] for item in sequence], 0)
                 waveform = respiratory_pca_waveform_subspace_loss(scores, matched.waveform, ridge=self.trainer.pca_waveform_ridge, min_frames=self.trainer.pca_waveform_min_frames)
                 total = total + float(self.loss_weights["respiratory_pca_waveform"]) * waveform["loss"]
+                waveform_losses.append(float(waveform["loss"].detach()))
+                waveform_r2.append(float(waveform["r2"].detach()))
             total.backward()
             frozen = [name for name, parameter in self.trainer.model.named_parameters() if not parameter.requires_grad and parameter.grad is not None]
             if frozen:
@@ -128,9 +134,41 @@ class RespiratoryStagedVNextRunner:
         unexpected = [name for name in changed if not name.startswith(allowed)]
         if unexpected:
             raise RuntimeError("respiratory vNext ownership audit failed: " + ", ".join(unexpected))
-        report = {"stage": stage, "segment": segment.name, "global_step": self.global_step, "segment_step": segment.steps, "trainable_modules": sorted(segment.owners), "learning_rates": [group["lr"] for group in optimizer.param_groups], "loss_last": losses[-1], "unexpected_parameter_changes": unexpected}
+        report = {"stage": stage, "segment": segment.name, "global_step": self.global_step, "segment_step": segment.steps, "trainable_modules": sorted(segment.owners), "learning_rates": [group["lr"] for group in optimizer.param_groups], "loss_last": losses[-1], "loss_mean": sum(losses) / len(losses), "unexpected_parameter_changes": unexpected}
+        if waveform_losses:
+            report.update({"respiratory_pca_loss_last": waveform_losses[-1], "respiratory_pca_loss_mean": sum(waveform_losses) / len(waveform_losses), "respiratory_pca_r2_last": waveform_r2[-1], "respiratory_pca_r2_mean": sum(waveform_r2) / len(waveform_r2), **self._score_diagnostics(segment.active_respiratory_levels)})
+        if segment.name.startswith(("resp_mbc_bootstrap", "resp_score_refine", "resp_canonical_refine")):
+            report.update(self._dvf_diagnostics(stage))
+        self.last_optimizer_state = optimizer.state_dict()
         self.completed.append(report)
         return report
 
+    def _score_diagnostics(self, active_levels: int) -> dict[str, float]:
+        sequence = self.trainer.sampler.temporal_batch(max_items=self.trainer.temporal_batch_size)
+        with torch.no_grad():
+            scores = torch.cat([self.trainer.model.encode_motion_scores(item)["resp_scores"][:, :active_levels] for item in sequence], 0)
+        mean = scores.mean(0)
+        return {"respiratory_score_temporal_rms": float(scores.square().mean().sqrt()), "respiratory_score_static_rms": float(mean.square().mean().sqrt())}
+
+    def _dvf_diagnostics(self, stage: str) -> dict[str, float]:
+        sequence = self.trainer.sampler.temporal_batch(max_items=self.trainer.temporal_batch_size)
+        if not sequence:
+            return {}
+        model = self.trainer.model
+        with torch.no_grad():
+            grid, _ = model._physical_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, (4, 4, 4))
+            values = []
+            for observation in sequence:
+                score = model.encode_motion_scores(observation)["resp_scores"][:, :stage_contract(stage).active_respiratory_levels]
+                values.append(ScoreWeightedMBCField(model.respiratory_mbc, score)(grid)[0])
+            _, _, metrics = dvf_static_dynamic_metrics(torch.stack(values))
+        return {"respiratory_dvf_rms_mm": float(torch.stack(values).square().mean().sqrt()), "respiratory_dvf_static_rms_mm": metrics["mean_DVF_RMS_mm"], "respiratory_dvf_dynamic_rms_mm": metrics["dynamic_DVF_temporal_RMS_mm"]}
+
     def state_dict(self) -> dict[str, object]:
-        return {"global_step": self.global_step, "completed": list(self.completed), "schedule": [segment.name for segment in respiratory_staged_vnext_segments()]}
+        return {"global_step": self.global_step, "completed": list(self.completed), "current_segment": None if not self.completed else self.completed[-1]["segment"], "segment_step": 0 if not self.completed else self.completed[-1]["segment_step"], "sampler_state": self.trainer.sampler.state_dict(), "optimizer": self.last_optimizer_state, "schedule": [segment.name for segment in respiratory_staged_vnext_segments()]}
+
+    def load_boundary_state(self, state: Mapping[str, object]) -> None:
+        self.global_step = int(state["global_step"])
+        self.completed = list(state["completed"])
+        self.last_optimizer_state = state.get("optimizer")  # type: ignore[assignment]
+        self.trainer.sampler.load_state_dict(state["sampler_state"])  # type: ignore[arg-type]

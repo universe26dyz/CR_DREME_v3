@@ -58,6 +58,28 @@ def test_respiratory_pca_loss_has_no_mbc_or_canonical_gradient() -> None:
     assert frozen.grad is None
 
 
+def test_phase_b_pca_only_backward_has_gradients_only_on_respiratory_encoder() -> None:
+    """The formal B auxiliary reaches every intended score-encoder branch only."""
+    from cardioresp4d.training.model import SourceFirstDynamicModel
+    from cardioresp4d.training.respiratory_staged_vnext import configure_respiratory_staged_segment
+    from cardioresp4d.training.sampler import DynamicObservation
+    from cardioresp4d.losses.motion_loss import respiratory_pca_waveform_subspace_loss
+    model = SourceFirstDynamicModel(torch.tensor([-2., -2., -2.]), torch.tensor([2., 2., 2.]), cardiac_lower_world_mm=torch.tensor([-1., -1., -1.]), cardiac_upper_world_mm=torch.tensor([1., 1., 1.]), n_dynamic_frames=8, inr_width=8, inr_depth=1, latent_dim=4, motion_hidden_dim=8, respiratory_grid_shapes=((4, 4, 4),) * 3, cardiac_grid_shape=(4, 4, 4), psf_samples=1)
+    segment = next(item for item in respiratory_staged_vnext_segments() if item.name == "resp_pca_warmup")
+    configure_respiratory_staged_segment(model, segment, {"resp_score": {"film_lr": 5e-4}})
+    scores = []
+    for index in range(8):
+        observation = DynamicObservation(torch.rand(1, 4, 4), "SAX", "s", index, torch.tensor([float(index), 0., 0.]), torch.tensor([1., 0., 0.]), torch.tensor([0., 1., 0.]), torch.tensor([0., 0., 1.]), torch.ones(2), 4., True, "valid", float(index))
+        scores.append(model.encode_motion_scores(observation)["resp_scores"][:, :1])
+    respiratory_pca_waveform_subspace_loss(torch.cat(scores), torch.linspace(-1., 1., 8))["loss"].backward()
+    expected = ("film_encoder.image.", "film_encoder.geometry_mlp.", "film_encoder.head.", "film_encoder.resp.")
+    for prefix in expected:
+        gradients = [parameter.grad for name, parameter in model.named_parameters() if name.startswith(prefix)]
+        assert gradients and all(gradient is not None and torch.isfinite(gradient).all() and bool(gradient.abs().sum() > 0) for gradient in gradients)
+    for prefix in ("canonical.", "respiratory_mbc.", "film_encoder.card.", "cardiac_mbc.", "uncertainty."):
+        assert all(parameter.grad is None for name, parameter in model.named_parameters() if name.startswith(prefix))
+
+
 def test_segment_optimizer_owns_one_factor_and_keeps_cardiac_frozen() -> None:
     from cardioresp4d.training.model import SourceFirstDynamicModel
     from cardioresp4d.training.respiratory_staged_vnext import configure_respiratory_staged_segment
@@ -69,3 +91,26 @@ def test_segment_optimizer_owns_one_factor_and_keeps_cardiac_frozen() -> None:
     assert owned == {id(parameter) for level in model.respiratory_mbc.levels[:2] for parameter in level.parameters()}
     assert not any(parameter.requires_grad for parameter in model.canonical.parameters())
     assert not any(parameter.requires_grad for parameter in model.film_encoder.card.parameters())
+
+
+def test_phase_e_stage2c_renderer_calls_frozen_motion_without_updating_it() -> None:
+    """E keeps the stage2c respiratory pullback active while updating canonical only."""
+    from cardioresp4d.training.model import SourceFirstDynamicModel
+    from cardioresp4d.training.respiratory_staged_vnext import configure_respiratory_staged_segment
+    from cardioresp4d.training.sampler import DynamicObservation
+    model = SourceFirstDynamicModel(torch.tensor([-2., -2., -2.]), torch.tensor([2., 2., 2.]), cardiac_lower_world_mm=torch.tensor([-1., -1., -1.]), cardiac_upper_world_mm=torch.tensor([1., 1., 1.]), n_dynamic_frames=1, inr_width=8, inr_depth=1, latent_dim=4, motion_hidden_dim=8, respiratory_grid_shapes=((4, 4, 4),) * 3, cardiac_grid_shape=(4, 4, 4), psf_samples=1)
+    segment = next(item for item in respiratory_staged_vnext_segments() if item.name == "resp_canonical_refine")
+    optimizer = configure_respiratory_staged_segment(model, segment, {"resp_e": {"canonical_lr": 5e-5}})
+    frozen = {name: parameter.detach().clone() for name, parameter in model.named_parameters() if name.startswith(("film_encoder.", "respiratory_mbc."))}
+    called = {"encoder": 0, "mbc": 0}
+    encoder_hook = model.film_encoder.register_forward_hook(lambda *_: called.__setitem__("encoder", called["encoder"] + 1))
+    mbc_hook = model.respiratory_mbc.register_forward_hook(lambda *_: called.__setitem__("mbc", called["mbc"] + 1))
+    try:
+        observation = DynamicObservation(torch.rand(1, 4, 4), "SAX", "s", 0, torch.zeros(3), torch.tensor([1., 0., 0.]), torch.tensor([0., 1., 0.]), torch.tensor([0., 0., 1.]), torch.ones(2), 4., True, "valid", 0.)
+        optimizer.zero_grad(set_to_none=True)
+        model.predict(observation, torch.tensor([[1., 1.]]), "stage2c")["predicted_intensity"].mean().backward()
+        optimizer.step()
+    finally:
+        encoder_hook.remove(); mbc_hook.remove()
+    assert called == {"encoder": 1, "mbc": 1}
+    assert all(torch.equal(before, dict(model.named_parameters())[name]) for name, before in frozen.items())
