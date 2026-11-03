@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import csv
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
+import torch
 
 import experiments.c4_diagnostics.exp3b1b_good_mbc_encoder_recovery as b1b
-from experiments.c4_diagnostics.exp3b1b_good_mbc_encoder_recovery import _classify, _parse_existing_b1_phase_b_at_step, _phase_a_protocol, _phase_b_eval_steps, _phase_b_protocol, _write_paired_comparison, run
+from experiments.c4_diagnostics.exp3b1b_good_mbc_encoder_recovery import _classify, _formal_fresh_args_valid, _formal_resume_args_valid, _parse_existing_b1_phase_b_at_step, _phase_a_protocol, _phase_b_eval_steps, _phase_b_protocol, _write_paired_comparison, run
 
 
 PRIMARY = {
@@ -94,6 +96,7 @@ def test_good_mbc_gate_enters_imported_phase_b_with_frozen_mbc(tmp_path: Path, m
     assert summary["stage_parameter_change_audit"]["B"]["unexpected"] == []
     assert summary["runtime_audit"]["phase_a_encoder_calls"] == 0
     assert summary["runtime_audit"]["phase_b_encoder_calls"] > 0
+    assert summary["git_sha"] == b1b.old_b1._git_sha()
     assert summary["historical_pair_available"] is False
     assert summary["exposure_accounting"]["total_observation_exposures"] == 474000
     assert summary["frozen_module_audit"]["respiratory_mbc_unchanged_during_b"] is True
@@ -123,6 +126,44 @@ def test_mid_phase_b_resume_continues_with_cpu_safe_checkpoint_rng(tmp_path: Pat
     resumed = _smoke_args(tmp_path, "resume")
     resumed.phase_b_steps = 2
     resumed.resume_from = checkpoint
+    calls: list[str] = []; original = b1b.old_b1._assert_expected_gradients
+    monkeypatch.setattr(b1b.old_b1, "_assert_expected_gradients", lambda model, phase: calls.append(phase) or original(model, phase))
     summary = run(resumed)
     assert summary["phase_b_entered"] is True
+    assert calls == ["B"]
     assert (resumed.output_dir / "checkpoint_phase_b_2.pt").is_file()
+    payload = b1b.old_b1._load_checkpoint(resumed.output_dir / "checkpoint_phase_b_2.pt")
+    assert payload["protocol"]["phase_schedule"]["phase_b_steps"] == 2
+
+
+def test_failed_phase_a_checkpoint_resume_still_short_circuits_before_phase_b(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fresh = _smoke_args(tmp_path, "resume-gate")
+    fresh.phase_b_steps = 1
+    with monkeypatch.context() as patched:
+        patched.setattr(b1b, "_escape", lambda _metric: False)
+        run(fresh)
+    checkpoint = fresh.output_dir / "checkpoint_phase_a_end.pt"
+    payload = b1b.old_b1._load_checkpoint(checkpoint)
+    aggregate = payload["phase_metrics"]["A"]["aggregate"]
+    aggregate["full_fov_dynamic_cosine"]["mean"] = .1
+    aggregate["full_fov_dynamic_rms_ratio"]["mean"] = 2.
+    aggregate["full_fov_dynamic_normalized_epe"]["mean"] = 2.
+    torch.save(payload, checkpoint)
+    resumed = _smoke_args(tmp_path, "resume-gate")
+    resumed.phase_b_steps = 2
+    resumed.resume_from = fresh.output_dir / "checkpoint_phase_a_end.pt"
+    summary = run(resumed)
+    assert summary["causal_classification"] == "good_mbc_bootstrap_failure"
+    assert summary["phase_b_entered"] is False
+    assert not (resumed.output_dir / "checkpoint_phase_b_1.pt").exists()
+
+
+def _formal_args(phase_b_steps: int) -> Namespace:
+    return Namespace(phase_a_steps=750, phase_b_steps=phase_b_steps, phase_a_observations_per_update=32, pixel_mode="fixed_grid", pixel_samples=256, locations_per_view=3, frames_per_location=50, accumulation_chunk_size=5)
+
+
+def test_formal_schedule_allows_b2000_only_for_resume() -> None:
+    assert _formal_fresh_args_valid(_formal_args(1000))
+    assert not _formal_fresh_args_valid(_formal_args(2000))
+    assert _formal_resume_args_valid(_formal_args(1000))
+    assert _formal_resume_args_valid(_formal_args(2000))

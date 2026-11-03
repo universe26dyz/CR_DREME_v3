@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
@@ -123,12 +124,20 @@ def _state_norm(state: dict[str, torch.Tensor], prefixes: str | tuple[str, ...])
     return float(torch.cat(values).norm()) if values else 0.
 
 
-def _formal_args_valid(args) -> bool:
-    return (args.phase_a_steps, args.phase_b_steps, args.phase_a_observations_per_update, args.pixel_mode, args.pixel_samples, args.locations_per_view, args.frames_per_location, args.accumulation_chunk_size) == (750, 1000, 32, "fixed_grid", 256, 3, 50, 5)
+def _formal_common_args_valid(args) -> bool:
+    return (args.phase_a_steps, args.phase_a_observations_per_update, args.pixel_mode, args.pixel_samples, args.locations_per_view, args.frames_per_location, args.accumulation_chunk_size) == (750, 32, "fixed_grid", 256, 3, 50, 5)
 
 
-def _checkpoint_state(*, model, optimizer, global_step: int, phase: str, protocol: dict[str, Any], pixel_protocol: dict[str, Any], observation_audit: dict[str, Any], curve: list[dict[str, Any]], initial_metrics: dict[str, Any], phase_metrics: dict[str, Any], snapshots: dict[str, dict[str, torch.Tensor]]) -> dict[str, Any]:
-    return {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "global_step": global_step, "phase": phase, "protocol": protocol, "pixel_protocol": pixel_protocol, "observation_audit": observation_audit, "curve": curve, "initial_metrics": initial_metrics, "phase_metrics": phase_metrics, "snapshots": snapshots}
+def _formal_fresh_args_valid(args) -> bool:
+    return _formal_common_args_valid(args) and args.phase_b_steps == 1000
+
+
+def _formal_resume_args_valid(args) -> bool:
+    return _formal_common_args_valid(args) and args.phase_b_steps in {1000, 2000}
+
+
+def _checkpoint_state(*, model, optimizer, global_step: int, phase: str, protocol: dict[str, Any], pixel_protocol: dict[str, Any], observation_audit: dict[str, Any], curve: list[dict[str, Any]], initial_metrics: dict[str, Any], phase_metrics: dict[str, Any], snapshots: dict[str, dict[str, torch.Tensor]], seed: int) -> dict[str, Any]:
+    return {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "global_step": global_step, "phase": phase, "protocol": protocol, "pixel_protocol": pixel_protocol, "observation_audit": observation_audit, "curve": curve, "initial_metrics": initial_metrics, "phase_metrics": phase_metrics, "snapshots": snapshots, "seed": seed}
 
 
 def _save_checkpoint(path: Path, **state: Any) -> None:
@@ -153,7 +162,7 @@ def _build_runtime(args):
 def run(args) -> dict[str, Any]:
     if args.resume_from is not None:
         return _resume(args)
-    if not args.smoke and (not _formal_args_valid(args) or args.manifest is None or args.qc_table is None or args.canonical_domain is None or args.eval_every != 250):
+    if not args.smoke and (not _formal_fresh_args_valid(args) or args.manifest is None or args.qc_table is None or args.canonical_domain is None or args.eval_every != 250):
         raise ValueError("formal Exp3-B1b requires the prescribed 750/1000, stochastic32/fullbatch450, fixed-grid geometry, and 250-step evaluation protocol")
     if args.output_dir.exists() and any(args.output_dir.iterdir()) and not args.overwrite:
         raise FileExistsError("output directory is non-empty")
@@ -189,7 +198,7 @@ def run(args) -> dict[str, Any]:
         phase_a_rows, phase_a_arrays, _ = _evaluate(model, groups, motion, grid_shape=tuple(args.evaluation_grid_shape)); phase_a_metrics = _phase_a_metric(phase_a_rows); phase_arrays["phase_a"] = phase_a_arrays; phase_metrics["A"] = phase_a_metrics; a_dvf = _aggregate_dvf(phase_a_metrics)
         _assert_only_level0_changed(model, snapshots["start"]); snapshots["A"] = parameter_snapshot(model); stage_audit: dict[str, Any] = {"A": old_b1._snapshot_changed(snapshots["start"], snapshots["A"], [name for name in snapshots["start"] if name.startswith(_LEVEL0)])}
         _write_json(args.output_dir / "metrics_initial.json", initial_metrics); _write_json(args.output_dir / "metrics_phase_a_end.json", phase_a_metrics)
-        state = _checkpoint_state(model=model, optimizer=optimizer, global_step=args.phase_a_steps, phase="A", protocol=protocol, pixel_protocol=pixel_protocol, observation_audit=observation_audit, curve=curve, initial_metrics=initial_metrics, phase_metrics=phase_metrics, snapshots=snapshots)
+        state = _checkpoint_state(model=model, optimizer=optimizer, global_step=args.phase_a_steps, phase="A", protocol=protocol, pixel_protocol=pixel_protocol, observation_audit=observation_audit, curve=curve, initial_metrics=initial_metrics, phase_metrics=phase_metrics, snapshots=snapshots, seed=args.seed)
         _save_checkpoint(args.output_dir / "checkpoint_phase_a_end.pt", **state); _save_checkpoint(args.output_dir / "checkpoint_last.pt", **state)
         if not _escape(a_dvf):
             return _finish(args, initial_metrics, phase_metrics, phase_arrays, snapshots, stage_audit, module_calls, a_dvf, None, curve, protocol, observation_audit, pixel_protocol, optimizer)
@@ -208,7 +217,7 @@ def run(args) -> dict[str, Any]:
                 metrics, arrays = _metrics(model, groups, motion, grid_shape=tuple(args.evaluation_grid_shape)); phase_metrics[f"B{phase_step}"] = metrics; phase_arrays[f"phase_b_{phase_step}"] = arrays; dvf = _aggregate_dvf(metrics)
                 curve.append({"global_step": global_step, "phase": "B", "phase_step": phase_step, "full_batch_reconstruction_mse": float(batch["full_batch_reconstruction_mse"]), **dvf})
                 _write_json(args.output_dir / f"metrics_phase_b_{phase_step}.json", metrics)
-                state = _checkpoint_state(model=model, optimizer=optimizer, global_step=global_step, phase="B", protocol=protocol, pixel_protocol=pixel_protocol, observation_audit=observation_audit, curve=curve, initial_metrics=initial_metrics, phase_metrics=phase_metrics, snapshots=snapshots)
+                state = _checkpoint_state(model=model, optimizer=optimizer, global_step=global_step, phase="B", protocol=protocol, pixel_protocol=pixel_protocol, observation_audit=observation_audit, curve=curve, initial_metrics=initial_metrics, phase_metrics=phase_metrics, snapshots=snapshots, seed=args.seed)
                 _save_checkpoint(args.output_dir / f"checkpoint_phase_b_{phase_step}.pt", **state); _save_checkpoint(args.output_dir / "checkpoint_last.pt", **state)
         snapshots["B"] = parameter_snapshot(model); stage_audit["B"] = old_b1._snapshot_changed(snapshots["A"], snapshots["B"], [name for name in snapshots["A"] if name.startswith(_ENCODER_PREFIXES)])
         b_dvf = _aggregate_dvf(phase_metrics[f"B{args.phase_b_steps}"])
@@ -220,14 +229,14 @@ def run(args) -> dict[str, Any]:
 def _resume(args) -> dict[str, Any]:
     if not args.resume_from.is_file():
         raise FileNotFoundError(args.resume_from)
-    if not args.smoke and (not _formal_args_valid(args) or args.manifest is None or args.qc_table is None or args.canonical_domain is None or args.eval_every != 250):
+    if not args.smoke and (not _formal_resume_args_valid(args) or args.manifest is None or args.qc_table is None or args.canonical_domain is None or args.eval_every != 250):
         raise ValueError("formal Exp3-B1b resume requires the prescribed protocol")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = old_b1._load_checkpoint(args.resume_from)
     config, motion, observations, groups, observation_audit, pixel_protocol, model = _build_runtime(args)
     expected = {"phase_a": _phase_a_protocol(), "phase_b": _phase_b_protocol(), "no_phase_c": True}
     saved_protocol = dict(checkpoint["protocol"]); saved_schedule = saved_protocol.pop("phase_schedule", {})
-    if saved_protocol != expected or saved_schedule.get("phase_a_steps") != args.phase_a_steps or int(saved_schedule.get("phase_b_steps", -1)) > args.phase_b_steps or checkpoint["observation_audit"] != observation_audit or checkpoint["pixel_protocol"] != pixel_protocol:
+    if saved_protocol != expected or saved_schedule.get("phase_a_steps") != args.phase_a_steps or int(saved_schedule.get("phase_b_steps", -1)) > args.phase_b_steps or checkpoint.get("seed") != args.seed or checkpoint["observation_audit"] != observation_audit or checkpoint["pixel_protocol"] != pixel_protocol:
         raise ValueError("incompatible Exp3-B1b resume checkpoint")
     if checkpoint["phase"] not in {"A", "B"}:
         raise ValueError("B1b resume checkpoint must be from Phase A or B")
@@ -235,9 +244,12 @@ def _resume(args) -> dict[str, Any]:
     phase_step_start = 0 if checkpoint["phase"] == "A" else int(checkpoint["global_step"]) - args.phase_a_steps
     if phase_step_start < 0 or phase_step_start > args.phase_b_steps:
         raise ValueError("resume checkpoint global step is incompatible with the requested Phase-B length")
+    resume_protocol = copy.deepcopy(checkpoint["protocol"]); resume_protocol["phase_schedule"]["phase_b_steps"] = args.phase_b_steps
     snapshots, curve, initial_metrics, phase_metrics = checkpoint["snapshots"], checkpoint["curve"], checkpoint["initial_metrics"], checkpoint["phase_metrics"]
     a_dvf = _aggregate_dvf(phase_metrics["A"]); stage_audit = {"A": old_b1._snapshot_changed(snapshots["start"], snapshots["A"], [name for name in snapshots["start"] if name.startswith(_LEVEL0)])}; phase_arrays: dict[str, dict[str, np.ndarray]] = {}
     module_calls = {"phase_a_encoder_calls": 0, "phase_b_encoder_calls": 0, "renderer_calls": 0, "respiratory_mbc_calls": 0, "cardiac_mbc_calls": 0, "uncertainty_calls": 0}
+    if not _escape(a_dvf):
+        return _finish(args, initial_metrics, phase_metrics, phase_arrays, snapshots, stage_audit, module_calls, a_dvf, None, curve, resume_protocol, observation_audit, pixel_protocol, None, resume_gate_short_circuit=True)
 
     def _count_encoder(_module, _args, _output): module_calls["phase_b_encoder_calls"] += 1
     def _count_renderer(_module, _args, _output): module_calls["renderer_calls"] += 1
@@ -264,18 +276,18 @@ def _resume(args) -> dict[str, Any]:
             if phase_step % args.eval_every == 0 or phase_step == args.phase_b_steps:
                 metrics, arrays = _metrics(model, groups, motion, grid_shape=tuple(args.evaluation_grid_shape)); phase_metrics[f"B{phase_step}"] = metrics; phase_arrays[f"phase_b_{phase_step}"] = arrays; dvf = _aggregate_dvf(metrics)
                 curve.append({"global_step": global_step, "phase": "B", "phase_step": phase_step, "full_batch_reconstruction_mse": float(batch["full_batch_reconstruction_mse"]), **dvf}); _write_json(args.output_dir / f"metrics_phase_b_{phase_step}.json", metrics)
-                state = _checkpoint_state(model=model, optimizer=optimizer, global_step=global_step, phase="B", protocol=checkpoint["protocol"], pixel_protocol=pixel_protocol, observation_audit=observation_audit, curve=curve, initial_metrics=initial_metrics, phase_metrics=phase_metrics, snapshots=snapshots)
+                state = _checkpoint_state(model=model, optimizer=optimizer, global_step=global_step, phase="B", protocol=resume_protocol, pixel_protocol=pixel_protocol, observation_audit=observation_audit, curve=curve, initial_metrics=initial_metrics, phase_metrics=phase_metrics, snapshots=snapshots, seed=args.seed)
                 _save_checkpoint(args.output_dir / f"checkpoint_phase_b_{phase_step}.pt", **state); _save_checkpoint(args.output_dir / "checkpoint_last.pt", **state)
         snapshots["B"] = parameter_snapshot(model); stage_audit["B"] = old_b1._snapshot_changed(snapshots["A"], snapshots["B"], [name for name in snapshots["A"] if name.startswith(_ENCODER_PREFIXES)])
         b_dvf = _aggregate_dvf(phase_metrics[f"B{args.phase_b_steps}"])
-        return _finish(args, initial_metrics, phase_metrics, phase_arrays, snapshots, stage_audit, module_calls, a_dvf, b_dvf, curve, checkpoint["protocol"], observation_audit, pixel_protocol, optimizer)
+        return _finish(args, initial_metrics, phase_metrics, phase_arrays, snapshots, stage_audit, module_calls, a_dvf, b_dvf, curve, resume_protocol, observation_audit, pixel_protocol, optimizer)
     finally:
         for hook in hooks: hook.remove()
 
 
-def _finish(args, initial_metrics, phase_metrics, phase_arrays, snapshots, stage_audit, module_calls, a_dvf, b_dvf, curve, protocol, observation_audit, pixel_protocol, optimizer):
+def _finish(args, initial_metrics, phase_metrics, phase_arrays, snapshots, stage_audit, module_calls, a_dvf, b_dvf, curve, protocol, observation_audit, pixel_protocol, optimizer, *, resume_gate_short_circuit: bool = False):
     phase_b_entered = b_dvf is not None
-    if module_calls["phase_a_encoder_calls"] != 0 or module_calls["cardiac_mbc_calls"] != 0 or module_calls["uncertainty_calls"] != 0 or module_calls["renderer_calls"] <= 0 or (phase_b_entered and module_calls["phase_b_encoder_calls"] <= 0):
+    if not resume_gate_short_circuit and (module_calls["phase_a_encoder_calls"] != 0 or module_calls["cardiac_mbc_calls"] != 0 or module_calls["uncertainty_calls"] != 0 or module_calls["renderer_calls"] <= 0 or (phase_b_entered and module_calls["phase_b_encoder_calls"] <= 0)):
         raise RuntimeError("B1b runtime module-call audit failed")
     final_snapshot = snapshots["B" if phase_b_entered else "A"]
     frozen = {"film_encoder_card_unchanged": all(torch.equal(snapshots["start"][name], final_snapshot[name]) for name in snapshots["start"] if name.startswith("film_encoder.card.")), "canonical_unchanged": all(torch.equal(snapshots["start"][name], final_snapshot[name]) for name in snapshots["start"] if name.startswith("canonical.")), "respiratory_mbc_unchanged_during_b": None if not phase_b_entered else all(torch.equal(snapshots["A"][name], snapshots["B"][name]) for name in snapshots["A"] if name.startswith("respiratory_mbc.")), "cardiac_mbc_unchanged": all(torch.equal(snapshots["start"][name], final_snapshot[name]) for name in snapshots["start"] if name.startswith("cardiac_mbc.")), "uncertainty_unchanged": all(torch.equal(snapshots["start"][name], final_snapshot[name]) for name in snapshots["start"] if name.startswith("uncertainty."))}
@@ -298,7 +310,7 @@ def _finish(args, initial_metrics, phase_metrics, phase_arrays, snapshots, stage
         historical_pair_available = True
     factor = {"encoder_parameter_norm": _state_norm(final_snapshot, _ENCODER_PREFIXES), "respiratory_mbc_level0_parameter_norm": _state_norm(final_snapshot, _LEVEL0), "basis_field_metric_supported": False}
     _write_json(args.output_dir / "factor_diagnostics.json", factor)
-    summary = {"experiment": "Exp3-B1b Good-MBC to Encoder Recovery", "output_dir": str(args.output_dir), "seed": args.seed, "scientific_protocol": protocol, "exposure_accounting": {"phase_a": _phase_a_protocol()["exposure_accounting"], "phase_b": _phase_b_protocol()["exposure_accounting"], "total_observation_exposures": 474000}, "observation_audit": observation_audit, "pixel_protocol": pixel_protocol, "phase_a": {"final_dvf": a_dvf, "escape": _escape(a_dvf)}, "phase_b": None if b_dvf is None else {"final_dvf": b_dvf, "escape": _escape(b_dvf), "strict": _strict(b_dvf), "first_phase_b_escape_step": first_escape, "first_phase_b_strict_step": first_strict}, "phase_b_entered": phase_b_entered, "historical_pair_available": historical_pair_available, "stage_parameter_change_audit": stage_audit, "frozen_module_audit": frozen, "runtime_audit": module_calls, **classification}
+    summary = {"experiment": "Exp3-B1b Good-MBC to Encoder Recovery", "git_sha": old_b1._git_sha(), "output_dir": str(args.output_dir), "seed": args.seed, "scientific_protocol": protocol, "exposure_accounting": {"phase_a": _phase_a_protocol()["exposure_accounting"], "phase_b": _phase_b_protocol()["exposure_accounting"], "total_observation_exposures": 474000}, "observation_audit": observation_audit, "pixel_protocol": pixel_protocol, "phase_a": {"final_dvf": a_dvf, "escape": _escape(a_dvf)}, "phase_b": None if b_dvf is None else {"final_dvf": b_dvf, "escape": _escape(b_dvf), "strict": _strict(b_dvf), "first_phase_b_escape_step": first_escape, "first_phase_b_strict_step": first_strict}, "phase_b_entered": phase_b_entered, "historical_pair_available": historical_pair_available, "stage_parameter_change_audit": stage_audit, "frozen_module_audit": frozen, "runtime_audit": module_calls, **classification}
     _write_json(args.output_dir / "summary.json", summary)
     return summary
 
