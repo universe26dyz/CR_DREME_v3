@@ -41,7 +41,7 @@ def test_bridge_classification_is_based_on_full_fov_dvf_contract() -> None:
     failed = {"full_fov_dynamic_cosine": .7, "full_fov_dynamic_rms_ratio": .2, "full_fov_dynamic_normalized_epe": 2.}
     assert _classify_bridge(failed, passed, passed) == "c4a_reproduction_failure"
     assert _classify_bridge(passed, failed, failed) == "fixed_pixel_sampling_degrades_mbc_recovery"
-    assert _classify_bridge(passed, passed, failed) == "exact_fullbatch_optimization_is_primary_bridge_difference"
+    assert _classify_bridge(passed, passed, failed) == "stochastic32_vs_fullbatch450_protocol_difference"
 
 
 def test_cpu_smoke_runs_both_arms_with_only_level0_changes(tmp_path: Path) -> None:
@@ -54,11 +54,30 @@ def test_cpu_smoke_runs_both_arms_with_only_level0_changes(tmp_path: Path) -> No
         assert result["encoder_calls"] == 0
 
 
-def test_existing_b1_curve_parser_reads_the_step_750_row(tmp_path: Path) -> None:
+def test_existing_b1_summary_cannot_stand_in_for_step_750_curve_data(tmp_path: Path) -> None:
+    summary = tmp_path / "summary.json"
+    summary.write_text('{"phase_a": {"final_dvf": {"full_fov_dynamic_cosine": 0.1, "full_fov_dynamic_rms_ratio": 2.0, "full_fov_dynamic_normalized_epe": 3.0}}}')
+    with pytest.raises(ValueError, match="B1-A@750 comparison requires the existing B1 training curve"):
+        _existing_b1_at_step(summary, None)
+
+
+def test_existing_b1_curve_parser_reads_phase_a_step_750_without_summary(tmp_path: Path) -> None:
     curve = tmp_path / "curve.csv"
     with curve.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["global_step", "full_fov_dynamic_cosine", "full_fov_dynamic_rms_ratio", "full_fov_dynamic_normalized_epe"]); writer.writeheader(); writer.writerow({"global_step": 750, "full_fov_dynamic_cosine": .9272, "full_fov_dynamic_rms_ratio": 1.3617, "full_fov_dynamic_normalized_epe": .7980})
-    assert _existing_b1_at_step(tmp_path / "unused.json", curve) == {"full_fov_dynamic_cosine": .9272, "full_fov_dynamic_rms_ratio": 1.3617, "full_fov_dynamic_normalized_epe": .7980}
+        writer = csv.DictWriter(handle, fieldnames=["global_step", "phase", "full_fov_dynamic_cosine", "full_fov_dynamic_rms_ratio", "full_fov_dynamic_normalized_epe"]); writer.writeheader(); writer.writerow({"global_step": 750, "phase": "A", "full_fov_dynamic_cosine": .9272, "full_fov_dynamic_rms_ratio": 1.3617, "full_fov_dynamic_normalized_epe": .7980})
+    assert _existing_b1_at_step(None, curve) == {"full_fov_dynamic_cosine": .9272, "full_fov_dynamic_rms_ratio": 1.3617, "full_fov_dynamic_normalized_epe": .7980}
+
+
+def test_existing_b1_curve_rejects_step_750_from_non_phase_a(tmp_path: Path) -> None:
+    curve = tmp_path / "curve.csv"
+    with curve.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["global_step", "phase", "full_fov_dynamic_cosine", "full_fov_dynamic_rms_ratio", "full_fov_dynamic_normalized_epe"]); writer.writeheader(); writer.writerow({"global_step": 750, "phase": "B", "full_fov_dynamic_cosine": .9272, "full_fov_dynamic_rms_ratio": 1.3617, "full_fov_dynamic_normalized_epe": .7980})
+    with pytest.raises(ValueError, match="Phase A"):
+        _existing_b1_at_step(None, curve)
+
+
+def test_b1_fullbatch_exposure_accounting_is_recorded_at_step_750() -> None:
+    assert _exposure_accounting(steps=750, observations_per_update=450, pixels_per_observation=256) == {"optimizer_steps": 750, "observations_per_update": 450, "pixels_per_observation": 256, "observation_exposures": 337500, "pixel_observation_exposures": 86400000}
 
 
 def test_formal_bridge_requires_c4a_budget_and_geometry_inputs(tmp_path: Path) -> None:

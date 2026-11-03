@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -50,20 +51,28 @@ def _passes(metric: dict[str, float]) -> bool:
 def _classify_bridge(r0: dict[str, float], r1: dict[str, float], b1: dict[str, float]) -> str:
     if not _passes(r0): return "c4a_reproduction_failure"
     if not _passes(r1): return "fixed_pixel_sampling_degrades_mbc_recovery"
-    if not _passes(b1): return "exact_fullbatch_optimization_is_primary_bridge_difference"
+    if not _passes(b1): return "stochastic32_vs_fullbatch450_protocol_difference"
     return "bridge_difference_not_explained_by_pixel_sampling_alone"
 
 
-def _existing_b1_at_step(summary: Path, curve: Path | None, step: int = 750) -> dict[str, float]:
-    if curve is not None:
-        with curve.open(newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
-                if int(row.get("global_step", row.get("step", -1))) == step:
-                    return {name: float(row[name]) for name in ("full_fov_dynamic_cosine", "full_fov_dynamic_rms_ratio", "full_fov_dynamic_normalized_epe")}
-        raise ValueError(f"existing B1 curve has no step {step}")
-    payload = json.loads(summary.read_text(encoding="utf-8")); value = payload.get("phase_a", {}).get("final_dvf")
-    if not isinstance(value, dict): raise ValueError("existing B1 summary has no phase_a.final_dvf")
-    return {name: float(value[name]) for name in ("full_fov_dynamic_cosine", "full_fov_dynamic_rms_ratio", "full_fov_dynamic_normalized_epe")}
+def _existing_b1_at_step(summary: Path | None, curve: Path | None, step: int = 750) -> dict[str, float]:
+    if curve is None:
+        raise ValueError("B1-A@750 comparison requires the existing B1 training curve; phase_a.final_dvf is the phase-end metric and must not be used as step 750.")
+    metrics = ("full_fov_dynamic_cosine", "full_fov_dynamic_rms_ratio", "full_fov_dynamic_normalized_epe")
+    with curve.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if int(row.get("global_step", row.get("step", -1))) != step:
+                continue
+            if "phase" in row and row["phase"] != "A":
+                raise ValueError(f"existing B1 curve step {step} must be from Phase A")
+            try:
+                value = {name: float(row[name]) for name in metrics}
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"existing B1 curve step {step} is missing primary DVF metrics") from exc
+            if not all(math.isfinite(metric) for metric in value.values()):
+                raise ValueError(f"existing B1 curve step {step} has non-finite primary DVF metrics")
+            return value
+    raise ValueError(f"existing B1 curve has no step {step}")
 
 
 def _run_arm(args, pixel_mode: str) -> dict[str, Any]:
@@ -103,12 +112,15 @@ def _run_arm(args, pixel_mode: str) -> dict[str, Any]:
 def run(args) -> dict[str, Any]:
     if not args.smoke and (args.steps, args.observations_per_update, args.pixel_samples, args.locations_per_view, args.frames_per_location) != (750, 32, 256, 3, 50): raise ValueError("formal bridge requires C4a 750/32/256/9-location/450-frame protocol")
     if not args.smoke and (args.manifest is None or args.qc_table is None or args.canonical_domain is None): raise ValueError("formal bridge requires manifest, QC table, and canonical domain")
+    if args.existing_b1_summary is not None and args.existing_b1_curve is None:
+        _existing_b1_at_step(args.existing_b1_summary, None)
     modes = ("random", "fixed_grid") if args.arm == "all" else (args.arm,); results = {"R0" if mode == "random" else "R1": _run_arm(args, mode) for mode in modes}
-    if args.existing_b1_summary is not None:
+    if args.existing_b1_curve is not None:
         b1 = _existing_b1_at_step(args.existing_b1_summary, args.existing_b1_curve); results["B1_A_750"] = {"pixel_mode": "fixed_grid", "observations_per_update": 450, "final_dvf": b1}
     if {"R0", "R1", "B1_A_750"} <= set(results):
-        comparison = {"results": results, "classification": _classify_bridge(results["R0"]["final_dvf"], results["R1"]["final_dvf"], results["B1_A_750"]["final_dvf"])}; (args.output_dir / "bridge_comparison.json").write_text(json.dumps(comparison, indent=2)+"\n")
-        with (args.output_dir / "bridge_comparison.csv").open("w", newline="") as handle: writer=csv.DictWriter(handle, fieldnames=["arm","pixel_mode","observations_per_update","full_fov_dynamic_cosine","full_fov_dynamic_rms_ratio","full_fov_dynamic_normalized_epe"]); writer.writeheader(); writer.writerows({"arm":name, "pixel_mode":value["pixel_mode"], "observations_per_update":value.get("observations_per_update", value.get("exposure_accounting",{}).get("observations_per_update")), **value["final_dvf"]} for name,value in results.items())
+        results["B1_A_750"]["exposure_accounting"] = _exposure_accounting(steps=750, observations_per_update=450, pixels_per_observation=256)
+        comparison = {"results": results, "classification": _classify_bridge(results["R0"]["final_dvf"], results["R1"]["final_dvf"], results["B1_A_750"]["final_dvf"]), "causal_scope": "R1 and B1-A differ in update batch protocol and total observation exposure; this bridge does not distinguish batch stochasticity from exposure/optimization-duration effects."}; (args.output_dir / "bridge_comparison.json").write_text(json.dumps(comparison, indent=2)+"\n")
+        with (args.output_dir / "bridge_comparison.csv").open("w", newline="") as handle: writer=csv.DictWriter(handle, fieldnames=["arm","pixel_mode","optimizer_steps","observations_per_update","pixels_per_observation","observation_exposures","pixel_observation_exposures","full_fov_dynamic_cosine","full_fov_dynamic_rms_ratio","full_fov_dynamic_normalized_epe"]); writer.writeheader(); writer.writerows({"arm":name, "pixel_mode":value["pixel_mode"], **value.get("exposure_accounting", {}), **value["final_dvf"]} for name,value in results.items())
     return results
 
 
