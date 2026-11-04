@@ -84,6 +84,40 @@ def test_score_rms_diagnostics_separate_dc_and_dynamic_energy() -> None:
     assert abs(oscillating_metrics["respiratory_score_total_rms"] ** 2 - oscillating_metrics["respiratory_score_mean_rms"] ** 2 - oscillating_metrics["respiratory_score_dynamic_rms"] ** 2) < 1e-6
 
 
+def test_per_location_score_decomposition_does_not_turn_between_location_dc_into_dynamics() -> None:
+    from cardioresp4d.training.respiratory_staged_vnext import respiratory_score_rms_metrics
+    metrics = respiratory_score_rms_metrics((torch.full((3, 1, 3), 2.), torch.full((5, 1, 3), -4.)))
+    assert metrics["respiratory_score_dynamic_rms"] == 0.
+    assert metrics["respiratory_score_mean_rms"] > 0.
+    assert abs(metrics["respiratory_score_total_rms"] ** 2 - metrics["respiratory_score_mean_rms"] ** 2) < 1e-6
+
+
+def test_per_location_dvf_decomposition_recovers_known_temporal_oscillation() -> None:
+    from cardioresp4d.training.respiratory_staged_vnext import respiratory_dvf_rms_metrics
+    constant = torch.full((3, 2, 3), 3.)
+    oscillating = torch.stack((torch.full((2, 3), -2.), torch.full((2, 3), 2.), torch.full((2, 3), -2.), torch.full((2, 3), 2.)))
+    metrics = respiratory_dvf_rms_metrics((constant, oscillating))
+    assert metrics["respiratory_dvf_dynamic_rms_mm"] > 0.
+    assert abs(metrics["respiratory_dvf_total_rms_mm"] ** 2 - metrics["respiratory_dvf_static_rms_mm"] ** 2 - metrics["respiratory_dvf_dynamic_rms_mm"] ** 2) < 1e-6
+
+
+def test_per_location_dvf_decomposition_does_not_turn_between_location_dc_into_dynamics() -> None:
+    from cardioresp4d.training.respiratory_staged_vnext import respiratory_dvf_rms_metrics
+    metrics = respiratory_dvf_rms_metrics((torch.full((3, 2, 3), 2.), torch.full((5, 2, 3), -4.)))
+    assert metrics["respiratory_dvf_dynamic_rms_mm"] == 0.
+    assert metrics["respiratory_dvf_static_rms_mm"] > 0.
+
+
+def test_per_location_score_decomposition_frame_weights_two_temporal_oscillations() -> None:
+    from cardioresp4d.training.respiratory_staged_vnext import respiratory_score_rms_metrics
+    first = torch.tensor([-1., 1.]).reshape(2, 1, 1).expand(-1, 1, 3)
+    second = torch.tensor([-3., 3., -3., 3.]).reshape(4, 1, 1).expand(-1, 1, 3)
+    metrics = respiratory_score_rms_metrics((first, second))
+    expected = ((2 * 1.**2 + 4 * 3.**2) / 6) ** .5
+    assert abs(metrics["respiratory_score_dynamic_rms"] - expected) < 1e-6
+    assert metrics["respiratory_score_mean_rms"] == 0.
+
+
 def test_respiration_pca_provenance_never_falls_back_to_cardiac_candidates(tmp_path: Path) -> None:
     import json
     import numpy as np
