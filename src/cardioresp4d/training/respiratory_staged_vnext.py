@@ -107,12 +107,13 @@ class RespiratoryStagedVNextRunner:
 
     def run_segment(self, segment: RespiratoryStagedSegment) -> dict[str, object]:
         optimizer = configure_respiratory_staged_segment(self.trainer.model, segment, self.trainer.optimizer_config)
+        self.trainer.model.zero_grad(set_to_none=True)
         before = {name: parameter.detach().cpu().clone() for name, parameter in self.trainer.model.named_parameters()}
         stage = segment.stage; contract = stage_contract(stage); losses: list[float] = []
         waveform_losses: list[list[float]] = [[], [], []]; waveform_r2: list[list[float]] = [[], [], []]
         pca_matched_steps = 0; pca_skipped_steps = 0
         for step in range(1, segment.steps + 1):
-            optimizer.zero_grad(set_to_none=True)
+            self.trainer.model.zero_grad(set_to_none=True)
             total = next(self.trainer.model.parameters()).sum() * 0.
             if segment.data_loss:
                 rows = [self.trainer._observation_components(observation, stage) for observation in self.trainer.sampler.sample_step(observations_per_update=self.trainer.observations_per_update)]

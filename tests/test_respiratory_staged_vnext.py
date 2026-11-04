@@ -13,6 +13,27 @@ sys.path.insert(0, str(ROOT / "src"))
 from cardioresp4d.training.respiratory_staged_vnext import respiratory_staged_vnext_segments, validate_respiratory_staged_vnext_config  # noqa: E402
 
 
+def _smoke_runner_with_matching_respiratory_pca():
+    from cardioresp4d.frequency.pca_waveform_prior import PCAWaveformMatch
+    from cardioresp4d.training.model import SourceFirstDynamicModel
+    from cardioresp4d.training.respiratory_staged_vnext import RespiratoryStagedVNextRunner
+    from cardioresp4d.training.sampler import DynamicObservation, ViewLocationBalancedSampler
+    from cardioresp4d.training.trainer import UnifiedProgressiveTrainer
+    class MatchingRespiratoryPCA:
+        def match(self, view, slice_id, timestamps, *, device, dtype):
+            return PCAWaveformMatch(timestamps, torch.linspace(-1., 1., timestamps.numel(), device=device, dtype=dtype), 1)
+    rows = [DynamicObservation(torch.rand(1, 4, 4), view, "s", index, torch.zeros(3), torch.tensor([1., 0., 0.]), torch.tensor([0., 1., 0.]), torch.tensor([0., 0., 1.]), torch.ones(2), 4., True, "valid", float(frame)) for index, (view, frame) in enumerate((view, frame) for view in ("SAX", "2CH", "4CH") for frame in range(3))]
+    model = SourceFirstDynamicModel(torch.tensor([-2., -2., -2.]), torch.tensor([2., 2., 2.]), cardiac_lower_world_mm=torch.tensor([-1., -1., -1.]), cardiac_upper_world_mm=torch.tensor([1., 1., 1.]), n_dynamic_frames=9, inr_width=8, inr_depth=1, latent_dim=4, motion_hidden_dim=8, respiratory_grid_shapes=((4, 4, 4),) * 3, cardiac_grid_shape=(4, 4, 4), psf_samples=1)
+    optimizer = {"resp_a2": {"canonical_lr": 5e-5}, "resp_score": {"film_lr": 5e-4}, "resp_mbc": {"respiratory_mbc_lr": 5e-4}, "resp_e": {"canonical_lr": 5e-5}}
+    trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(rows), pixel_samples=1, optimizer_config=optimizer, pca_waveform_min_frames=3)
+    return RespiratoryStagedVNextRunner(trainer, respiratory_pca_waveform_prior=MatchingRespiratoryPCA(), loss_weights={"respiratory_pca_waveform": 1e-3}), model
+
+
+def _owner_has_finite_nonzero_gradient(model, owner: str) -> bool:
+    prefixes = {"canonical": ("canonical.",), "respiratory_encoder": ("film_encoder.image.", "film_encoder.geometry_mlp.", "film_encoder.head.", "film_encoder.resp."), "respiratory_mbc": ("respiratory_mbc.levels.",)}
+    return any(parameter.grad is not None and torch.isfinite(parameter.grad).all() and bool(parameter.grad.abs().sum() > 0) for name, parameter in model.named_parameters() if name.startswith(prefixes[owner]))
+
+
 def test_vnext_schedule_has_fixed_non_joint_ownership_and_budget() -> None:
     segments = respiratory_staged_vnext_segments()
     assert [(segment.name, segment.steps) for segment in segments] == [("resp_static_bootstrap_a1", 500), ("resp_static_bootstrap_a2", 1300), ("resp_pca_warmup", 1000), ("resp_mbc_bootstrap_c1", 250), ("resp_mbc_bootstrap_c2", 250), ("resp_mbc_bootstrap_c3", 250), ("resp_score_refine", 1500), ("resp_canonical_refine", 2000)]
@@ -98,6 +119,26 @@ def test_phase_b_missing_local_pca_match_skips_and_records_counter() -> None:
     report = runner.run_segment(segment)
     assert report["respiratory_pca_matched_steps"] == 0
     assert report["respiratory_pca_skipped_steps"] == 1
+
+
+def test_smoke_segments_clear_gradients_across_a2_b_c_d_e_ownership_changes() -> None:
+    runner, model = _smoke_runner_with_matching_respiratory_pca()
+    names = ("resp_static_bootstrap_a2", "resp_pca_warmup", "resp_mbc_bootstrap_c1", "resp_score_refine", "resp_canonical_refine")
+    expected_owners = ("canonical", "respiratory_encoder", "respiratory_mbc", "respiratory_encoder", "canonical")
+    schedule = {segment.name: segment for segment in respiratory_staged_vnext_segments()}
+    for name, owner in zip(names, expected_owners):
+        runner.run_segment(replace(schedule[name], steps=1))
+        assert _owner_has_finite_nonzero_gradient(model, owner)
+        assert all(parameter.grad is None for parameter in model.parameters() if not parameter.requires_grad)
+
+
+def test_stale_canonical_gradient_is_cleared_before_phase_b_backward() -> None:
+    runner, model = _smoke_runner_with_matching_respiratory_pca()
+    canonical = next(model.canonical.parameters()); canonical.grad = torch.ones_like(canonical)
+    segment = replace(next(item for item in respiratory_staged_vnext_segments() if item.name == "resp_pca_warmup"), steps=1)
+    runner.run_segment(segment)
+    assert canonical.grad is None
+    assert _owner_has_finite_nonzero_gradient(model, "respiratory_encoder")
 
 
 def test_phase_b_pca_only_backward_has_gradients_only_on_respiratory_encoder() -> None:
