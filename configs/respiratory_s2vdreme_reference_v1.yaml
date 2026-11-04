@@ -21,5 +21,13 @@ training:
     cardiac_evaluation_grid: {mode: fixed_physical_cardiac_box, shape: [16,16,16]}
 static_reference:
   mean_policy: qc_valid_per_location_exact_temporal_mean
-  canonical_initialization: direct_exact_state_or_static_volume_mse_warm_start
+  canonical_initialization:
+    direct_exact_state: true
+    fallback:
+      enabled: true
+      # No repository convergence evidence exists for a formal fixed step count.
+      # Direct-state rejection therefore requires one separately recorded calibration.
+      mode: calibration_required
+      learning_rate: 1.0e-4
+      max_points: 262144
   nesvor: {formal_iterations: 10000, formal_samples: 256, smoke_iterations: 2, smoke_samples: 8}

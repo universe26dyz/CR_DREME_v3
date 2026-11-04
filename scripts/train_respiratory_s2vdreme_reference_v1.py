@@ -22,7 +22,7 @@ from cardioresp4d.adapters.source_lock import verify_vendored_source_lock
 from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import (
     REFERENCE_CHECKPOINT_BOUNDARIES, S2VDREMEReferenceRunner, canonical_init_provenance, joint_stage_audits,
     reference_schedule, strict_canonical_state_from_static_checkpoint, validate_reference_config,
-    static_volume_samples, warm_start_canonical_from_static_volume, apply_corrected_static_poses, load_corrected_pose_map, static_reference_diagnostics,
+    static_volume_samples, warm_start_canonical_from_static_volume, apply_corrected_static_poses, load_corrected_pose_map, static_reference_diagnostics, corrected_pose_containment_audit,
 )
 from cardioresp4d.training.build_model import build_source_first_model, effective_model_config
 from cardioresp4d.training.runtime_state import capture_rng_state, restore_rng_state, set_reproducibility
@@ -80,7 +80,6 @@ def main() -> None:
     parser.add_argument("--manifest", required=True, type=Path); parser.add_argument("--qc-table", required=True, type=Path); parser.add_argument("--canonical-domain", required=True, type=Path)
     parser.add_argument("--static-manifest", required=True, type=Path, help="authoritative static_reference_manifest.json")
     parser.add_argument("--static-volume", type=Path, help="Verified static NeSVoR NIfTI override for explicit MSE fallback")
-    parser.add_argument("--static-warm-start-steps", type=int, default=0, help="Explicit volume-MSE fallback iterations; never used for exact state admission")
     parser.add_argument("--output-dir", required=True, type=Path); parser.add_argument("--device", default="cuda"); parser.add_argument("--pixel-samples", type=int, default=256); parser.add_argument("--resume", type=Path)
     args = parser.parse_args(); device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available(): parser.error("CUDA requested but unavailable")
@@ -97,24 +96,33 @@ def main() -> None:
     if _sha256(static_model) != static_manifest["outputs"]["model"]["sha256"] or _sha256(static_volume) != static_manifest["outputs"]["volume"]["sha256"] or _sha256(pose_manifest) != static_manifest["corrected_pose_manifest"]["sha256"]:
         raise ValueError("static manifest artifact hashes do not match")
     domain = json.loads(args.canonical_domain.read_text()); reproducibility = set_reproducibility(int(config["training"]["seed"]))
-    observations, normalization, normalization_groups = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=config["training"]["normalization"]["mode"], assign_slice_positions=False)
-    observations = assign_normalized_slice_positions(apply_corrected_static_poses(observations, load_corrected_pose_map(pose_manifest)))
+    observations, normalization, normalization_groups = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=config["training"]["normalization"]["mode"], assign_slice_positions=True)
+    pose_map = load_corrected_pose_map(pose_manifest)
+    containment = corrected_pose_containment_audit(pose_map, lower_world_mm=domain["world_min_mm"], upper_world_mm=domain["world_max_mm"])
+    observations = apply_corrected_static_poses(observations, pose_map)
     checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
     model = build_source_first_model(config, domain, n_dynamic_frames=max(item.dynamic_frame_id for item in observations) + 1, device=device).to(device)
     static_payload = torch.load(static_model, map_location="cpu", weights_only=False)
     try:
         bounds = torch.stack((model.canonical_lower_world_mm, model.canonical_upper_world_mm))
         static_state = strict_canonical_state_from_static_checkpoint(static_payload, model.canonical.inr.state_dict(), dynamic_bounds_world_mm=bounds, expected_architecture=model.canonical.args)
-    except ValueError:
-        if args.static_warm_start_steps <= 0:
-            raise ValueError("static INR state is incompatible; pass --static-volume and positive --static-warm-start-steps for the explicit MSE fallback")
-        points, targets = static_volume_samples(static_volume, max_points=262144, device=device)
-        warm_report = warm_start_canonical_from_static_volume(model, points, targets, steps=args.static_warm_start_steps)
-        static_init = {**canonical_init_provenance(static_model, mode="static_volume_mse_warm_start"), "static_volume_path": str(static_volume), "static_volume_sha256": _sha256(static_volume), "warm_start": warm_report, "intensity_statistics": {"min": float(targets.min()), "max": float(targets.max()), "mean": float(targets.mean()), "std": float(targets.std(unbiased=False))}}
+    except ValueError as error:
+        fallback = config["static_reference"]["canonical_initialization"]["fallback"]
+        if fallback["mode"] != "fixed_steps":
+            raise ValueError(f"direct static state admission rejected: {error}; formal fallback is calibration_required and cannot be selected by CLI") from error
+        points, targets = static_volume_samples(static_volume, max_points=int(fallback["max_points"]), device=device)
+        warm_report = warm_start_canonical_from_static_volume(model, points, targets, steps=int(fallback["steps"]), learning_rate=float(fallback["learning_rate"]))
+        static_init = {
+            **canonical_init_provenance(static_model, mode="static_volume_mse_warm_start"),
+            "direct_state_admission": {"accepted": False, "reason": str(error)},
+            "static_volume_path": str(static_volume), "static_volume_sha256": _sha256(static_volume),
+            "warm_start": {**warm_report, "sample_count": int(targets.numel()), "relative_improvement": (warm_report["loss_first"] - warm_report["loss_last"]) / max(warm_report["loss_first"], 1e-12)},
+            "intensity_statistics": {"min": float(targets.min()), "max": float(targets.max()), "mean": float(targets.mean()), "std": float(targets.std(unbiased=False))},
+        }
     else:
         model.canonical.inr.load_state_dict(static_state, strict=True)
         if not torch.allclose(model.canonical.inr.bounding_box, bounds, atol=1e-5, rtol=0.0): raise RuntimeError("direct static load changed canonical bounding_box")
-        static_init = canonical_init_provenance(static_model, mode="direct_exact_state")
+        static_init = {**canonical_init_provenance(static_model, mode="direct_exact_state"), "direct_state_admission": {"accepted": True, "reason": None, "static_bbox": static_state["bounding_box"].detach().cpu().tolist(), "dynamic_bbox": bounds.detach().cpu().tolist(), "bbox_tolerance_mm": 1e-5, "architecture_match": True, "encoding_backend_match": True}}
     sampler = ViewLocationBalancedSampler(observations, seed=int(config["training"]["seed"]))
     runner = S2VDREMEReferenceRunner(model, sampler, pixel_samples=args.pixel_samples, observations_per_update=int(config["training"]["observations_per_update"]), optimizer_config=config["training"]["optimizer"])
     segments = reference_schedule(); start = 0
@@ -125,7 +133,7 @@ def main() -> None:
     effective = {"requested": config, "constructed": {**effective_model_config(model), "optimizer": config["training"]["optimizer"], "schedule": [segment.__dict__ for segment in reference_schedule()], "observations_per_update": runner.observations_per_update, "loss_weights": config["training"]["loss_weights"]}, "source_lock": source_lock}
     (args.output_dir / "effective_config.json").write_text(json.dumps(effective, indent=2) + "\n")
     static_diagnostics = static_reference_diagnostics(model, sampler)
-    (args.output_dir / "static_reference_ready.json").write_text(json.dumps({**static_init, **static_diagnostics, "static_manifest": str(args.static_manifest), "static_manifest_sha256": _sha256(args.static_manifest), "canonical_bbox": bounds.detach().cpu().tolist(), "static_pose_map": str(pose_manifest)}, indent=2) + "\n")
+    (args.output_dir / "static_reference_ready.json").write_text(json.dumps({**static_init, **static_diagnostics, "corrected_pose_containment": containment, "static_manifest": str(args.static_manifest), "static_manifest_sha256": _sha256(args.static_manifest), "canonical_bbox": bounds.detach().cpu().tolist(), "static_pose_map": str(pose_manifest)}, indent=2) + "\n")
     for segment in segments[start:]:
         runner.run_segment(segment)
         payload = _checkpoint(model=model, runner=runner, config=config, provenance=provenance, static_init=static_init)

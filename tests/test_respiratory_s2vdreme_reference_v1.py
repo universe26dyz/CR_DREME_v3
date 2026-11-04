@@ -198,3 +198,33 @@ def test_diagnostic_rng_is_repeatable_and_does_not_perturb_training_rng() -> Non
     assert torch.equal(torch.get_rng_state(), before)
     with diagnostic_rng_context(): second = torch.rand(4)
     torch.testing.assert_close(first, second)
+
+
+def test_acquisition_positions_survive_rotated_corrected_pose_propagation() -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import CorrectedStaticPose, apply_corrected_static_poses
+    from cardioresp4d.training.sampler import assign_normalized_slice_positions
+
+    raw = assign_normalized_slice_positions([_observation(slice_id="low", center_z=-4., timestamp=0.), _observation(slice_id="low", center_z=-4., timestamp=1.), _observation(slice_id="high", center_z=4.)])
+    rotated = {("SAX", "low"): CorrectedStaticPose("SAX", "low", "x", 0, {}, {"center_mm": [0., 0., -4.], "row_direction": [0.98, 0.2, 0.], "column_direction": [-0.2, 0.98, 0.], "normal": [0., 0., 1.], "pixel_spacing_mm": [1.2, 1.3], "slice_thickness_mm": 4., "image_shape": [1, 4, 5]}, [], "x"), ("SAX", "high"): CorrectedStaticPose("SAX", "high", "x", 1, {}, {"center_mm": [0., 0., 4.], "row_direction": [1., 0., 0.], "column_direction": [0., 0.98, 0.2], "normal": [0., -0.2, 0.98], "pixel_spacing_mm": [1.2, 1.3], "slice_thickness_mm": 4., "image_shape": [1, 4, 5]}, [], "x")}
+    corrected = apply_corrected_static_poses(list(reversed(raw)), rotated)
+    assert [item.normalized_slice_position for item in corrected] == pytest.approx([1., -1., -1.])
+
+
+def test_corrected_pose_containment_is_fail_closed_and_reports_margins() -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import corrected_pose_containment_audit
+
+    inside = {("SAX", "a"): {"center_mm": [0., 0., 0.], "row_direction": [1., 0., 0.], "column_direction": [0., 1., 0.], "normal": [0., 0., 1.], "pixel_spacing_mm": [1., 1.], "slice_thickness_mm": 4., "image_shape": [1, 4, 5]}}
+    report = corrected_pose_containment_audit(inside, lower_world_mm=[-3., -3., -3.], upper_world_mm=[3., 3., 3.])
+    assert report["passed"] and report["location_count"] == 1
+    outside = {("SAX", "a"): {**inside[("SAX", "a")], "center_mm": [5., 0., 0.]}}
+    with pytest.raises(ValueError, match="SAX/a"):
+        corrected_pose_containment_audit(outside, lower_world_mm=[-3., -3., -3.], upper_world_mm=[3., 3., 3.])
+
+
+def test_formal_and_smoke_fallback_policies_are_explicit_and_distinct() -> None:
+    root = __import__("pathlib").Path(__file__).resolve().parents[1]
+    formal = yaml.safe_load((root / "configs" / "respiratory_s2vdreme_reference_v1.yaml").read_text())
+    smoke = yaml.safe_load((root / "configs" / "respiratory_s2vdreme_reference_v1_smoke.yaml").read_text())
+    assert formal["static_reference"]["canonical_initialization"]["fallback"]["mode"] == "calibration_required"
+    assert smoke["static_reference"]["canonical_initialization"]["fallback"]["mode"] == "fixed_steps"
+    assert smoke["static_reference"]["canonical_initialization"]["fallback"]["steps"] == 2

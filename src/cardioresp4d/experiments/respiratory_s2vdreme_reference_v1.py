@@ -315,6 +315,29 @@ def apply_corrected_static_poses(observations: Iterable[DynamicObservation], pos
     return result
 
 
+def corrected_pose_containment_audit(poses: Mapping[tuple[str, str], CorrectedStaticPose | Mapping[str, Any]], *, lower_world_mm: Sequence[float], upper_world_mm: Sequence[float], tolerance_mm: float = 1e-5) -> dict[str, Any]:
+    """Fail-closed corrected in-plane-corner admission using DynamicObservation geometry."""
+    lower, upper = np.asarray(lower_world_mm, dtype=float), np.asarray(upper_world_mm, dtype=float)
+    if lower.shape != (3,) or upper.shape != (3,) or np.any(upper <= lower) or tolerance_mm < 0:
+        raise ValueError("canonical containment bounds/tolerance are invalid")
+    min_margin = math.inf; max_margin = -math.inf
+    for (view, slice_id), value in sorted(poses.items()):
+        geometry = value.corrected_geometry if isinstance(value, CorrectedStaticPose) else value
+        _, height, width = geometry["image_shape"]
+        center, row, column = (np.asarray(geometry[key], dtype=float) for key in ("center_mm", "row_direction", "column_direction"))
+        spacing_row, spacing_column = geometry["pixel_spacing_mm"]
+        corners = np.asarray([center + (u - (width - 1) / 2.) * spacing_column * row + (v - (height - 1) / 2.) * spacing_row * column for u in (0., width - 1.) for v in (0., height - 1.)])
+        below, above = lower - corners.min(axis=0), corners.max(axis=0) - upper
+        violation = np.maximum(np.maximum(below, above), 0.)
+        if np.any(violation > tolerance_mm):
+            raise ValueError(f"corrected pose outside canonical domain for {view}/{slice_id}: corrected_min={corners.min(axis=0).tolist()} corrected_max={corners.max(axis=0).tolist()} canonical_min={lower.tolist()} canonical_max={upper.tolist()} violation_mm={violation.tolist()}")
+        margins = np.minimum(corners - lower, upper - corners)
+        min_margin = min(min_margin, float(margins.min())); max_margin = max(max_margin, float(margins.max()))
+    if not poses:
+        raise ValueError("corrected pose containment requires at least one location")
+    return {"policy": "corrected_slice_corners", "tolerance_mm": tolerance_mm, "location_count": len(poses), "minimum_margin_to_boundary_mm": min_margin, "maximum_margin_to_boundary_mm": max_margin, "passed": True}
+
+
 def write_static_reference_manifest(*, output_dir: str | Path, source_manifest: str | Path, qc_table: str | Path, mean_slice_manifest: str | Path, command: Sequence[str], executable: str, version: str, mode: str) -> Path:
     """Close the static artifact/provenance chain after NeSVoR has completed."""
     output = Path(output_dir); mean_path = Path(mean_slice_manifest)
@@ -371,7 +394,7 @@ def warm_start_canonical_from_static_volume(model, sample_points_world_mm: torch
         optimizer.zero_grad(set_to_none=True)
         loss = (model.canonical(sample_points_world_mm).reshape_as(target_intensity) - target_intensity).square().mean()
         loss.backward(); optimizer.step(); losses.append(float(loss.detach()))
-    return {"steps": float(steps), "learning_rate": learning_rate, "loss_first": losses[0], "loss_last": losses[-1]}
+    return {"steps_run": steps, "learning_rate": learning_rate, "loss_first": losses[0], "loss_last": losses[-1]}
 
 
 def static_volume_samples(volume_path: str | Path, *, max_points: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -403,6 +426,11 @@ def validate_reference_config(config: Mapping[str, Any]) -> None:
     required_disabled = {"pca_waveform", "pca_warmup", "hard_score_centering", "per_location_dc_subtraction", "zero_mean_score", "groupwise_encoder", "cardiac", "uncertainty"}
     if not required_disabled <= disabled:
         raise ValueError("reference experiment must explicitly disable PCA/DC/groupwise/cardiac/uncertainty auxiliaries")
+    fallback = config.get("static_reference", {}).get("canonical_initialization", {}).get("fallback", {})
+    if fallback.get("enabled") is not True or fallback.get("mode") not in {"calibration_required", "fixed_steps"} or float(fallback.get("learning_rate", 0.)) != 1e-4 or int(fallback.get("max_points", 0)) <= 0:
+        raise ValueError("reference experiment requires an explicit static-volume fallback policy")
+    if fallback["mode"] == "fixed_steps" and int(fallback.get("steps", 0)) <= 0:
+        raise ValueError("fixed-step static-volume fallback requires pinned positive steps")
 
 
 def deterministic_diagnostic_cohort(sampler) -> tuple[tuple[str, str, tuple[DynamicObservation, ...]], ...]:
