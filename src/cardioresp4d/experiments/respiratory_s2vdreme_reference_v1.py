@@ -9,7 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -49,6 +50,18 @@ class TemporalMeanLocation:
     geometry: dict[str, Any]
     geometry_hash: str
     qc_provenance: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CorrectedStaticPose:
+    view: str
+    slice_id: str
+    source_stack_file: str
+    source_stack_index: int
+    original_geometry: dict[str, Any]
+    corrected_geometry: dict[str, Any]
+    correction_transform_lps: list[list[float]]
+    corrected_slice_file: str
 
 
 def _geometry(observation: DynamicObservation) -> dict[str, Any]:
@@ -151,7 +164,7 @@ def nesvor_reconstruct_command(mean_stacks: Sequence[str | Path], *, output_dir:
     if len(thicknesses_mm) != len(mean_stacks) or any(not math.isfinite(value) or value <= 0 for value in thicknesses_mm):
         raise ValueError("each mean stack requires one finite acquisition thickness")
     output = Path(output_dir)
-    command = ["nesvor", "reconstruct", "--input-stacks", *[str(path) for path in mean_stacks], "--thicknesses", *[str(value) for value in thicknesses_mm], "--output-volume", str(output / "static_reference.nii.gz"), "--output-model", str(output / "model.pt"), "--output-json", str(output / "nesvor_effective_args.json")]
+    command = ["nesvor", "reconstruct", "--input-stacks", *[str(path) for path in mean_stacks], "--thicknesses", *[str(value) for value in thicknesses_mm], "--output-volume", str(output / "static_reference.nii.gz"), "--output-model", str(output / "model.pt"), "--output-json", str(output / "nesvor_effective_args.json"), "--output-slices", str(output / "slices"), "--output-log", str(output / "nesvor.log"), "--output-intensity-mean", "0"]
     for key, values in FORMAL_NESVOR_OPTIONS:
         command.extend((key, *values))
     if smoke:
@@ -182,8 +195,9 @@ def reference_schedule() -> tuple[ReferenceSegment, ...]:
 REFERENCE_CHECKPOINT_BOUNDARIES = tuple(f"checkpoint_{segment.name}_end.pt" for segment in reference_schedule())
 
 
-def configure_reference_segment(model: torch.nn.Module, segment: ReferenceSegment) -> torch.optim.Adam:
+def configure_reference_segment(model: torch.nn.Module, segment: ReferenceSegment, *, optimizer_config: Mapping[str, float] | None = None) -> torch.optim.Adam:
     """Fresh joint optimizer with no cardiac/uncertainty ownership."""
+    settings = {"canonical_lr": 1e-4, "respiratory_encoder_lr": 5e-4, "respiratory_mbc_lr": 5e-4} if optimizer_config is None else dict(optimizer_config)
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     model.respiratory_mbc.set_active_levels(segment.active_respiratory_levels)
@@ -191,15 +205,15 @@ def configure_reference_segment(model: torch.nn.Module, segment: ReferenceSegmen
     if "canonical" in segment.owners:
         parameters = list(model.canonical.parameters())
         for parameter in parameters: parameter.requires_grad_(True)
-        groups.append({"params": parameters, "lr": 1e-4, "name": "canonical"})
+        groups.append({"params": parameters, "lr": float(settings["canonical_lr"]), "name": "canonical"})
     if "respiratory_encoder" in segment.owners:
         parameters = list(model.film_encoder.parameters())
         for parameter in parameters: parameter.requires_grad_(True)
-        groups.append({"params": parameters, "lr": 5e-4, "name": "respiratory_encoder"})
+        groups.append({"params": parameters, "lr": float(settings["respiratory_encoder_lr"]), "name": "respiratory_encoder"})
     if "respiratory_mbc" in segment.owners:
         parameters = [parameter for level in model.respiratory_mbc.levels[:segment.active_respiratory_levels] for parameter in level.parameters()]
         for parameter in parameters: parameter.requires_grad_(True)
-        groups.append({"params": parameters, "lr": 5e-4, "name": "respiratory_mbc"})
+        groups.append({"params": parameters, "lr": float(settings["respiratory_mbc_lr"]), "name": "respiratory_mbc"})
     return torch.optim.Adam(groups)
 
 
@@ -220,7 +234,7 @@ def reference_dvf_diagnostics(dvfs_by_location: tuple[torch.Tensor, ...]) -> dic
     return metrics
 
 
-def strict_canonical_state_from_static_checkpoint(payload: Mapping[str, Any], expected: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def strict_canonical_state_from_static_checkpoint(payload: Mapping[str, Any], expected: Mapping[str, torch.Tensor], *, dynamic_bounds_world_mm: torch.Tensor | None = None, expected_architecture: Any | None = None, tolerance_mm: float = 1e-5) -> dict[str, torch.Tensor]:
     """Admit only a schema explicitly containing an exact INR state dictionary."""
     # Pinned NeSVoR 0.6.0rc1 writes ``{"model": inr.state_dict(), ...}``
     # in ``nesvor.cli.io.save_volume``.  ``inr_state_dict`` is accepted only
@@ -230,7 +244,108 @@ def strict_canonical_state_from_static_checkpoint(payload: Mapping[str, Any], ex
         raise ValueError("static checkpoint has no auditable inr_state_dict; use the volume-MSE warm start")
     if set(candidate) != set(expected) or any(not isinstance(candidate[key], torch.Tensor) or candidate[key].shape != expected[key].shape for key in expected):
         raise ValueError("static checkpoint INR state is not an exact canonical key/shape match")
+    if dynamic_bounds_world_mm is not None:
+        bbox = candidate.get("bounding_box")
+        if not isinstance(bbox, torch.Tensor) or bbox.shape != (2, 3) or not torch.allclose(bbox.detach().cpu(), dynamic_bounds_world_mm.detach().cpu(), atol=tolerance_mm, rtol=0.0):
+            raise ValueError("static checkpoint bounding_box does not match the dynamic canonical domain")
+    if expected_architecture is not None:
+        static_args = payload.get("args")
+        for name in ("coarsest_resolution", "finest_resolution", "level_scale", "n_features_per_level", "log2_hashmap_size", "n_features_z", "width", "depth"):
+            if static_args is None or not hasattr(static_args, name) or getattr(static_args, name) != getattr(expected_architecture, name):
+                raise ValueError(f"static checkpoint architecture does not match dynamic canonical: {name}")
     return {key: candidate[key] for key in expected}
+
+
+def _lps_affine_from_geometry(geometry: Mapping[str, Any]) -> np.ndarray:
+    _, height, width = geometry["image_shape"]
+    row, column, center = (np.asarray(geometry[key], dtype=float) for key in ("row_direction", "column_direction", "center_mm"))
+    spacing_row, spacing_column = geometry["pixel_spacing_mm"]
+    normal = np.asarray(geometry["normal"], dtype=float)
+    affine = np.eye(4)
+    affine[:3, 0] = row * spacing_column; affine[:3, 1] = column * spacing_row; affine[:3, 2] = normal * float(geometry["slice_thickness_mm"])
+    affine[:3, 3] = center - (width - 1) / 2 * affine[:3, 0] - (height - 1) / 2 * affine[:3, 1]
+    return affine
+
+
+def _corrected_geometry_from_slice(path: Path, original: Mapping[str, Any]) -> dict[str, Any]:
+    image = nib.load(str(path)); affine_lps = np.diag([-1., -1., 1., 1.]) @ image.affine
+    width, height, depth = image.shape[:3]
+    axes = affine_lps[:3, :3]
+    row = axes[:, 0] / np.linalg.norm(axes[:, 0]); column = axes[:, 1] / np.linalg.norm(axes[:, 1]); normal = axes[:, 2] / np.linalg.norm(axes[:, 2])
+    center = nib.affines.apply_affine(affine_lps, [(width - 1) / 2, (height - 1) / 2, (depth - 1) / 2])
+    return {"center_mm": center.tolist(), "row_direction": row.tolist(), "column_direction": column.tolist(), "normal": normal.tolist(), "pixel_spacing_mm": list(original["pixel_spacing_mm"]), "slice_thickness_mm": float(original["slice_thickness_mm"]), "image_shape": list(original["image_shape"])}
+
+
+def build_corrected_pose_map(mean_slice_manifest: str | Path, corrected_slices_dir: str | Path) -> dict[tuple[str, str], CorrectedStaticPose]:
+    """Map NeSVoR's ordered ``output_slices/<index>.nii.gz`` back to mean locations.
+
+    Pinned NeSVoR saves its post-registration ``output_slices`` in input order;
+    the mean manifest records the command's stack order and intra-stack index.
+    The NIfTI affine is the corrected pose and is converted RAS→LPS here.
+    """
+    manifest_path = Path(mean_slice_manifest); records = json.loads(manifest_path.read_text())["locations"]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for record in records: groups.setdefault(record["stack_file"], []).append(record)
+    ordered = [record for stack in sorted(groups) for record in sorted(groups[stack], key=lambda item: int(item["stack_index"]))]
+    corrected_dir = Path(corrected_slices_dir); files = [corrected_dir / f"{index}.nii.gz" for index in range(len(ordered))]
+    if len(list(corrected_dir.glob("[0-9]*.nii*"))) != len(ordered) or any(not path.is_file() for path in files):
+        raise ValueError("corrected slice count does not exactly match the mean-slice locations")
+    result: dict[tuple[str, str], CorrectedStaticPose] = {}
+    for record, path in zip(ordered, files):
+        key = (str(record["view"]).upper(), str(record["slice_id"]))
+        if key in result:
+            raise ValueError(f"ambiguous corrected pose mapping for {key[0]}/{key[1]}")
+        corrected = _corrected_geometry_from_slice(path, record["geometry"])
+        transform = _lps_affine_from_geometry(corrected) @ np.linalg.inv(_lps_affine_from_geometry(record["geometry"]))
+        result[key] = CorrectedStaticPose(key[0], key[1], str(record["stack_file"]), int(record["stack_index"]), dict(record["geometry"]), corrected, transform.tolist(), str(path))
+    return result
+
+
+def apply_corrected_static_poses(observations: Iterable[DynamicObservation], pose_map: Mapping[tuple[str, str], CorrectedStaticPose]) -> list[DynamicObservation]:
+    """Apply one immutable static corrected pose to every valid temporal frame."""
+    result = []
+    for observation in sorted(observations, key=lambda item: (item.view.upper(), item.slice_id, item.timestamp_s, item.dynamic_frame_id)):
+        if not observation.qc_valid:
+            result.append(observation); continue
+        pose = pose_map.get((observation.view.upper(), observation.slice_id))
+        if pose is None:
+            raise ValueError(f"missing corrected static pose for {observation.view}/{observation.slice_id}")
+        geometry = pose.corrected_geometry
+        result.append(replace(observation, center_mm=torch.tensor(geometry["center_mm"], dtype=observation.center_mm.dtype, device=observation.center_mm.device), row_direction=torch.tensor(geometry["row_direction"], dtype=observation.row_direction.dtype, device=observation.row_direction.device), column_direction=torch.tensor(geometry["column_direction"], dtype=observation.column_direction.dtype, device=observation.column_direction.device), normal=torch.tensor(geometry["normal"], dtype=observation.normal.dtype, device=observation.normal.device)))
+    return result
+
+
+def write_static_reference_manifest(*, output_dir: str | Path, source_manifest: str | Path, qc_table: str | Path, mean_slice_manifest: str | Path, command: Sequence[str], executable: str, version: str, mode: str) -> Path:
+    """Close the static artifact/provenance chain after NeSVoR has completed."""
+    output = Path(output_dir); mean_path = Path(mean_slice_manifest)
+    if mode not in {"formal", "smoke"} or "--output-intensity-mean" not in command or command[command.index("--output-intensity-mean") + 1] != "0":
+        raise ValueError("static manifest requires the provenance-proven output_intensity_mean=0 contract")
+    pose_map = build_corrected_pose_map(mean_path, output / "slices")
+    pose_path = output / "corrected_pose_manifest.json"
+    pose_path.write_text(json.dumps({"mapping_policy": "NeSVoR output_slices follows deterministic input-stack then intra-stack order", "poses": {f"{view}/{slice_id}": asdict(pose) for (view, slice_id), pose in sorted(pose_map.items())}}, indent=2) + "\n")
+    mean = json.loads(mean_path.read_text()); stack_paths = sorted({item["stack_file"] for item in mean["locations"]})
+    def artifact(path: Path) -> dict[str, str]:
+        if not path.is_file(): raise ValueError(f"required static output is missing: {path}")
+        return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    outputs = {name: artifact(output / filename) for name, filename in {"model": "model.pt", "volume": "static_reference.nii.gz", "effective_args": "nesvor_effective_args.json", "log": "nesvor.log"}.items()}
+    stacks = []
+    for stack in stack_paths:
+        locations = sorted((item for item in mean["locations"] if item["stack_file"] == stack), key=lambda item: int(item["stack_index"]))
+        stacks.append({"path": str(mean_path.parent / stack), "sha256": hashlib.sha256((mean_path.parent / stack).read_bytes()).hexdigest(), "view": locations[0]["view"], "location_count": len(locations), "slice_ids_in_stack_order": [item["slice_id"] for item in locations], "thickness_mm": locations[0]["stack_thickness_mm"], "geometry_hashes": [item["geometry_hash"] for item in locations]})
+    payload = {"source_manifest_sha256": hashlib.sha256(Path(source_manifest).read_bytes()).hexdigest(), "qc_table_sha256": hashlib.sha256(Path(qc_table).read_bytes()).hexdigest(), "mean_slice_manifest": artifact(mean_path), "mean_stacks": stacks, "nesvor": {"executable": executable, "version": version, "command": list(command), "mode": mode, "pinned_commit": "2e96a91bdd30174210caea911e03a2778c65adbe"}, "outputs": outputs, "corrected_pose_manifest": artifact(pose_path), "pose_location_count": len(pose_map), "scientific_contract": {"registration": "stack", "transformation_optimization": "enabled", "output_intensity_mean": 0, "formal_n_iter": 10000, "formal_n_samples": 256}}
+    manifest = output / "static_reference_manifest.json"; manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return manifest
+
+
+def load_corrected_pose_map(path: str | Path) -> dict[tuple[str, str], CorrectedStaticPose]:
+    payload = json.loads(Path(path).read_text())
+    result = {}
+    for key, value in payload["poses"].items():
+        view, slice_id = key.split("/", 1); pose = CorrectedStaticPose(**value)
+        if (view, slice_id) in result or pose.view != view or pose.slice_id != slice_id:
+            raise ValueError("ambiguous corrected pose manifest")
+        result[(view, slice_id)] = pose
+    return result
 
 
 def canonical_init_provenance(static_model_path: str | Path, *, mode: str) -> dict[str, str]:
@@ -278,7 +393,7 @@ def static_volume_samples(volume_path: str | Path, *, max_points: int, device: t
 def validate_reference_config(config: Mapping[str, Any]) -> None:
     """Reject accidental inheritance of vNext scientific settings."""
     training = config.get("training", {})
-    if training.get("observations_per_update") != 32 or training.get("loss_weights") != {"image": 2e-6, "mbc_normalization": 1e-2, "smooth_resp": 1e-3}:
+    if training.get("observations_per_update") != 32 or training.get("loss_weights") != {"image": 2e-6, "mbc_normalization": 1e-2, "smooth_resp": 1e-3} or training.get("optimizer") != {"canonical_lr": 1e-4, "respiratory_encoder_lr": 5e-4, "respiratory_mbc_lr": 5e-4}:
         raise ValueError("reference experiment requires fixed batch size and explicit S2V-DREME loss weights")
     schedule = training.get("schedule")
     expected = [{"level": 1, "warm_steps": 200, "joint_steps": 600}, {"level": 2, "warm_steps": 200, "joint_steps": 600}, {"level": 3, "warm_steps": 200, "joint_steps": 600}]
@@ -294,11 +409,36 @@ def deterministic_diagnostic_cohort(sampler) -> tuple[tuple[str, str, tuple[Dyna
     return tuple((view, slice_id, tuple(sorted(frames, key=lambda item: item.timestamp_s))) for view in sorted(sampler._grouped) for slice_id, frames in sorted(sampler._grouped[view].items()) if frames)
 
 
+@contextmanager
+def diagnostic_rng_context(seed: int = 20260823):
+    """Isolate repeatable diagnostic PSF draws from the training RNG stream."""
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        yield
+
+
+def static_reference_diagnostics(model, sampler) -> dict[str, float]:
+    """Deterministic, read-only static-canonical reconstruction audit before motion."""
+    cohort = deterministic_diagnostic_cohort(sampler); sums: dict[str, float] = {}; counts: dict[str, int] = {}
+    with diagnostic_rng_context(), torch.no_grad():
+        for view, _, frames in cohort:
+            for observation in frames:
+                height, width = observation.image.shape[-2:]; linear = torch.arange(height * width, device=observation.image.device)
+                uv = torch.stack((linear.remainder(width), torch.div(linear, width, rounding_mode="floor")), dim=-1).to(observation.image.dtype)
+                error = (model.predict(observation, uv, "stage1")["predicted_intensity"] - observation.image[0].flatten()).square()
+                sums[view] = sums.get(view, 0.) + float(error.sum()); counts[view] = counts.get(view, 0) + error.numel()
+    result = {f"reconstruction_mse_{view}": sums[view] / counts[view] for view in sorted(sums)}
+    result["reconstruction_mse_full"] = sum(sums.values()) / sum(counts.values())
+    result["diagnostic_location_count"] = len(cohort); result["diagnostic_frame_count"] = sum(len(frames) for _, _, frames in cohort)
+    return result
+
+
 def boundary_motion_diagnostics(model, sampler, *, stage: str) -> dict[str, float]:
     """Read-only full-span, per-location diagnostics shared across all boundaries."""
     cohort = deterministic_diagnostic_cohort(sampler)
     levels = stage_contract(stage).active_respiratory_levels
-    with torch.no_grad():
+    with diagnostic_rng_context(), torch.no_grad():
         score_values = tuple(torch.cat([model.encode_motion_scores(item)["resp_scores"][:, :levels] for item in frames]) for _, _, frames in cohort)
         grid, _ = model._physical_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, (4, 4, 4))
         dvf_values = tuple(torch.stack([ScoreWeightedMBCField(model.respiratory_mbc, model.encode_motion_scores(item)["resp_scores"][:, :levels])(grid)[0] for item in frames]) for _, _, frames in cohort)
@@ -326,13 +466,13 @@ class S2VDREMEReferenceRunner:
     are not part of this reference protocol.
     """
 
-    def __init__(self, model, sampler, *, pixel_samples: int = 256, observations_per_update: int = 32) -> None:
+    def __init__(self, model, sampler, *, pixel_samples: int = 256, observations_per_update: int = 32, optimizer_config: Mapping[str, float] | None = None) -> None:
         if observations_per_update != 32:
             raise ValueError("S2V-DREME reference protocol requires 32 observations/update")
         if pixel_samples <= 0:
             raise ValueError("pixel_samples must be positive")
         self.model, self.sampler = model, sampler
-        self.pixel_samples, self.observations_per_update = pixel_samples, observations_per_update
+        self.pixel_samples, self.observations_per_update, self.optimizer_config = pixel_samples, observations_per_update, dict(optimizer_config or {})
         self.global_step = 0
         self.completed: list[dict[str, Any]] = []
         self.last_optimizer_state: dict[str, Any] | None = None
@@ -356,7 +496,7 @@ class S2VDREMEReferenceRunner:
         return {f"{name}_parameter_norm": float(torch.sqrt(sum((parameter.detach().square().sum() for parameter in module.parameters()), start=torch.zeros((), device=next(module.parameters()).device)))) for name, module in modules.items()}
 
     def run_segment(self, segment: ReferenceSegment) -> dict[str, Any]:
-        optimizer = configure_reference_segment(self.model, segment)
+        optimizer = configure_reference_segment(self.model, segment, optimizer_config=self.optimizer_config)
         self.model.zero_grad(set_to_none=True)
         before_loss = self.completed[-1].get("loss_last") if self.completed else None
         losses: list[float] = []
@@ -391,7 +531,7 @@ class S2VDREMEReferenceRunner:
 def joint_stage_audits(completed: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Report warm-to-joint changes without assigning a one-dimensional verdict."""
     by_name = {str(item["segment"]): item for item in completed}
-    fields = ("loss_last", "respiratory_score_static_rms", "respiratory_score_dynamic_rms", "respiratory_dvf_static_rms_mm", "respiratory_dvf_dynamic_rms_mm", "respiratory_encoder_parameter_norm", "respiratory_mbc_parameter_norm", "canonical_parameter_norm")
+    fields = ("reconstruction_mse_full", "reconstruction_mse_SAX", "reconstruction_mse_2CH", "reconstruction_mse_4CH", "respiratory_score_static_rms", "respiratory_score_dynamic_rms", "respiratory_dvf_static_rms_mm", "respiratory_dvf_dynamic_rms_mm", "respiratory_encoder_parameter_norm", "respiratory_mbc_parameter_norm", "canonical_parameter_norm")
     audits = []
     for level in range(1, 4):
         warm, joint = by_name.get(f"L{level}_warm"), by_name.get(f"L{level}_joint")

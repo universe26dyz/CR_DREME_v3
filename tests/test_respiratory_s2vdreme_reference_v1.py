@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 
+import nibabel as nib
+import numpy as np
 import pytest
 import torch
 import yaml
@@ -61,6 +64,8 @@ def test_formal_and_smoke_nesvor_commands_are_distinct_and_complete() -> None:
     assert formal[formal.index("--n-samples") + 1] == "256"
     assert smoke[smoke.index("--n-iter") + 1] != "10000"
     assert "--scanner-space" in formal and "--no-slice-scale" in formal
+    assert formal[formal.index("--output-intensity-mean") + 1] == "0"
+    assert "--output-slices" in formal and "--output-log" in formal
 
 
 def test_reference_encoder_has_eight_film_layers_and_gradients() -> None:
@@ -135,10 +140,10 @@ def test_per_location_diagnostics_do_not_count_between_location_dc_as_dynamic() 
 def test_joint_audit_reports_motion_and_parameter_changes_without_verdict() -> None:
     from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import joint_stage_audits
 
-    fields = {"loss_last": 1., "respiratory_score_static_rms": 2., "respiratory_score_dynamic_rms": 3., "respiratory_dvf_static_rms_mm": 4., "respiratory_dvf_dynamic_rms_mm": 5., "respiratory_encoder_parameter_norm": 6., "respiratory_mbc_parameter_norm": 7., "canonical_parameter_norm": 8.}
+    fields = {"reconstruction_mse_full": 1., "reconstruction_mse_SAX": 1., "reconstruction_mse_2CH": 1., "reconstruction_mse_4CH": 1., "respiratory_score_static_rms": 2., "respiratory_score_dynamic_rms": 3., "respiratory_dvf_static_rms_mm": 4., "respiratory_dvf_dynamic_rms_mm": 5., "respiratory_encoder_parameter_norm": 6., "respiratory_mbc_parameter_norm": 7., "canonical_parameter_norm": 8.}
     audits = joint_stage_audits([{"segment": "L1_warm", **fields}, {"segment": "L1_joint", **{key: value + 1 for key, value in fields.items()}}])
     assert len(audits) == 1
-    assert audits[0]["delta_loss_last"] == 1.0
+    assert audits[0]["delta_reconstruction_mse_full"] == 1.0
     assert audits[0]["delta_respiratory_dvf_dynamic_rms_mm"] == 1.0
 
 
@@ -150,3 +155,46 @@ def test_static_checkpoint_admission_requires_exact_canonical_state() -> None:
     assert set(admitted) == set(expected)
     with pytest.raises(ValueError, match="exact"):
         strict_canonical_state_from_static_checkpoint({"inr_state_dict": {"a": torch.ones(3)}}, expected)
+
+
+def test_static_state_admission_rejects_shifted_bbox_despite_matching_shapes() -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import strict_canonical_state_from_static_checkpoint
+
+    expected = {"bounding_box": torch.tensor([[-1., -1., -1.], [1., 1., 1.]]), "a": torch.ones(2)}
+    accepted = strict_canonical_state_from_static_checkpoint({"model": {"bounding_box": expected["bounding_box"].clone(), "a": torch.ones(2)}}, expected, dynamic_bounds_world_mm=expected["bounding_box"])
+    torch.testing.assert_close(accepted["bounding_box"], expected["bounding_box"])
+    with pytest.raises(ValueError, match="bounding_box"):
+        strict_canonical_state_from_static_checkpoint({"model": {"bounding_box": expected["bounding_box"] + 1., "a": torch.ones(2)}}, expected, dynamic_bounds_world_mm=expected["bounding_box"])
+
+
+def test_corrected_pose_map_propagates_per_location_without_changing_frame_content(tmp_path) -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import apply_corrected_static_poses, build_corrected_pose_map
+
+    mean_manifest = tmp_path / "mean.json"
+    mean_manifest.write_text(json.dumps({"locations": [
+        {"view": "SAX", "slice_id": "a", "stack_file": "mean_stack_SAX.nii.gz", "stack_index": 0, "geometry": {"center_mm": [0., 0., 0.], "row_direction": [1., 0., 0.], "column_direction": [0., 1., 0.], "normal": [0., 0., 1.], "pixel_spacing_mm": [1., 1.], "slice_thickness_mm": 4., "image_shape": [1, 4, 5]}},
+        {"view": "SAX", "slice_id": "b", "stack_file": "mean_stack_SAX.nii.gz", "stack_index": 1, "geometry": {"center_mm": [0., 0., 4.], "row_direction": [1., 0., 0.], "column_direction": [0., 1., 0.], "normal": [0., 0., 1.], "pixel_spacing_mm": [1., 1.], "slice_thickness_mm": 4., "image_shape": [1, 4, 5]}},
+    ]}))
+    slices = tmp_path / "slices"; slices.mkdir()
+    for index, x in enumerate((10., 20.)):
+        affine = np.eye(4); affine[:3, 3] = [-(x + 2.), 0., 0.]  # RAS origin; slice centre maps to LPS +x.
+        nib.save(nib.Nifti1Image(np.zeros((5, 4, 1), dtype=np.float32), affine), slices / f"{index}.nii.gz")
+    pose_map = build_corrected_pose_map(mean_manifest, slices)
+    frames = [_observation(slice_id="a", timestamp=2., value=3.), _observation(slice_id="a", timestamp=1., value=4.), _observation(slice_id="b", timestamp=0., value=5.)]
+    corrected = apply_corrected_static_poses(list(reversed(frames)), pose_map)
+    assert [item.slice_id for item in corrected] == ["a", "a", "b"]
+    assert [item.timestamp_s for item in corrected] == [1., 2., 0.]
+    assert [float(item.center_mm[0]) for item in corrected] == [10., 10., 20.]
+    assert [float(item.image.mean()) for item in corrected] == [4., 3., 5.]
+    with pytest.raises(ValueError, match="missing"):
+        apply_corrected_static_poses(frames, {("SAX", "a"): pose_map[("SAX", "a")]})
+
+
+def test_diagnostic_rng_is_repeatable_and_does_not_perturb_training_rng() -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import diagnostic_rng_context
+
+    torch.manual_seed(99); before = torch.get_rng_state().clone()
+    with diagnostic_rng_context(): first = torch.rand(4)
+    assert torch.equal(torch.get_rng_state(), before)
+    with diagnostic_rng_context(): second = torch.rand(4)
+    torch.testing.assert_close(first, second)

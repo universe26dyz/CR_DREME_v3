@@ -25,7 +25,7 @@ def main() -> None:
     config = yaml.safe_load(args.experiment_config.read_text()); domain = json.loads(args.canonical_domain.read_text())
     model = build_source_first_model(config, domain, n_dynamic_frames=1, device=torch.device("cpu"))
     payload = torch.load(args.static_model, map_location="cpu", weights_only=False)
-    strict_canonical_state_from_static_checkpoint(payload, model.canonical.inr.state_dict())
+    strict_canonical_state_from_static_checkpoint(payload, model.canonical.inr.state_dict(), dynamic_bounds_world_mm=torch.stack((model.canonical_lower_world_mm, model.canonical_upper_world_mm)), expected_architecture=model.canonical.args)
     args.output.write_text(json.dumps(canonical_init_provenance(args.static_model, mode="direct_exact_state"), indent=2) + "\n")
     print(args.output)
 
