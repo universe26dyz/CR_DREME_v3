@@ -1,0 +1,8 @@
+# CPU-only smoke override; this file is intentionally distinct from the formal protocol.
+experiment: respiratory_s2vdreme_reference_v1_smoke
+extends: respiratory_s2vdreme_reference_v1.yaml
+static_reference:
+  nesvor: {formal_iterations: 2, formal_samples: 8, smoke_iterations: 2, smoke_samples: 8}
+training:
+  observations_per_update: 32
+  smoke_steps_per_segment: 1

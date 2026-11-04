@@ -12,6 +12,7 @@ from cardioresp4d.adapters.sinr_mbc import CardiacSINRMBCAdapter, RespiratorySIN
 from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField, SequentialPullbackMotion
 from cardioresp4d.models.film_motion_encoder import GeometryFiLMMotionEncoder
 from cardioresp4d.models.s2v_style_motion_encoder import S2VStyleSingleFrameFiLMEncoder
+from cardioresp4d.models.s2vdreme_reference_encoder import S2VDREMEReferenceSingleFrameFiLMEncoder
 from .sampler import DynamicObservation
 from .stage_contract import stage_contract
 
@@ -35,6 +36,8 @@ class SourceFirstDynamicModel(nn.Module):
             self.film_encoder = GeometryFiLMMotionEncoder(channels=motion_hidden_dim if film_channels is None else film_channels, canonical_lower_world_mm=lower_world_mm, canonical_upper_world_mm=upper_world_mm, position_bands=film_position_bands)
         elif film_implementation == "s2v_style_single_frame":
             self.film_encoder = S2VStyleSingleFrameFiLMEncoder(position_bands=film_position_bands, view_embedding_dim=film_view_embedding_dim, condition_dim=film_condition_dim, block_channels=film_block_channels, block_strides=film_block_strides)
+        elif film_implementation == "s2vdreme_reference_8layer":
+            self.film_encoder = S2VDREMEReferenceSingleFrameFiLMEncoder(position_bands=film_position_bands, view_embedding_dim=film_view_embedding_dim, condition_dim=film_condition_dim, block_channels=film_block_channels, block_strides=film_block_strides)
         else:
             raise ValueError(f"unsupported film implementation {film_implementation!r}")
         self.respiratory_mbc = RespiratorySINRMBCAdapter(lower_world_mm, upper_world_mm, grid_shapes=respiratory_grid_shapes, cps=respiratory_cps, hidden_dim=motion_hidden_dim)

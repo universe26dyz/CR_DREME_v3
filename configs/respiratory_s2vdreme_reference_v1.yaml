@@ -1,0 +1,25 @@
+# Isolated Experiment 1: static-NeSVoR initialization plus paper-style joint respiratory refinement.
+experiment: respiratory_s2vdreme_reference_v1
+model:
+  canonical: {implementation: nesvor_official, coarsest_resolution: 16, finest_resolution: 0.5, level_scale: 1.3819, features_per_level: 2, log2_hashmap_size: 19, latent_dim: 15, width: 64, depth: 1, spatial_scaling: 1.0}
+  psf: {implementation: nesvor_official, n_samples: 8}
+  film: {implementation: s2vdreme_reference_8layer, position_bands: 4, view_embedding_dim: 8, condition_dim: 64, block_channels: [32,32,64,64,64,64,64,64], block_strides: [1,1,2,1,2,1,2,1]}
+  uncertainty: {implementation: disabled, frame_embedding_dim: 8, width: 64, depth: 1}
+  respiratory_mbc: {implementation: sinr_official, logical_control_shapes: [[8,8,8],[12,12,12],[16,16,16]], cps: 2, hidden_dim: 64}
+  cardiac_mbc: {implementation: disabled_but_constructed_for_shared_renderer, local_box: true, logical_control_shape: [16,16,16], cps: 2, hidden_dim: 64, taper_mm: 4}
+training:
+  observations_per_update: 32
+  seed: 20260823
+  normalization: {mode: per_series}
+  image_regularization: {mode: dreme_tv_stable, delta: 1.0}
+  loss_weights: {image: 2.0e-6, mbc_normalization: 1.0e-2, smooth_resp: 1.0e-3}
+  optimizer: {canonical_lr: 1.0e-4, respiratory_encoder_lr: 5.0e-4, respiratory_mbc_lr: 5.0e-4}
+  schedule: [{level: 1, warm_steps: 200, joint_steps: 600}, {level: 2, warm_steps: 200, joint_steps: 600}, {level: 3, warm_steps: 200, joint_steps: 600}]
+  disabled: [pca_waveform, pca_warmup, hard_score_centering, per_location_dc_subtraction, zero_mean_score, groupwise_encoder, cardiac, uncertainty]
+  motion_regularization:
+    respiratory_evaluation_grid: {mode: fixed_physical_full_fov, shape: [16,16,16]}
+    cardiac_evaluation_grid: {mode: fixed_physical_cardiac_box, shape: [16,16,16]}
+static_reference:
+  mean_policy: qc_valid_per_location_exact_temporal_mean
+  canonical_initialization: direct_exact_state_or_static_volume_mse_warm_start
+  nesvor: {formal_iterations: 10000, formal_samples: 256, smoke_iterations: 2, smoke_samples: 8}
