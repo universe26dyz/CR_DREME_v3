@@ -13,10 +13,15 @@ from nesvor.inr.models import INR, NeSVoR  # noqa: E402
 
 
 def detect_checkpoint_encoding_backend(state_dict: dict[str, torch.Tensor]) -> str:
-    """Identify legacy schema-1 encoding layout without converting weights."""
+    """Identify a dynamic or raw NeSVoR INR encoding layout without conversion."""
     keys = set(state_dict)
-    tinycudann = "canonical.inr.encoding.params" in keys
-    torch_hash = "canonical.inr.encoding.box_offsets" in keys or any(key.startswith("canonical.inr.encoding.embeddings.") for key in keys)
+    prefixes = ("canonical.inr.", "")
+    tinycudann = any(f"{prefix}encoding.params" in keys for prefix in prefixes)
+    torch_hash = any(
+        f"{prefix}encoding.box_offsets" in keys
+        or any(key.startswith(f"{prefix}encoding.embeddings.") for key in keys)
+        for prefix in prefixes
+    )
     if tinycudann and torch_hash:
         raise ValueError("ambiguous checkpoint canonical encoding backend")
     if tinycudann:
@@ -24,6 +29,11 @@ def detect_checkpoint_encoding_backend(state_dict: dict[str, torch.Tensor]) -> s
     if torch_hash:
         return "torch_hash"
     raise ValueError("cannot determine checkpoint canonical encoding backend")
+
+
+def lps_to_ras_world_matrix(*, dtype: torch.dtype = torch.float32, device: torch.device | None = None) -> torch.Tensor:
+    """Return the fixed, translation-free DICOM-LPS → NIfTI-RAS coordinate map."""
+    return torch.diag(torch.tensor([-1., -1., 1.], dtype=dtype, device=device))
 
 
 @contextmanager
@@ -44,10 +54,16 @@ def _upstream_encoding_backend(backend: str):
 class NeSVoRCanonicalAdapter(nn.Module):
     """Directly wraps upstream ``INR``; NeSVoR normalises world-mm bounds itself."""
 
-    def __init__(self, bounds_world_mm: torch.Tensor, *, coarsest_resolution: float = 8., finest_resolution: float = 1., level_scale: float = 1.5, n_features_per_level: int = 2, log2_hashmap_size: int = 19, n_features_z: int = 16, width: int = 64, depth: int = 2, spatial_scaling: float = 1., encoding_backend: str | None = None) -> None:
+    def __init__(self, bounds_world_mm: torch.Tensor, *, coarsest_resolution: float = 8., finest_resolution: float = 1., level_scale: float = 1.5, n_features_per_level: int = 2, log2_hashmap_size: int = 19, n_features_z: int = 16, width: int = 64, depth: int = 2, spatial_scaling: float = 1., encoding_backend: str | None = None, input_world_to_internal: torch.Tensor | None = None) -> None:
         super().__init__()
         if bounds_world_mm.shape != (2, 3) or not torch.isfinite(bounds_world_mm).all() or torch.any(bounds_world_mm[1] <= bounds_world_mm[0]):
             raise ValueError("bounds_world_mm must be finite [2,3] lower/upper bounds")
+        transform = torch.eye(3, dtype=torch.float32) if input_world_to_internal is None else torch.as_tensor(input_world_to_internal, dtype=torch.float32)
+        if transform.shape != (3, 3) or not torch.isfinite(transform).all() or abs(float(torch.linalg.det(transform))) < 1e-8:
+            raise ValueError("input_world_to_internal must be a finite invertible [3,3] transform")
+        # Runtime frame metadata is intentionally not checkpoint state; Exp1 resume
+        # binds it explicitly through protocol provenance instead.
+        self.register_buffer("input_world_to_internal", transform, persistent=False)
         self.args = Namespace(coarsest_resolution=coarsest_resolution, finest_resolution=finest_resolution, level_scale=level_scale, n_features_per_level=n_features_per_level, log2_hashmap_size=log2_hashmap_size, n_features_z=n_features_z, width=width, depth=depth, dtype=torch.float32, img_reg_autodiff=False)
         self.encoding_backend = ("torch_hash" if nesvor_models.USE_TORCH else "tinycudann") if encoding_backend is None else encoding_backend
         # Source-first resume needs the checkpoint's exact upstream encoding
@@ -56,13 +72,17 @@ class NeSVoRCanonicalAdapter(nn.Module):
             self.inr = INR(bounds_world_mm.detach().clone().to(dtype=torch.float32), self.args, spatial_scaling)
         self.spatial_scaling = float(spatial_scaling)
 
+    def world_to_internal(self, points_world_mm: torch.Tensor) -> torch.Tensor:
+        """Map external canonical coordinates to the upstream INR's fixed frame."""
+        return torch.matmul(points_world_mm, self.input_world_to_internal.to(points_world_mm).transpose(0, 1))
+
     def forward(self, points_world_mm: torch.Tensor, return_features: bool = False):
         if points_world_mm.shape[-1] != 3 or not torch.isfinite(points_world_mm).all():
             raise ValueError("points_world_mm must be finite and end in xyz millimetres")
         # The pinned INR uses ``view`` internally; DICOM PSF/motion broadcasting
         # can produce a valid non-contiguous tensor, so the adapter materializes
         # only layout (not coordinates or INR math) at this interface.
-        result = self.inr(points_world_mm.contiguous())
+        result = self.inr(self.world_to_internal(points_world_mm).contiguous())
         if self.inr.training:
             density, _encoding, latent_z = result
             # NeSVoR's sigma_net concatenates its slice embedding with z[...,1:],
@@ -80,9 +100,9 @@ class NeSVoRCanonicalAdapter(nn.Module):
         if mode not in {"edge", "TV", "L2", "none", "dreme_tv_stable"} or delta <= 0:
             raise ValueError("invalid official NeSVoR image regularization mode or delta")
         if mode == "dreme_tv_stable":
-            xyz = sample_points_world_mm * self.spatial_scaling
+            xyz = self.world_to_internal(sample_points_world_mm) * self.spatial_scaling
             d_density = density - torch.flip(density, (1,))
             dx2 = ((xyz - torch.flip(xyz, (1,))) ** 2).sum(-1) + 1e-6
             return (d_density.abs() / dx2.sqrt()).mean()
         context = Namespace(args=Namespace(image_regularization=mode, img_reg_autodiff=False), inr=self.inr, spatial_scaling=self.spatial_scaling, delta=float(delta))
-        return NeSVoR.img_reg(context, density, sample_points_world_mm)
+        return NeSVoR.img_reg(context, density, self.world_to_internal(sample_points_world_mm))

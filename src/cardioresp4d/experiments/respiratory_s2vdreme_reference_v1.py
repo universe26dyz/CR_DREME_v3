@@ -18,6 +18,7 @@ import torch
 import nibabel as nib
 import numpy as np
 
+from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend, lps_to_ras_world_matrix
 from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField
 from cardioresp4d.training.respiratory_staged_vnext import respiratory_dvf_rms_metrics, respiratory_score_rms_metrics
 from cardioresp4d.training.sampler import DynamicObservation
@@ -234,7 +235,7 @@ def reference_dvf_diagnostics(dvfs_by_location: tuple[torch.Tensor, ...]) -> dic
     return metrics
 
 
-def strict_canonical_state_from_static_checkpoint(payload: Mapping[str, Any], expected: Mapping[str, torch.Tensor], *, dynamic_bounds_world_mm: torch.Tensor | None = None, expected_architecture: Any | None = None, tolerance_mm: float = 1e-5) -> dict[str, torch.Tensor]:
+def strict_canonical_state_from_static_checkpoint(payload: Mapping[str, Any], expected: Mapping[str, torch.Tensor], *, internal_bounds_world_mm: torch.Tensor | None = None, expected_architecture: Any | None = None, expected_encoding_backend: str | None = None, world_to_internal_transform: torch.Tensor | None = None, tolerance_mm: float = 1e-5) -> dict[str, torch.Tensor]:
     """Admit only a schema explicitly containing an exact INR state dictionary."""
     # Pinned NeSVoR 0.6.0rc1 writes ``{"model": inr.state_dict(), ...}``
     # in ``nesvor.cli.io.save_volume``.  ``inr_state_dict`` is accepted only
@@ -244,15 +245,21 @@ def strict_canonical_state_from_static_checkpoint(payload: Mapping[str, Any], ex
         raise ValueError("static checkpoint has no auditable inr_state_dict; use the volume-MSE warm start")
     if set(candidate) != set(expected) or any(not isinstance(candidate[key], torch.Tensor) or candidate[key].shape != expected[key].shape for key in expected):
         raise ValueError("static checkpoint INR state is not an exact canonical key/shape match")
-    if dynamic_bounds_world_mm is not None:
+    if internal_bounds_world_mm is not None:
         bbox = candidate.get("bounding_box")
-        if not isinstance(bbox, torch.Tensor) or bbox.shape != (2, 3) or not torch.allclose(bbox.detach().cpu(), dynamic_bounds_world_mm.detach().cpu(), atol=tolerance_mm, rtol=0.0):
-            raise ValueError("static checkpoint bounding_box does not match the dynamic canonical domain")
+        if not isinstance(bbox, torch.Tensor) or bbox.shape != (2, 3) or not torch.allclose(bbox.detach().cpu(), internal_bounds_world_mm.detach().cpu(), atol=tolerance_mm, rtol=0.0):
+            raise ValueError("static checkpoint bounding_box does not match the internal INR domain")
     if expected_architecture is not None:
         static_args = payload.get("args")
         for name in ("coarsest_resolution", "finest_resolution", "level_scale", "n_features_per_level", "log2_hashmap_size", "n_features_z", "width", "depth"):
             if static_args is None or not hasattr(static_args, name) or getattr(static_args, name) != getattr(expected_architecture, name):
                 raise ValueError(f"static checkpoint architecture does not match dynamic canonical: {name}")
+    if expected_encoding_backend is not None and detect_checkpoint_encoding_backend(dict(candidate)) != expected_encoding_backend:
+        raise ValueError("static checkpoint encoding backend does not match the constructed canonical INR")
+    if world_to_internal_transform is not None:
+        expected_bridge = lps_to_ras_world_matrix(dtype=world_to_internal_transform.dtype, device=world_to_internal_transform.device)
+        if world_to_internal_transform.shape != (3, 3) or not torch.equal(world_to_internal_transform, expected_bridge):
+            raise ValueError("static direct admission requires the fixed LPS-to-RAS coordinate bridge")
     return {key: candidate[key] for key in expected}
 
 
@@ -338,6 +345,34 @@ def corrected_pose_containment_audit(poses: Mapping[tuple[str, str], CorrectedSt
     return {"policy": "corrected_slice_corners", "tolerance_mm": tolerance_mm, "location_count": len(poses), "minimum_margin_to_boundary_mm": min_margin, "maximum_margin_to_boundary_mm": max_margin, "passed": True}
 
 
+def corrected_pose_internal_inr_containment_audit(poses: Mapping[tuple[str, str], CorrectedStaticPose | Mapping[str, Any]], *, internal_lower_world_mm: Sequence[float], internal_upper_world_mm: Sequence[float], world_to_internal_transform: torch.Tensor, tolerance_mm: float = 1e-5) -> dict[str, Any]:
+    """Fail closed when corrected LPS slice support exceeds inherited INR RAS support.
+
+    The tolerance is explicit because the NeSVoR corrected affine and saved INR
+    box are float32 artifacts; it is not a domain expansion.
+    """
+    lower, upper = np.asarray(internal_lower_world_mm, dtype=float), np.asarray(internal_upper_world_mm, dtype=float)
+    transform = np.asarray(torch.as_tensor(world_to_internal_transform, dtype=torch.float64).cpu(), dtype=float)
+    if lower.shape != (3,) or upper.shape != (3,) or transform.shape != (3, 3) or np.any(upper <= lower) or tolerance_mm < 0:
+        raise ValueError("internal INR containment bounds/transform/tolerance are invalid")
+    minimum_margin = math.inf
+    for (view, slice_id), value in sorted(poses.items()):
+        geometry = value.corrected_geometry if isinstance(value, CorrectedStaticPose) else value
+        _, height, width = geometry["image_shape"]
+        center, row, column = (np.asarray(geometry[key], dtype=float) for key in ("center_mm", "row_direction", "column_direction"))
+        spacing_row, spacing_column = geometry["pixel_spacing_mm"]
+        lps_corners = np.asarray([center + (u - (width - 1) / 2.) * spacing_column * row + (v - (height - 1) / 2.) * spacing_row * column for u in (0., width - 1.) for v in (0., height - 1.)])
+        ras_corners = lps_corners @ transform.T
+        below, above = lower - ras_corners.min(axis=0), ras_corners.max(axis=0) - upper
+        violation = np.maximum(np.maximum(below, above), 0.)
+        if np.any(violation > tolerance_mm):
+            raise ValueError(f"corrected pose outside static INR support for {view}/{slice_id}: corrected_lps_min={lps_corners.min(axis=0).tolist()} corrected_lps_max={lps_corners.max(axis=0).tolist()} converted_ras_min={ras_corners.min(axis=0).tolist()} converted_ras_max={ras_corners.max(axis=0).tolist()} static_inr_ras_min={lower.tolist()} static_inr_ras_max={upper.tolist()} violation_mm={violation.tolist()}")
+        minimum_margin = min(minimum_margin, float(np.minimum(ras_corners - lower, upper - ras_corners).min()))
+    if not poses:
+        raise ValueError("internal INR containment requires at least one location")
+    return {"policy": "corrected_slice_corners_lps_to_ras", "tolerance_mm": tolerance_mm, "location_count": len(poses), "minimum_margin_to_boundary_mm": minimum_margin, "passed": True}
+
+
 def write_static_reference_manifest(*, output_dir: str | Path, source_manifest: str | Path, qc_table: str | Path, mean_slice_manifest: str | Path, command: Sequence[str], executable: str, version: str, mode: str) -> Path:
     """Close the static artifact/provenance chain after NeSVoR has completed."""
     output = Path(output_dir); mean_path = Path(mean_slice_manifest)
@@ -372,7 +407,7 @@ def load_corrected_pose_map(path: str | Path) -> dict[tuple[str, str], Corrected
 
 
 def canonical_init_provenance(static_model_path: str | Path, *, mode: str) -> dict[str, str]:
-    if mode not in {"direct_exact_state", "static_volume_mse_warm_start"}:
+    if mode not in {"direct_exact_state", "direct_exact_state_with_coordinate_bridge", "static_volume_mse_warm_start"}:
         raise ValueError("unknown canonical initialization mode")
     path = Path(static_model_path)
     return {"mode": mode, "static_model_path": str(path), "static_model_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}

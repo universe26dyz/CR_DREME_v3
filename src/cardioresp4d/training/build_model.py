@@ -24,7 +24,7 @@ def uses_s2v_style_film(config: Mapping[str, Any]) -> bool:
     return str(config.get("model", {}).get("film", {}).get("implementation", "full_geometry_single_film")) in {"s2v_style_single_frame", "s2vdreme_reference_8layer"}
 
 
-def build_source_first_model(config: Mapping[str, Any], domain: Mapping[str, Any], *, n_dynamic_frames: int, device: torch.device, canonical_encoding_backend: str | None = None) -> SourceFirstDynamicModel:
+def build_source_first_model(config: Mapping[str, Any], domain: Mapping[str, Any], *, n_dynamic_frames: int, device: torch.device, canonical_encoding_backend: str | None = None, canonical_internal_bounds_world_mm: torch.Tensor | None = None, canonical_world_to_internal_transform: torch.Tensor | None = None) -> SourceFirstDynamicModel:
     """Construct every formal source-backed object from the validated config."""
     model = config["model"]
     canonical = model["canonical"]
@@ -55,6 +55,8 @@ def build_source_first_model(config: Mapping[str, Any], domain: Mapping[str, Any
         inr_depth=int(canonical["depth"]),
         canonical_spatial_scaling=float(canonical.get("spatial_scaling", 1.)),
         canonical_encoding_backend=canonical_encoding_backend,
+        canonical_internal_bounds_world_mm=canonical_internal_bounds_world_mm,
+        canonical_world_to_internal_transform=canonical_world_to_internal_transform,
         motion_hidden_dim=int(respiratory["hidden_dim"]),
         respiratory_grid_shapes=tuple(_triple(shape, "model.respiratory_mbc.logical_control_shapes") for shape in respiratory["logical_control_shapes"]),
         respiratory_cps=_triple(respiratory["cps"], "model.respiratory_mbc.cps") if isinstance(respiratory["cps"], (list, tuple)) else int(respiratory["cps"]),
@@ -91,7 +93,7 @@ def effective_model_config(model: SourceFirstDynamicModel) -> dict[str, Any]:
             "respiratory_siren": f"{type(resp.levels[0].siren).__module__}.{type(resp.levels[0].siren).__name__}",
             "cardiac_ffd": f"{type(cardiac.basis.ffd).__module__}.{type(cardiac.basis.ffd).__name__}",
         },
-        "canonical": {**{key: getattr(canonical, key) for key in ("coarsest_resolution", "finest_resolution", "level_scale", "n_features_per_level", "log2_hashmap_size", "n_features_z", "width", "depth")}, "encoding_backend": model.canonical.encoding_backend},
+        "canonical": {**{key: getattr(canonical, key) for key in ("coarsest_resolution", "finest_resolution", "level_scale", "n_features_per_level", "log2_hashmap_size", "n_features_z", "width", "depth")}, "encoding_backend": model.canonical.encoding_backend, "external_world_bounds_mm": torch.stack((model.canonical_lower_world_mm, model.canonical_upper_world_mm)).detach().cpu().tolist(), "internal_inr_bounds_mm": model.canonical.inr.bounding_box.detach().cpu().tolist(), "world_to_internal_matrix": model.canonical.input_world_to_internal.detach().cpu().tolist()},
         "psf": {"n_samples": model.psf.n_samples},
         "respiratory_mbc": {"logical_control_shapes": [list(level.logical_control_shape) for level in resp.levels], "cps": list(resp.levels[0].cps), "dense_evaluation_shapes": [list(level.dense_evaluation_shape) for level in resp.levels], "padded_control_shapes": [list(level.padded_control_shape) for level in resp.levels], "grid_spacing_mm": [level.grid_spacing_mm.detach().cpu().tolist() for level in resp.levels]},
         "cardiac_mbc": {"logical_control_shape": list(cardiac.basis.logical_control_shape), "cps": list(cardiac.basis.cps), "dense_evaluation_shape": list(cardiac.basis.dense_evaluation_shape), "padded_control_shape": list(cardiac.basis.padded_control_shape), "taper_mm": cardiac.taper_mm},

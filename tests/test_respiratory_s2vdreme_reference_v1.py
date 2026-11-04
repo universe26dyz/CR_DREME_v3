@@ -161,10 +161,62 @@ def test_static_state_admission_rejects_shifted_bbox_despite_matching_shapes() -
     from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import strict_canonical_state_from_static_checkpoint
 
     expected = {"bounding_box": torch.tensor([[-1., -1., -1.], [1., 1., 1.]]), "a": torch.ones(2)}
-    accepted = strict_canonical_state_from_static_checkpoint({"model": {"bounding_box": expected["bounding_box"].clone(), "a": torch.ones(2)}}, expected, dynamic_bounds_world_mm=expected["bounding_box"])
+    accepted = strict_canonical_state_from_static_checkpoint({"model": {"bounding_box": expected["bounding_box"].clone(), "a": torch.ones(2)}}, expected, internal_bounds_world_mm=expected["bounding_box"])
     torch.testing.assert_close(accepted["bounding_box"], expected["bounding_box"])
     with pytest.raises(ValueError, match="bounding_box"):
-        strict_canonical_state_from_static_checkpoint({"model": {"bounding_box": expected["bounding_box"] + 1., "a": torch.ones(2)}}, expected, dynamic_bounds_world_mm=expected["bounding_box"])
+        strict_canonical_state_from_static_checkpoint({"model": {"bounding_box": expected["bounding_box"] + 1., "a": torch.ones(2)}}, expected, internal_bounds_world_mm=expected["bounding_box"])
+
+
+def test_static_inr_lps_ras_bridge_is_exact_and_differentiable() -> None:
+    from cardioresp4d.adapters.nesvor_inr import NeSVoRCanonicalAdapter, lps_to_ras_world_matrix
+
+    bounds = torch.tensor([[-4., -5., -6.], [4., 5., 6.]])
+    bridge = NeSVoRCanonicalAdapter(bounds, width=8, depth=1, n_features_z=4, finest_resolution=4., encoding_backend="torch_hash", input_world_to_internal=lps_to_ras_world_matrix())
+    bridge.train()
+    points_lps = torch.tensor([[1.5, -2.0, 3.0], [-1.0, 2.5, -4.0]], requires_grad=True)
+    points_ras = torch.tensor([[-1.5, 2.0, 3.0], [1.0, -2.5, -4.0]])
+    expected, _, _ = bridge.inr(points_ras)
+    actual = bridge(points_lps)
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    assert points_lps.grad is not None and torch.isfinite(points_lps.grad).all() and points_lps.grad.abs().sum() > 0
+    torch.testing.assert_close(bridge.world_to_internal(points_lps.detach()), points_ras)
+
+
+def test_static_inr_bridge_keeps_external_motion_bounds_separate() -> None:
+    from cardioresp4d.adapters.nesvor_inr import lps_to_ras_world_matrix
+    from cardioresp4d.training.build_model import build_source_first_model
+
+    root = __import__("pathlib").Path(__file__).resolve().parents[1]
+    config = yaml.safe_load((root / "configs" / "respiratory_s2vdreme_reference_v1.yaml").read_text())
+    domain = {"world_min_mm": [-10., -9., -8.], "world_max_mm": [10., 9., 8.], "cardiac_box": {"min_mm": [-2., -2., -2.], "max_mm": [2., 2., 2.]}}
+    internal = torch.tensor([[-7., -6., -5.], [7., 6., 5.]])
+    model = build_source_first_model(config, domain, n_dynamic_frames=1, device=torch.device("cpu"), canonical_internal_bounds_world_mm=internal, canonical_world_to_internal_transform=lps_to_ras_world_matrix())
+    torch.testing.assert_close(model.canonical_lower_world_mm, torch.tensor(domain["world_min_mm"]))
+    torch.testing.assert_close(model.canonical_upper_world_mm, torch.tensor(domain["world_max_mm"]))
+    torch.testing.assert_close(model.canonical.inr.bounding_box, internal)
+    torch.testing.assert_close(model.canonical.world_to_internal(torch.tensor([[1., 2., 3.]])), torch.tensor([[-1., -2., 3.]]))
+
+
+def test_raw_static_encoding_backend_detection_is_strict() -> None:
+    from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend
+
+    assert detect_checkpoint_encoding_backend({"encoding.params": torch.zeros(1)}) == "tinycudann"
+    assert detect_checkpoint_encoding_backend({"encoding.box_offsets": torch.zeros(1)}) == "torch_hash"
+    with pytest.raises(ValueError, match="ambiguous"):
+        detect_checkpoint_encoding_backend({"encoding.params": torch.zeros(1), "encoding.box_offsets": torch.zeros(1)})
+
+
+def test_static_state_admission_uses_internal_bbox_and_fixed_lps_ras_bridge() -> None:
+    from cardioresp4d.adapters.nesvor_inr import lps_to_ras_world_matrix
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import strict_canonical_state_from_static_checkpoint
+
+    internal = torch.tensor([[-5., -4., -3.], [5., 4., 3.]])
+    expected = {"bounding_box": internal.clone(), "encoding.box_offsets": torch.zeros(1)}
+    admitted = strict_canonical_state_from_static_checkpoint({"model": {key: value.clone() for key, value in expected.items()}}, expected, internal_bounds_world_mm=internal, world_to_internal_transform=lps_to_ras_world_matrix(), expected_encoding_backend="torch_hash")
+    torch.testing.assert_close(admitted["bounding_box"], internal)
+    with pytest.raises(ValueError, match="coordinate bridge"):
+        strict_canonical_state_from_static_checkpoint({"model": {key: value.clone() for key, value in expected.items()}}, expected, internal_bounds_world_mm=internal, world_to_internal_transform=torch.eye(3), expected_encoding_backend="torch_hash")
 
 
 def test_corrected_pose_map_propagates_per_location_without_changing_frame_content(tmp_path) -> None:
@@ -219,6 +271,17 @@ def test_corrected_pose_containment_is_fail_closed_and_reports_margins() -> None
     outside = {("SAX", "a"): {**inside[("SAX", "a")], "center_mm": [5., 0., 0.]}}
     with pytest.raises(ValueError, match="SAX/a"):
         corrected_pose_containment_audit(outside, lower_world_mm=[-3., -3., -3.], upper_world_mm=[3., 3., 3.])
+
+
+def test_corrected_pose_internal_inr_containment_uses_lps_ras_corners() -> None:
+    from cardioresp4d.adapters.nesvor_inr import lps_to_ras_world_matrix
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import corrected_pose_internal_inr_containment_audit
+
+    pose = {("SAX", "a"): {"center_mm": [2., -1., 0.], "row_direction": [1., 0., 0.], "column_direction": [0., 1., 0.], "normal": [0., 0., 1.], "pixel_spacing_mm": [1., 1.], "slice_thickness_mm": 4., "image_shape": [1, 3, 3]}}
+    report = corrected_pose_internal_inr_containment_audit(pose, internal_lower_world_mm=[-4., -4., -1.], internal_upper_world_mm=[1., 3., 1.], world_to_internal_transform=lps_to_ras_world_matrix())
+    assert report["passed"]
+    with pytest.raises(ValueError, match="converted_ras"):
+        corrected_pose_internal_inr_containment_audit(pose, internal_lower_world_mm=[-1., -1., -1.], internal_upper_world_mm=[1., 1., 1.], world_to_internal_transform=lps_to_ras_world_matrix())
 
 
 def test_formal_and_smoke_fallback_policies_are_explicit_and_distinct() -> None:
