@@ -55,6 +55,18 @@ def validate_respiratory_staged_vnext_config(config: Mapping[str, Any]) -> None:
             raise ValueError(f"respiratory vNext requires fixed {key} learning rates")
 
 
+def multilevel_respiratory_pca_waveform_loss(respiratory_scores: torch.Tensor, waveform: torch.Tensor | None, *, ridge: float = 1e-4, min_frames: int = 8) -> dict[str, object]:
+    """Anchor each of the three MBC score levels to the same respiratory PC."""
+    if respiratory_scores.ndim != 3 or respiratory_scores.shape[1:] != (3, 3):
+        raise ValueError("respiratory PCA anchoring requires respiratory_scores [T,3,3]")
+    zero = respiratory_scores.sum() * 0.
+    if waveform is None:
+        return {"loss": zero, "r2": zero, "loss_by_level": (zero, zero, zero), "r2_by_level": (zero, zero, zero), "matched": False}
+    losses = tuple(respiratory_pca_waveform_subspace_loss(respiratory_scores[:, level, :], waveform, ridge=ridge, min_frames=min_frames) for level in range(3))
+    loss_by_level = tuple(item["loss"] for item in losses); r2_by_level = tuple(item["r2"] for item in losses)
+    return {"loss": torch.stack(loss_by_level).mean(), "r2": torch.stack(r2_by_level).mean(), "loss_by_level": loss_by_level, "r2_by_level": r2_by_level, "matched": True}
+
+
 def configure_respiratory_staged_segment(model, segment: RespiratoryStagedSegment, optimizer_config: Mapping[str, Mapping[str, float]]) -> torch.optim.Adam:
     """Apply one vNext ownership boundary and construct a fresh optimizer."""
     for parameter in model.parameters():
@@ -97,7 +109,8 @@ class RespiratoryStagedVNextRunner:
         optimizer = configure_respiratory_staged_segment(self.trainer.model, segment, self.trainer.optimizer_config)
         before = {name: parameter.detach().cpu().clone() for name, parameter in self.trainer.model.named_parameters()}
         stage = segment.stage; contract = stage_contract(stage); losses: list[float] = []
-        waveform_losses: list[float] = []; waveform_r2: list[float] = []
+        waveform_losses: list[list[float]] = [[], [], []]; waveform_r2: list[list[float]] = [[], [], []]
+        pca_matched_steps = 0; pca_skipped_steps = 0
         for step in range(1, segment.steps + 1):
             optimizer.zero_grad(set_to_none=True)
             total = next(self.trainer.model.parameters()).sum() * 0.
@@ -116,13 +129,15 @@ class RespiratoryStagedVNextRunner:
                     raise ValueError("respiratory vNext PCA segments require reliable respiratory PCA provenance")
                 timestamps = torch.tensor([item.timestamp_s for item in sequence], device=sequence[0].image.device, dtype=torch.float64)
                 matched = self.prior.match(sequence[0].view, sequence[0].slice_id, timestamps, device=sequence[0].image.device, dtype=sequence[0].image.dtype)
-                if matched is None:
-                    raise ValueError("respiratory vNext PCA segment has no reliable local respiratory selected-PC")
-                scores = torch.cat([self.trainer.model.encode_motion_scores(item)["resp_scores"][:, 0, :] for item in sequence], 0)
-                waveform = respiratory_pca_waveform_subspace_loss(scores, matched.waveform, ridge=self.trainer.pca_waveform_ridge, min_frames=self.trainer.pca_waveform_min_frames)
+                scores = torch.cat([self.trainer.model.encode_motion_scores(item)["resp_scores"] for item in sequence], 0)
+                waveform = multilevel_respiratory_pca_waveform_loss(scores, None if matched is None else matched.waveform, ridge=self.trainer.pca_waveform_ridge, min_frames=self.trainer.pca_waveform_min_frames)
                 total = total + float(self.loss_weights["respiratory_pca_waveform"]) * waveform["loss"]
-                waveform_losses.append(float(waveform["loss"].detach()))
-                waveform_r2.append(float(waveform["r2"].detach()))
+                if waveform["matched"]:
+                    pca_matched_steps += 1
+                    for level, value in enumerate(waveform["loss_by_level"]): waveform_losses[level].append(float(value.detach()))
+                    for level, value in enumerate(waveform["r2_by_level"]): waveform_r2[level].append(float(value.detach()))
+                else:
+                    pca_skipped_steps += 1
             total.backward()
             frozen = [name for name, parameter in self.trainer.model.named_parameters() if not parameter.requires_grad and parameter.grad is not None]
             if frozen:
@@ -135,8 +150,10 @@ class RespiratoryStagedVNextRunner:
         if unexpected:
             raise RuntimeError("respiratory vNext ownership audit failed: " + ", ".join(unexpected))
         report = {"stage": stage, "segment": segment.name, "global_step": self.global_step, "segment_step": segment.steps, "trainable_modules": sorted(segment.owners), "learning_rates": [group["lr"] for group in optimizer.param_groups], "loss_last": losses[-1], "loss_mean": sum(losses) / len(losses), "unexpected_parameter_changes": unexpected}
-        if waveform_losses:
-            report.update({"respiratory_pca_loss_last": waveform_losses[-1], "respiratory_pca_loss_mean": sum(waveform_losses) / len(waveform_losses), "respiratory_pca_r2_last": waveform_r2[-1], "respiratory_pca_r2_mean": sum(waveform_r2) / len(waveform_r2), **self._score_diagnostics(segment.active_respiratory_levels)})
+        if segment.respiratory_pca:
+            level_losses = [None if not values else sum(values) / len(values) for values in waveform_losses]
+            level_r2 = [None if not values else sum(values) / len(values) for values in waveform_r2]
+            report.update({"respiratory_pca_matched_steps": pca_matched_steps, "respiratory_pca_skipped_steps": pca_skipped_steps, **{f"respiratory_pca_loss_level{level}": level_losses[level] for level in range(3)}, **{f"respiratory_pca_r2_level{level}": level_r2[level] for level in range(3)}, "respiratory_pca_loss_mean": None if not pca_matched_steps else sum(value for value in level_losses if value is not None) / 3, "respiratory_pca_r2_mean": None if not pca_matched_steps else sum(value for value in level_r2 if value is not None) / 3, "respiratory_pca_loss_last": None if not pca_matched_steps else sum(values[-1] for values in waveform_losses) / 3, "respiratory_pca_r2_last": None if not pca_matched_steps else sum(values[-1] for values in waveform_r2) / 3, **self._score_diagnostics(3)})
         if segment.name.startswith(("resp_mbc_bootstrap", "resp_score_refine", "resp_canonical_refine")):
             report.update(self._dvf_diagnostics(stage))
         self.last_optimizer_state = optimizer.state_dict()

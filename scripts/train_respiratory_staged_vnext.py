@@ -67,6 +67,9 @@ def resume_next_segment_index(checkpoint: Mapping[str, Any], segments, provenanc
     completed = state.get("completed")
     if not isinstance(completed, list) or not completed:
         raise ValueError("--resume must be a completed respiratory vNext segment boundary")
+    for index, item in enumerate(completed):
+        if index >= len(segments) or item.get("segment") != segments[index].name:
+            raise ValueError("--resume completed schedule is not a respiratory vNext prefix")
     index = len(completed) - 1
     if index >= len(segments) or completed[index].get("segment") != segments[index].name:
         raise ValueError("--resume completed schedule is not a respiratory vNext prefix")
@@ -110,6 +113,8 @@ def main() -> None:
     if checkpoint is not None: model.load_state_dict(checkpoint["model"])
     frequency_prior = load_training_frequency_prior(bands_path, allow_template_fallback=False)
     respiratory_pca_prior = PCAWaveformPrior.load(bands_path, component="respiratory", strict=True)
+    if not respiratory_pca_prior.locations:
+        raise ValueError("respiratory vNext requires at least one reliable respiratory selected-PC location")
     temporal = config["training"]["temporal_auxiliary"]
     trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(observations, seed=args.seed), pixel_samples=args.pixel_samples, observations_per_update=int(config["training"]["observations_per_update"]), optimizer_config=config["training"]["optimizer"], loss_weights=config["training"]["loss_weights"], frequency_prior=frequency_prior, pca_waveform_prior=respiratory_pca_prior, pca_waveform_ridge=float(temporal.get("pca_waveform_ridge", 1e-4)), pca_waveform_min_frames=int(temporal.get("pca_waveform_min_frames", 8)), temporal_every=int(temporal["every_steps"]), temporal_batch_size=int(temporal["max_frames"]), cardiac_sampling_fraction=float(config["training"]["cardiac_sampling_fraction"]))
     runner = RespiratoryStagedVNextRunner(trainer, respiratory_pca_waveform_prior=respiratory_pca_prior, loss_weights=config["training"]["loss_weights"])

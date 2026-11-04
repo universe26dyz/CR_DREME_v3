@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -58,6 +59,47 @@ def test_respiratory_pca_loss_has_no_mbc_or_canonical_gradient() -> None:
     assert frozen.grad is None
 
 
+def test_multilevel_respiratory_pca_loss_is_the_mean_of_three_independent_levels() -> None:
+    from cardioresp4d.losses.motion_loss import respiratory_pca_waveform_subspace_loss
+    from cardioresp4d.training.respiratory_staged_vnext import multilevel_respiratory_pca_waveform_loss
+    torch.manual_seed(0)
+    target = torch.sin(torch.linspace(0., 3.14, 12))
+    scores = torch.stack((torch.stack((target, target.square(), target.cos()), -1), torch.stack((target.cos(), target, target.square()), -1), torch.randn(12, 3)), 1)
+    result = multilevel_respiratory_pca_waveform_loss(scores, target)
+    per_level = [respiratory_pca_waveform_subspace_loss(scores[:, level, :], target)["loss"] for level in range(3)]
+    torch.testing.assert_close(result["loss"], torch.stack(per_level).mean())
+    assert not torch.isclose(result["loss"], per_level[0])
+    assert len(result["loss_by_level"]) == 3
+
+
+def test_missing_respiratory_pca_match_is_a_differentiable_skip_without_fallback() -> None:
+    from cardioresp4d.training.respiratory_staged_vnext import multilevel_respiratory_pca_waveform_loss
+    scores = torch.randn(8, 3, 3, requires_grad=True)
+    result = multilevel_respiratory_pca_waveform_loss(scores, None)
+    assert result["matched"] is False
+    assert result["loss"].requires_grad
+    result["loss"].backward()
+    assert scores.grad is not None and torch.equal(scores.grad, torch.zeros_like(scores.grad))
+
+
+def test_phase_b_missing_local_pca_match_skips_and_records_counter() -> None:
+    from cardioresp4d.training.model import SourceFirstDynamicModel
+    from cardioresp4d.training.respiratory_staged_vnext import RespiratoryStagedVNextRunner
+    from cardioresp4d.training.sampler import DynamicObservation, ViewLocationBalancedSampler
+    from cardioresp4d.training.trainer import UnifiedProgressiveTrainer
+    class MissingLocalRespiratoryPCA:
+        def match(self, *args, **kwargs):
+            return None
+    rows = [DynamicObservation(torch.rand(1, 4, 4), view, "s", index, torch.zeros(3), torch.tensor([1., 0., 0.]), torch.tensor([0., 1., 0.]), torch.tensor([0., 0., 1.]), torch.ones(2), 4., True, "valid", float(frame)) for index, (view, frame) in enumerate((view, frame) for view in ("SAX", "2CH", "4CH") for frame in range(3))]
+    model = SourceFirstDynamicModel(torch.tensor([-2., -2., -2.]), torch.tensor([2., 2., 2.]), cardiac_lower_world_mm=torch.tensor([-1., -1., -1.]), cardiac_upper_world_mm=torch.tensor([1., 1., 1.]), n_dynamic_frames=9, inr_width=8, inr_depth=1, latent_dim=4, motion_hidden_dim=8, respiratory_grid_shapes=((4, 4, 4),) * 3, cardiac_grid_shape=(4, 4, 4), psf_samples=1)
+    trainer = UnifiedProgressiveTrainer(model, ViewLocationBalancedSampler(rows), pixel_samples=1, optimizer_config={"resp_score": {"film_lr": 5e-4}})
+    runner = RespiratoryStagedVNextRunner(trainer, respiratory_pca_waveform_prior=MissingLocalRespiratoryPCA(), loss_weights={"respiratory_pca_waveform": 1e-3})
+    segment = replace(next(item for item in respiratory_staged_vnext_segments() if item.name == "resp_pca_warmup"), steps=1)
+    report = runner.run_segment(segment)
+    assert report["respiratory_pca_matched_steps"] == 0
+    assert report["respiratory_pca_skipped_steps"] == 1
+
+
 def test_phase_b_pca_only_backward_has_gradients_only_on_respiratory_encoder() -> None:
     """The formal B auxiliary reaches every intended score-encoder branch only."""
     from cardioresp4d.training.model import SourceFirstDynamicModel
@@ -70,8 +112,13 @@ def test_phase_b_pca_only_backward_has_gradients_only_on_respiratory_encoder() -
     scores = []
     for index in range(8):
         observation = DynamicObservation(torch.rand(1, 4, 4), "SAX", "s", index, torch.tensor([float(index), 0., 0.]), torch.tensor([1., 0., 0.]), torch.tensor([0., 1., 0.]), torch.tensor([0., 0., 1.]), torch.ones(2), 4., True, "valid", float(index))
-        scores.append(model.encode_motion_scores(observation)["resp_scores"][:, :1])
-    respiratory_pca_waveform_subspace_loss(torch.cat(scores), torch.linspace(-1., 1., 8))["loss"].backward()
+        scores.append(model.encode_motion_scores(observation)["resp_scores"])
+    scores = torch.cat(scores); scores.retain_grad()
+    from cardioresp4d.training.respiratory_staged_vnext import multilevel_respiratory_pca_waveform_loss
+    multilevel_respiratory_pca_waveform_loss(scores, torch.linspace(-1., 1., 8))["loss"].backward()
+    assert scores.grad is not None
+    for level in range(3):
+        assert torch.isfinite(scores.grad[:, level]).all() and bool(scores.grad[:, level].abs().sum() > 0)
     expected = ("film_encoder.image.", "film_encoder.geometry_mlp.", "film_encoder.head.", "film_encoder.resp.")
     for prefix in expected:
         gradients = [parameter.grad for name, parameter in model.named_parameters() if name.startswith(prefix)]

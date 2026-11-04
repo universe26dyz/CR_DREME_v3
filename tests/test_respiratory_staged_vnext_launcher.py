@@ -41,3 +41,11 @@ def test_resume_only_accepts_completed_segment_boundaries_and_matching_provenanc
     checkpoint["runner_state"]["segment_step"] = segments[0].steps
     with pytest.raises(ValueError, match="provenance"):
         resume_next_segment_index(checkpoint, segments, {**provenance, "manifest": "different"})
+
+
+def test_resume_rejects_a_completed_schedule_with_a_wrong_earlier_segment() -> None:
+    segments = respiratory_staged_vnext_segments()
+    provenance = {"effective_config": "abc", "manifest": "m", "respiratory_pca": "p"}
+    checkpoint = {"checkpoint_schema": 1, "provenance": provenance, "runner_state": {"completed": [{"segment": "wrong", "segment_step": segments[0].steps}, {"segment": segments[1].name, "segment_step": segments[1].steps}], "global_step": segments[0].steps + segments[1].steps, "current_segment": segments[1].name, "segment_step": segments[1].steps}}
+    with pytest.raises(ValueError, match="schedule"):
+        resume_next_segment_index(checkpoint, segments, provenance)
