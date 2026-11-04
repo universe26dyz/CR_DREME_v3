@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import torch
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -46,7 +47,7 @@ def test_vnext_schedule_has_fixed_non_joint_ownership_and_budget() -> None:
 
 
 def test_vnext_config_requires_distinct_respiratory_pca_weight_and_fixed_lrs() -> None:
-    config = {"training": {"loss_weights": {"respiratory_pca_waveform": 1e-3}, "optimizer": {"resp_a1": {"canonical_lr": 2e-4}, "resp_a2": {"canonical_lr": 5e-5}, "resp_score": {"film_lr": 5e-4}, "resp_mbc": {"respiratory_mbc_lr": 5e-4}, "resp_e": {"canonical_lr": 5e-5}}}}
+    config = {"training": {"loss_weights": {"zero_mean_score": 1e-2, "respiratory_pca_waveform": 1e-3}, "optimizer": {"resp_a1": {"canonical_lr": 2e-4}, "resp_a2": {"canonical_lr": 5e-5}, "resp_score": {"film_lr": 5e-4}, "resp_mbc": {"respiratory_mbc_lr": 5e-4}, "resp_e": {"canonical_lr": 5e-5}}}}
     validate_respiratory_staged_vnext_config(config)
     config["training"]["loss_weights"]["respiratory_pca_waveform"] = 0.
     try:
@@ -55,6 +56,32 @@ def test_vnext_config_requires_distinct_respiratory_pca_weight_and_fixed_lrs() -
         pass
     else:
         raise AssertionError("respiratory PCA weight must be required")
+    config["training"]["loss_weights"].update({"respiratory_pca_waveform": 1e-3, "zero_mean_score": 1e-4})
+    try:
+        validate_respiratory_staged_vnext_config(config)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("zero_mean_score must be the fixed formal value 1e-2")
+
+
+def test_vnext_overlay_pins_the_only_new_scientific_weight() -> None:
+    payload = yaml.safe_load((ROOT / "configs" / "respiratory_staged_vnext.yaml").read_text())
+    assert payload["training"]["loss_weights"]["zero_mean_score"] == 1e-2
+    assert payload["training"]["loss_weights"]["respiratory_pca_waveform"] == 1e-3
+
+
+def test_score_rms_diagnostics_separate_dc_and_dynamic_energy() -> None:
+    from cardioresp4d.training.respiratory_staged_vnext import respiratory_score_rms_metrics
+    constant = torch.full((5, 3, 3), 2.)
+    constant_metrics = respiratory_score_rms_metrics(constant)
+    assert constant_metrics["respiratory_score_dynamic_rms"] == 0.
+    assert constant_metrics["respiratory_score_mean_rms"] > 0.
+    oscillating = torch.stack([torch.full((3, 3), -2.), torch.full((3, 3), 2.)]).repeat(3, 1, 1)
+    oscillating_metrics = respiratory_score_rms_metrics(oscillating)
+    assert oscillating_metrics["respiratory_score_mean_rms"] < 1e-7
+    assert oscillating_metrics["respiratory_score_dynamic_rms"] > 0.
+    assert abs(oscillating_metrics["respiratory_score_total_rms"] ** 2 - oscillating_metrics["respiratory_score_mean_rms"] ** 2 - oscillating_metrics["respiratory_score_dynamic_rms"] ** 2) < 1e-6
 
 
 def test_respiration_pca_provenance_never_falls_back_to_cardiac_candidates(tmp_path: Path) -> None:
@@ -139,6 +166,24 @@ def test_stale_canonical_gradient_is_cleared_before_phase_b_backward() -> None:
     runner.run_segment(segment)
     assert canonical.grad is None
     assert _owner_has_finite_nonzero_gradient(model, "respiratory_encoder")
+
+
+def test_dvf_diagnostic_cohort_is_rng_safe_repeatable_and_fixed_motion_equal_from_d_to_e() -> None:
+    runner, _ = _smoke_runner_with_matching_respiratory_pca()
+    from cardioresp4d.training.respiratory_staged_vnext import configure_respiratory_staged_segment
+    c3 = next(item for item in respiratory_staged_vnext_segments() if item.name == "resp_mbc_bootstrap_c3")
+    configure_respiratory_staged_segment(runner.trainer.model, c3, runner.trainer.optimizer_config)
+    sampler_state = runner.trainer.sampler.state_dict()
+    first = runner._dvf_diagnostics("stage2c")
+    second = runner._dvf_diagnostics("stage2c")
+    assert first == second
+    assert runner.trainer.sampler.state_dict() == sampler_state
+    schedule = {segment.name: segment for segment in respiratory_staged_vnext_segments()}
+    d_report = runner.run_segment(replace(schedule["resp_score_refine"], steps=1))
+    e_report = runner.run_segment(replace(schedule["resp_canonical_refine"], steps=1))
+    keys = ("respiratory_dvf_total_rms_mm", "respiratory_dvf_static_rms_mm", "respiratory_dvf_dynamic_rms_mm", "diagnostic_location_count", "diagnostic_frame_count")
+    for key in keys:
+        assert d_report[key] == e_report[key]
 
 
 def test_phase_b_pca_only_backward_has_gradients_only_on_respiratory_encoder() -> None:

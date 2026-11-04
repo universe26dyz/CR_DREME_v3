@@ -49,6 +49,9 @@ def validate_respiratory_staged_vnext_config(config: Mapping[str, Any]) -> None:
     pca_weight = weights.get("respiratory_pca_waveform")
     if isinstance(pca_weight, bool) or not isinstance(pca_weight, (int, float)) or not math.isfinite(float(pca_weight)) or float(pca_weight) != 1e-3:
         raise ValueError("respiratory_pca_waveform must be the fixed formal value 1e-3")
+    zero_mean_weight = weights.get("zero_mean_score")
+    if isinstance(zero_mean_weight, bool) or not isinstance(zero_mean_weight, (int, float)) or not math.isfinite(float(zero_mean_weight)) or float(zero_mean_weight) != 1e-2:
+        raise ValueError("zero_mean_score must be the fixed formal value 1e-2")
     expected = {"resp_a1": {"canonical_lr": 2e-4}, "resp_a2": {"canonical_lr": 5e-5}, "resp_score": {"film_lr": 5e-4}, "resp_mbc": {"respiratory_mbc_lr": 5e-4}, "resp_e": {"canonical_lr": 5e-5}}
     for key, values in expected.items():
         if not isinstance(optimizer.get(key), Mapping) or any(float(optimizer[key].get(name, float("nan"))) != value for name, value in values.items()):
@@ -65,6 +68,17 @@ def multilevel_respiratory_pca_waveform_loss(respiratory_scores: torch.Tensor, w
     losses = tuple(respiratory_pca_waveform_subspace_loss(respiratory_scores[:, level, :], waveform, ridge=ridge, min_frames=min_frames) for level in range(3))
     loss_by_level = tuple(item["loss"] for item in losses); r2_by_level = tuple(item["r2"] for item in losses)
     return {"loss": torch.stack(loss_by_level).mean(), "r2": torch.stack(r2_by_level).mean(), "loss_by_level": loss_by_level, "r2_by_level": r2_by_level, "matched": True}
+
+
+def respiratory_score_rms_metrics(scores: torch.Tensor) -> dict[str, float]:
+    """Separate respiratory score DC gauge from its temporal variation."""
+    if scores.ndim < 2 or not scores.numel() or not torch.isfinite(scores).all():
+        raise ValueError("score diagnostics require a non-empty finite [T,...] tensor")
+    mean = scores.mean(dim=0, keepdim=True)
+    total_rms = float(scores.square().mean().sqrt())
+    mean_rms = float(mean.square().mean().sqrt())
+    dynamic_rms = float((scores - mean).square().mean().sqrt())
+    return {"respiratory_score_temporal_rms": total_rms, "respiratory_score_static_rms": mean_rms, "respiratory_score_total_rms": total_rms, "respiratory_score_mean_rms": mean_rms, "respiratory_score_dynamic_rms": dynamic_rms}
 
 
 def configure_respiratory_staged_segment(model, segment: RespiratoryStagedSegment, optimizer_config: Mapping[str, Mapping[str, float]]) -> torch.optim.Adam:
@@ -161,26 +175,32 @@ class RespiratoryStagedVNextRunner:
         self.completed.append(report)
         return report
 
+    def _diagnostic_cohort(self) -> tuple[tuple[str, str, tuple[object, ...]], ...]:
+        """Read a sorted full-span observation cohort without sampling RNG."""
+        grouped = self.trainer.sampler._grouped
+        return tuple((view, slice_id, tuple(sorted(frames, key=lambda item: item.timestamp_s))) for view in sorted(grouped) for slice_id, frames in sorted(grouped[view].items()) if frames)
+
     def _score_diagnostics(self, active_levels: int) -> dict[str, float]:
-        sequence = self.trainer.sampler.temporal_batch(max_items=self.trainer.temporal_batch_size)
+        cohort = self._diagnostic_cohort()
         with torch.no_grad():
-            scores = torch.cat([self.trainer.model.encode_motion_scores(item)["resp_scores"][:, :active_levels] for item in sequence], 0)
-        mean = scores.mean(0)
-        return {"respiratory_score_temporal_rms": float(scores.square().mean().sqrt()), "respiratory_score_static_rms": float(mean.square().mean().sqrt())}
+            scores = torch.cat([self.trainer.model.encode_motion_scores(item)["resp_scores"][:, :active_levels] for _, _, frames in cohort for item in frames], 0)
+        return respiratory_score_rms_metrics(scores)
 
     def _dvf_diagnostics(self, stage: str) -> dict[str, float]:
-        sequence = self.trainer.sampler.temporal_batch(max_items=self.trainer.temporal_batch_size)
-        if not sequence:
+        cohort = self._diagnostic_cohort()
+        if not cohort:
             return {}
         model = self.trainer.model
         with torch.no_grad():
             grid, _ = model._physical_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, (4, 4, 4))
             values = []
-            for observation in sequence:
+            for _, _, frames in cohort:
+              for observation in frames:
                 score = model.encode_motion_scores(observation)["resp_scores"][:, :stage_contract(stage).active_respiratory_levels]
                 values.append(ScoreWeightedMBCField(model.respiratory_mbc, score)(grid)[0])
             _, _, metrics = dvf_static_dynamic_metrics(torch.stack(values))
-        return {"respiratory_dvf_rms_mm": float(torch.stack(values).square().mean().sqrt()), "respiratory_dvf_static_rms_mm": metrics["mean_DVF_RMS_mm"], "respiratory_dvf_dynamic_rms_mm": metrics["dynamic_DVF_temporal_RMS_mm"]}
+        total_rms = float(torch.stack(values).square().mean().sqrt())
+        return {"respiratory_dvf_rms_mm": total_rms, "respiratory_dvf_total_rms_mm": total_rms, "respiratory_dvf_static_rms_mm": metrics["mean_DVF_RMS_mm"], "respiratory_dvf_dynamic_rms_mm": metrics["dynamic_DVF_temporal_RMS_mm"], "diagnostic_location_count": len(cohort), "diagnostic_frame_count": sum(len(frames) for _, _, frames in cohort)}
 
     def state_dict(self) -> dict[str, object]:
         return {"global_step": self.global_step, "completed": list(self.completed), "current_segment": None if not self.completed else self.completed[-1]["segment"], "segment_step": 0 if not self.completed else self.completed[-1]["segment_step"], "sampler_state": self.trainer.sampler.state_dict(), "optimizer": self.last_optimizer_state, "schedule": [segment.name for segment in respiratory_staged_vnext_segments()]}

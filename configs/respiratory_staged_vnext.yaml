@@ -1,6 +1,7 @@
 # Fixed respiratory-only vNext protocol; merged with a source-first model config by its launcher.
 training:
   loss_weights:
+    zero_mean_score: 1.0e-2
     respiratory_pca_waveform: 1.0e-3
   optimizer:
     resp_a1: {canonical_lr: 2.0e-4}
