@@ -37,14 +37,16 @@ class ScoreWeightedMBCField(nn.Module):
         batch, spatial_shape = points_mm.shape[0], points_mm.shape[1:-1]
         if self.scores.shape[0] not in (1, batch):
             raise ValueError("score batch must be one or match point batch")
-        fields = self.mbc(points_mm.reshape(batch, -1, 3))
+        broadcast_scores = self.scores.shape[0] == 1 and batch > 1
+        fields = self.mbc(points_mm.reshape(1 if broadcast_scores else batch, -1, 3))
         # A respiratory MBC exposes levels explicitly; the one-level cardiac
         # MBC returns a single field and is promoted to the same contract.
         if fields.ndim == 3: fields = fields[:, None]
-        scores = self.scores.to(points_mm).expand(batch, -1, -1)
+        scores = self.scores.to(points_mm).expand(batch if not broadcast_scores else 1, -1, -1)
         if fields.ndim != 4 or fields.shape[-1] != 3:
             raise ValueError("upstream SINR MBC must return [B,level,N,xyz]")
-        return (fields * scores[:, :, None, :]).sum(1).reshape(batch, *spatial_shape, 3)
+        weighted = (fields * scores[:, :, None, :]).sum(1)
+        return weighted.reshape(batch, *spatial_shape, 3)
 
 
 class SequentialPullbackMotion(nn.Module):

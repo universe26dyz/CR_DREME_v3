@@ -501,6 +501,42 @@ def test_effective_domain_provenance_binds_resume_admission() -> None:
         launcher.resume_next_segment_index(checkpoint, reference_schedule(), changed)
 
 
+def test_reference_runner_clears_training_gradients_before_boundary_diagnostic(monkeypatch) -> None:
+    import cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 as reference
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.p = torch.nn.Parameter(torch.tensor(1.0))
+            self.canonical = torch.nn.Linear(1, 1, bias=False)
+            self.film_encoder = torch.nn.Linear(1, 1, bias=False)
+            self.respiratory_mbc = torch.nn.Linear(1, 1, bias=False)
+
+    class DummySampler:
+        pass
+
+    model = DummyModel()
+    runner = reference.S2VDREMEReferenceRunner(model, DummySampler(), pixel_samples=1)
+
+    def configure(model, segment, *, optimizer_config=None):
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        model.p.requires_grad_(True)
+        return torch.optim.SGD([{"params": [model.p], "lr": 0.1, "name": "canonical"}])
+
+    monkeypatch.setattr(reference, "configure_reference_segment", configure)
+    runner._components = lambda observation, stage: {"data": model.p.square(), "image": model.p * 0., "mbc_normalization": model.p * 0., "smooth_resp": model.p * 0.}
+
+    def boundary_check(*args, **kwargs):
+        assert all(parameter.grad is None for parameter in model.parameters())
+        return {}
+
+    monkeypatch.setattr(reference, "boundary_motion_diagnostics", boundary_check)
+    segment = reference.ReferenceSegment("test", "stage2a", 1, 1, frozenset({"canonical"}))
+    runner.sampler.sample_step = lambda **kwargs: [object()]
+    runner.run_segment(segment)
+
+
 def test_corrected_pose_internal_inr_containment_uses_lps_ras_corners() -> None:
     from cardioresp4d.adapters.nesvor_inr import lps_to_ras_world_matrix
     from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import corrected_pose_internal_inr_containment_audit

@@ -770,6 +770,7 @@ class S2VDREMEReferenceRunner:
             if not any(parameter.grad is not None and torch.isfinite(parameter.grad).all() and parameter.grad.abs().max() > 0 for parameter in self.model.parameters() if parameter.requires_grad):
                 raise RuntimeError("reference gradient audit found no finite nonzero owner gradient")
             optimizer.step(); self.global_step += 1; losses.append(float(total.detach()))
+        self.model.zero_grad(set_to_none=True)
         diagnostics = boundary_motion_diagnostics(self.model, self.sampler, stage=segment.stage)
         report = {"segment": segment.name, "stage": segment.stage, "segment_step": segment.steps, "global_step": self.global_step, "owners": sorted(segment.owners), "loss_last": losses[-1], "loss_mean": sum(losses) / len(losses), "prior_boundary_loss_last": before_loss, "learning_rates": {group["name"]: group["lr"] for group in optimizer.param_groups}, **diagnostics, **self._parameter_norms()}
         self.completed.append(report); self.last_optimizer_state = optimizer.state_dict()
