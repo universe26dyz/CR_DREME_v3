@@ -57,6 +57,46 @@ def test_temporal_mean_export_writes_nifti_stack_and_geometry_manifest(tmp_path)
     assert all(item["stack_thickness_mm"] == 4.0 for item in payload["locations"])
 
 
+def test_temporal_mean_export_preserves_integer_missing_lattice_positions(tmp_path) -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import build_temporal_mean_locations, export_temporal_mean_stacks
+
+    locations = build_temporal_mean_locations([_observation(slice_id=f"s{index}", center_z=z, value=float(index + 1)) for index, z in enumerate((0., 2., 4., 8., 10.))])
+    manifest = export_temporal_mean_stacks(locations, tmp_path)
+    payload = json.loads(manifest.read_text())
+    records = payload["locations"]
+    assert [record["stack_index"] for record in records] == [0, 1, 2, 4, 5]
+    lattice = payload["stack_lattices"]["SAX"]
+    assert lattice["nominal_step_mm"] == pytest.approx(2.0)
+    assert lattice["lattice_size"] == 6 and lattice["missing_lattice_indices"] == [3]
+    image = nib.load(str(tmp_path / "mean_stack_SAX.nii.gz"))
+    np.testing.assert_array_equal(np.asanyarray(image.dataobj)[..., 3], 0.)
+    lps_affine = np.diag([-1., -1., 1., 1.]) @ image.affine
+    for record in records:
+        _, height, width = record["image_shape"]
+        center = nib.affines.apply_affine(lps_affine, [(width - 1) / 2, (height - 1) / 2, record["stack_index"]])
+        np.testing.assert_allclose(center, record["geometry"]["center_mm"], atol=1e-5)
+
+
+@pytest.mark.parametrize("positions", [(0., 2., 4.4, 6.4), (0., 2., 5., 7.)])
+def test_temporal_mean_export_rejects_noninteger_lattice_gaps(tmp_path, positions) -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import build_temporal_mean_locations, export_temporal_mean_stacks
+
+    locations = build_temporal_mean_locations([_observation(slice_id=f"s{index}", center_z=z) for index, z in enumerate(positions)])
+    with pytest.raises(ValueError, match="irregular"):
+        export_temporal_mean_stacks(locations, tmp_path)
+
+
+def test_temporal_mean_export_accepts_multiple_integer_gaps_and_numeric_jitter(tmp_path) -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import build_temporal_mean_locations, export_temporal_mean_stacks
+
+    gaps = build_temporal_mean_locations([_observation(slice_id=f"g{index}", center_z=z) for index, z in enumerate((0., 2., 6., 8., 14.))])
+    payload = json.loads(export_temporal_mean_stacks(gaps, tmp_path / "gaps").read_text())
+    assert [record["stack_index"] for record in payload["locations"]] == [0, 1, 3, 4, 7]
+    assert payload["stack_lattices"]["SAX"]["missing_lattice_indices"] == [2, 5, 6]
+    jitter = build_temporal_mean_locations([_observation(slice_id=f"j{index}", center_z=z) for index, z in enumerate((0., 2.00001, 4., 5.99999))])
+    assert json.loads(export_temporal_mean_stacks(jitter, tmp_path / "jitter").read_text())["stack_lattices"]["SAX"]["lattice_size"] == 4
+
+
 def test_formal_and_smoke_nesvor_commands_are_distinct_and_complete() -> None:
     from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import nesvor_reconstruct_command
 
@@ -69,7 +109,18 @@ def test_formal_and_smoke_nesvor_commands_are_distinct_and_complete() -> None:
     assert smoke[smoke.index("--n-iter") + 1] != "10000"
     assert "--scanner-space" in formal and "--no-slice-scale" in formal
     assert formal[formal.index("--output-intensity-mean") + 1] == "0"
+    assert formal[formal.index("--background-threshold") + 1] == "0"
     assert "--output-slices" in formal and "--output-log" in formal
+
+
+def test_static_manifest_requires_explicit_zero_background_threshold(tmp_path) -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import write_static_reference_manifest
+
+    source = tmp_path / "source.csv"; source.write_text("x")
+    qc = tmp_path / "qc.csv"; qc.write_text("x")
+    mean = tmp_path / "mean.json"; mean.write_text(json.dumps({"locations": []}))
+    with pytest.raises(ValueError, match="background_threshold"):
+        write_static_reference_manifest(output_dir=tmp_path, source_manifest=source, qc_table=qc, mean_slice_manifest=mean, command=["nesvor", "reconstruct", "--output-intensity-mean", "0"], executable="nesvor", version="0.6.0rc1", mode="formal")
 
 
 def test_reference_encoder_has_eight_film_layers_and_gradients() -> None:
@@ -229,7 +280,7 @@ def test_corrected_pose_map_propagates_per_location_without_changing_frame_conte
     mean_manifest = tmp_path / "mean.json"
     mean_manifest.write_text(json.dumps({"locations": [
         {"view": "SAX", "slice_id": "a", "stack_file": "mean_stack_SAX.nii.gz", "stack_index": 0, "geometry": {"center_mm": [0., 0., 0.], "row_direction": [1., 0., 0.], "column_direction": [0., 1., 0.], "normal": [0., 0., 1.], "pixel_spacing_mm": [1., 1.], "slice_thickness_mm": 4., "image_shape": [1, 4, 5]}},
-        {"view": "SAX", "slice_id": "b", "stack_file": "mean_stack_SAX.nii.gz", "stack_index": 1, "geometry": {"center_mm": [0., 0., 4.], "row_direction": [1., 0., 0.], "column_direction": [0., 1., 0.], "normal": [0., 0., 1.], "pixel_spacing_mm": [1., 1.], "slice_thickness_mm": 4., "image_shape": [1, 4, 5]}},
+        {"view": "SAX", "slice_id": "b", "stack_file": "mean_stack_SAX.nii.gz", "stack_index": 2, "stack_lattice_index": 2, "nesvor_nonempty_order": 1, "geometry": {"center_mm": [0., 0., 4.], "row_direction": [1., 0., 0.], "column_direction": [0., 1., 0.], "normal": [0., 0., 1.], "pixel_spacing_mm": [1., 1.], "slice_thickness_mm": 4., "image_shape": [1, 4, 5]}},
     ]}))
     slices = tmp_path / "slices"; slices.mkdir()
     for index, x in enumerate((10., 20.)):
@@ -241,6 +292,7 @@ def test_corrected_pose_map_propagates_per_location_without_changing_frame_conte
     assert [item.slice_id for item in corrected] == ["a", "a", "b"]
     assert [item.timestamp_s for item in corrected] == [1., 2., 0.]
     assert [float(item.center_mm[0]) for item in corrected] == [10., 10., 20.]
+    assert pose_map[("SAX", "b")].source_stack_index == 2
     assert [float(item.image.mean()) for item in corrected] == [4., 3., 5.]
     with pytest.raises(ValueError, match="missing"):
         apply_corrected_static_poses(frames, {("SAX", "a"): pose_map[("SAX", "a")]})

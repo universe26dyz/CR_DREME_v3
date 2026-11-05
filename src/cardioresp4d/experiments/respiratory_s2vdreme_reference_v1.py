@@ -26,6 +26,7 @@ from cardioresp4d.training.stage_contract import stage_contract
 
 
 REFERENCE_LOSS_WEIGHTS = {"image": 2e-6, "mbc_normalization": 1e-2, "smooth_resp": 1e-3}
+LATTICE_TOLERANCE_MM = 1e-3
 FORMAL_NESVOR_OPTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("--registration", ("stack",)), ("--scanner-space", ()), ("--metric", ("none",)),
     ("--weight-transformation", ("1",)), ("--weight-deform", ("0.1",)), ("--weight-image", ("1",)),
@@ -110,10 +111,60 @@ def build_temporal_mean_locations(observations: Iterable[DynamicObservation], *,
     return tuple(result)
 
 
+def infer_regular_slice_lattice(projections_mm: Sequence[float], *, tolerance_mm: float = LATTICE_TOLERANCE_MM) -> dict[str, Any]:
+    """Infer a regular physical lattice while admitting only integer-multiple gaps."""
+    projections = np.asarray(projections_mm, dtype=float)
+    if projections.ndim != 1 or len(projections) < 2 or not np.isfinite(projections).all() or tolerance_mm <= 0:
+        raise ValueError("lattice inference requires at least two finite projections and positive tolerance")
+    diffs = np.diff(projections)
+    if np.any(diffs <= 0):
+        raise ValueError("slice projections must be strictly increasing")
+    candidates = [float(np.median(diffs)), *[float(value) for value in diffs]]
+    admissible: list[tuple[float, np.ndarray, np.ndarray]] = []
+    for step in candidates:
+        if step <= tolerance_mm:
+            continue
+        multiples = np.rint(diffs / step).astype(int)
+        residuals = np.abs(diffs - multiples * step)
+        if np.all(multiples >= 1) and np.all(residuals <= tolerance_mm):
+            indices = np.concatenate(([0], np.cumsum(multiples)))
+            admissible.append((step, multiples, indices))
+    if not admissible:
+        raise ValueError("cannot safely represent irregular slice positions on an integer lattice")
+    step, multiples, indices = min(admissible, key=lambda item: item[0])
+    fitted = projections[0] + indices * step
+    residual = float(np.max(np.abs(projections - fitted)))
+    if residual > tolerance_mm:
+        raise ValueError("cannot safely represent slice positions with accumulated lattice residual")
+    missing = sorted(set(range(int(indices[-1]) + 1)).difference(int(value) for value in indices))
+    return {"base_step_mm": step, "real_lattice_indices": [int(value) for value in indices], "missing_lattice_indices": missing, "integer_multiples": [int(value) for value in multiples], "max_lattice_residual_mm": residual}
+
+
+def _validate_exported_lattice(*, volume: np.ndarray, lps_affine: np.ndarray, selected: Sequence[TemporalMeanLocation], lattice_indices: Sequence[int], missing_indices: Sequence[int], tolerance_mm: float) -> float:
+    """Audit placeholder-only lattice expansion before the stack reaches NeSVoR."""
+    if volume.ndim != 3 or len(selected) != len(lattice_indices) or sorted(lattice_indices) != list(lattice_indices) or len(set(lattice_indices)) != len(lattice_indices):
+        raise ValueError("exported lattice has invalid real location indexing")
+    if volume.shape[-1] != int(max(lattice_indices)) + 1 or any(index < 0 or index >= volume.shape[-1] for index in missing_indices):
+        raise ValueError("exported lattice size does not match physical indices")
+    center_error = 0.
+    for item, index in zip(selected, lattice_indices):
+        if not np.array_equal(volume[..., index], item.image[0].cpu().numpy().T):
+            raise ValueError("exported lattice real location was not populated exactly once")
+        _, height, width = item.geometry["image_shape"]
+        exported_center = nib.affines.apply_affine(lps_affine, [(width - 1) / 2, (height - 1) / 2, index])
+        error = float(np.max(np.abs(exported_center - np.asarray(item.geometry["center_mm"], dtype=float))))
+        center_error = max(center_error, error)
+    if any(not np.all(volume[..., index] == 0.) for index in missing_indices):
+        raise ValueError("exported lattice missing location placeholder is not zero-valued")
+    if center_error > tolerance_mm:
+        raise ValueError("exported lattice affine does not preserve real slice centres")
+    return center_error
+
+
 def export_temporal_mean_stacks(locations: Sequence[TemporalMeanLocation], output_dir: str | Path) -> Path:
     """Export view-wise NIfTI mean stacks plus geometry required by NeSVoR."""
     output = Path(output_dir); output.mkdir(parents=True, exist_ok=True)
-    records: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []; stack_lattices: dict[str, Any] = {}
     for view in ("SAX", "2CH", "4CH"):
         selected = [item for item in locations if item.view == view]
         if not selected:
@@ -140,21 +191,24 @@ def export_temporal_mean_stacks(locations: Sequence[TemporalMeanLocation], outpu
         selected = sorted(selected, key=lambda item: float(torch.dot(torch.as_tensor(item.geometry["center_mm"], dtype=torch.float64), normal)))
         centers = [torch.as_tensor(item.geometry["center_mm"], dtype=torch.float64) for item in selected]
         projections = [float(torch.dot(center, normal)) for center in centers]
-        step = float(np.median(np.diff(projections))) if len(projections) > 1 else float(next(iter(thicknesses)))
-        if step <= 0 or (len(projections) > 2 and not np.allclose(np.diff(projections), step, atol=1e-4, rtol=0.0)):
-            raise ValueError(f"cannot safely represent irregular slice positions for {view}")
+        lattice = (infer_regular_slice_lattice(projections) if len(projections) > 1 else {"base_step_mm": float(next(iter(thicknesses))), "real_lattice_indices": [0], "missing_lattice_indices": [], "integer_multiples": [], "max_lattice_residual_mm": 0.})
+        step = float(lattice["base_step_mm"]); lattice_indices = list(lattice["real_lattice_indices"]); missing_indices = list(lattice["missing_lattice_indices"])
         _, height, width = selected[0].image.shape
         spacing_row, spacing_column = first_geometry["pixel_spacing_mm"]
         origin = centers[0] - (width - 1) / 2 * spacing_column * row - (height - 1) / 2 * spacing_row * column
         lps = np.eye(4); lps[:3, 0] = (row * spacing_column).numpy(); lps[:3, 1] = (column * spacing_row).numpy(); lps[:3, 2] = (normal * step).numpy(); lps[:3, 3] = origin.numpy()
         ras = np.diag([-1., -1., 1., 1.]) @ lps
         path = output / f"mean_stack_{view}.nii.gz"
-        volume = torch.stack([item.image[0].cpu() for item in selected]).permute(2, 1, 0).numpy().astype(np.float32, copy=False)
+        volume = np.zeros((width, height, lattice_indices[-1] + 1), dtype=np.float32)
+        for item, index in zip(selected, lattice_indices):
+            volume[..., index] = item.image[0].cpu().numpy().T
+        max_center_error = _validate_exported_lattice(volume=volume, lps_affine=lps, selected=selected, lattice_indices=lattice_indices, missing_indices=missing_indices, tolerance_mm=LATTICE_TOLERANCE_MM)
         nib.save(nib.Nifti1Image(volume, ras), path)
-        for index, item in enumerate(selected):
-            records.append({"view": item.view, "slice_id": item.slice_id, "stack_file": path.name, "stack_index": index, "frame_count": item.frame_count, "timestamp_min_s": min(item.timestamps_s), "timestamp_max_s": max(item.timestamps_s), "image_shape": item.geometry["image_shape"], "geometry": item.geometry, "geometry_hash": item.geometry_hash, "qc_provenance": item.qc_provenance, "stack_thickness_mm": next(iter(thicknesses))})
+        stack_lattices[view] = {"representation": "regular_nifti_with_zero_missing_location_placeholders", "nominal_step_mm": step, "lattice_size": int(volume.shape[-1]), "real_location_count": len(selected), "missing_lattice_indices": missing_indices, "integer_multiples": lattice["integer_multiples"], "max_lattice_residual_mm": lattice["max_lattice_residual_mm"], "max_center_error_mm": max_center_error, "tolerance_mm": LATTICE_TOLERANCE_MM}
+        for nonempty_order, (index, item) in enumerate(zip(lattice_indices, selected)):
+            records.append({"view": item.view, "slice_id": item.slice_id, "stack_file": path.name, "stack_index": index, "stack_lattice_index": index, "nesvor_nonempty_order": nonempty_order, "frame_count": item.frame_count, "timestamp_min_s": min(item.timestamps_s), "timestamp_max_s": max(item.timestamps_s), "image_shape": item.geometry["image_shape"], "geometry": item.geometry, "geometry_hash": item.geometry_hash, "qc_provenance": item.qc_provenance, "stack_thickness_mm": next(iter(thicknesses))})
     manifest = output / "mean_slice_manifest.json"
-    manifest.write_text(json.dumps({"policy": "qc_valid_per_location_exact_temporal_mean", "locations": records}, indent=2, sort_keys=True))
+    manifest.write_text(json.dumps({"policy": "qc_valid_per_location_exact_temporal_mean", "stack_lattices": stack_lattices, "locations": records}, indent=2, sort_keys=True))
     return manifest
 
 
@@ -165,7 +219,7 @@ def nesvor_reconstruct_command(mean_stacks: Sequence[str | Path], *, output_dir:
     if len(thicknesses_mm) != len(mean_stacks) or any(not math.isfinite(value) or value <= 0 for value in thicknesses_mm):
         raise ValueError("each mean stack requires one finite acquisition thickness")
     output = Path(output_dir)
-    command = ["nesvor", "reconstruct", "--input-stacks", *[str(path) for path in mean_stacks], "--thicknesses", *[str(value) for value in thicknesses_mm], "--output-volume", str(output / "static_reference.nii.gz"), "--output-model", str(output / "model.pt"), "--output-json", str(output / "nesvor_effective_args.json"), "--output-slices", str(output / "slices"), "--output-log", str(output / "nesvor.log"), "--output-intensity-mean", "0"]
+    command = ["nesvor", "reconstruct", "--input-stacks", *[str(path) for path in mean_stacks], "--thicknesses", *[str(value) for value in thicknesses_mm], "--output-volume", str(output / "static_reference.nii.gz"), "--output-model", str(output / "model.pt"), "--output-json", str(output / "nesvor_effective_args.json"), "--output-slices", str(output / "slices"), "--output-log", str(output / "nesvor.log"), "--output-intensity-mean", "0", "--background-threshold", "0"]
     for key, values in FORMAL_NESVOR_OPTIONS:
         command.extend((key, *values))
     if smoke:
@@ -384,8 +438,8 @@ def corrected_pose_internal_inr_containment_audit(poses: Mapping[tuple[str, str]
 def write_static_reference_manifest(*, output_dir: str | Path, source_manifest: str | Path, qc_table: str | Path, mean_slice_manifest: str | Path, command: Sequence[str], executable: str, version: str, mode: str) -> Path:
     """Close the static artifact/provenance chain after NeSVoR has completed."""
     output = Path(output_dir); mean_path = Path(mean_slice_manifest)
-    if mode not in {"formal", "smoke"} or "--output-intensity-mean" not in command or command[command.index("--output-intensity-mean") + 1] != "0":
-        raise ValueError("static manifest requires the provenance-proven output_intensity_mean=0 contract")
+    if mode not in {"formal", "smoke"} or "--output-intensity-mean" not in command or command[command.index("--output-intensity-mean") + 1] != "0" or "--background-threshold" not in command or command[command.index("--background-threshold") + 1] != "0":
+        raise ValueError("static manifest requires explicit output_intensity_mean=0 and background_threshold=0")
     pose_map = build_corrected_pose_map(mean_path, output / "slices")
     pose_path = output / "corrected_pose_manifest.json"
     pose_path.write_text(json.dumps({"mapping_policy": "NeSVoR output_slices follows deterministic input-stack then intra-stack order", "poses": {f"{view}/{slice_id}": asdict(pose) for (view, slice_id), pose in sorted(pose_map.items())}}, indent=2) + "\n")
@@ -398,7 +452,7 @@ def write_static_reference_manifest(*, output_dir: str | Path, source_manifest: 
     for stack in stack_paths:
         locations = sorted((item for item in mean["locations"] if item["stack_file"] == stack), key=lambda item: int(item["stack_index"]))
         stacks.append({"path": str(mean_path.parent / stack), "sha256": hashlib.sha256((mean_path.parent / stack).read_bytes()).hexdigest(), "view": locations[0]["view"], "location_count": len(locations), "slice_ids_in_stack_order": [item["slice_id"] for item in locations], "thickness_mm": locations[0]["stack_thickness_mm"], "geometry_hashes": [item["geometry_hash"] for item in locations]})
-    payload = {"source_manifest_sha256": hashlib.sha256(Path(source_manifest).read_bytes()).hexdigest(), "qc_table_sha256": hashlib.sha256(Path(qc_table).read_bytes()).hexdigest(), "mean_slice_manifest": artifact(mean_path), "mean_stacks": stacks, "nesvor": {"executable": executable, "version": version, "command": list(command), "mode": mode, "pinned_commit": "2e96a91bdd30174210caea911e03a2778c65adbe"}, "outputs": outputs, "corrected_pose_manifest": artifact(pose_path), "pose_location_count": len(pose_map), "scientific_contract": {"registration": "stack", "transformation_optimization": "enabled", "output_intensity_mean": 0, "formal_n_iter": 10000, "formal_n_samples": 256}}
+    payload = {"source_manifest_sha256": hashlib.sha256(Path(source_manifest).read_bytes()).hexdigest(), "qc_table_sha256": hashlib.sha256(Path(qc_table).read_bytes()).hexdigest(), "mean_slice_manifest": artifact(mean_path), "mean_stacks": stacks, "nesvor": {"executable": executable, "version": version, "command": list(command), "mode": mode, "pinned_commit": "2e96a91bdd30174210caea911e03a2778c65adbe"}, "outputs": outputs, "corrected_pose_manifest": artifact(pose_path), "pose_location_count": len(pose_map), "scientific_contract": {"registration": "stack", "transformation_optimization": "enabled", "output_intensity_mean": 0, "background_threshold": 0, "formal_n_iter": 10000, "formal_n_samples": 256}}
     manifest = output / "static_reference_manifest.json"; manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return manifest
 
