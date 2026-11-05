@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
+import importlib.util
 import json
+import sys
+from pathlib import Path
 
 import nibabel as nib
 import numpy as np
@@ -279,9 +283,91 @@ def test_corrected_pose_internal_inr_containment_uses_lps_ras_corners() -> None:
 
     pose = {("SAX", "a"): {"center_mm": [2., -1., 0.], "row_direction": [1., 0., 0.], "column_direction": [0., 1., 0.], "normal": [0., 0., 1.], "pixel_spacing_mm": [1., 1.], "slice_thickness_mm": 4., "image_shape": [1, 3, 3]}}
     report = corrected_pose_internal_inr_containment_audit(pose, internal_lower_world_mm=[-4., -4., -1.], internal_upper_world_mm=[1., 3., 1.], world_to_internal_transform=lps_to_ras_world_matrix())
-    assert report["passed"]
-    with pytest.raises(ValueError, match="converted_ras"):
-        corrected_pose_internal_inr_containment_audit(pose, internal_lower_world_mm=[-1., -1., -1.], internal_upper_world_mm=[1., 1., 1.], world_to_internal_transform=lps_to_ras_world_matrix())
+    assert report["inside_location_count"] == 1 and report["outside_location_count"] == 0
+    outside = corrected_pose_internal_inr_containment_audit(pose, internal_lower_world_mm=[-1., -1., -1.], internal_upper_world_mm=[1., 1., 1.], world_to_internal_transform=lps_to_ras_world_matrix())
+    assert outside["outside_location_count"] == 1
+    assert outside["maximum_violation_mm"] == pytest.approx(2.0)
+    assert outside["worst_view"] == "SAX" and outside["worst_slice_id"] == "a"
+
+
+def _load_script(name: str):
+    root = Path(__file__).resolve().parents[1]
+    script_dir = root / "scripts"
+    spec = importlib.util.spec_from_file_location(name, script_dir / f"{name}.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(script_dir))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(script_dir))
+    return module
+
+
+def test_static_validator_requires_gpu_for_tinycudann_and_allows_torch_hash_cpu() -> None:
+    validator = _load_script("validate_respiratory_s2vdreme_reference_static")
+
+    assert validator.resolve_validation_device("cpu", "torch_hash", cuda_available=False) == torch.device("cpu")
+    with pytest.raises(ValueError, match="tinycudann.*CPU"):
+        validator.resolve_validation_device("cpu", "tinycudann", cuda_available=False)
+    with pytest.raises(ValueError, match="CUDA requested but unavailable"):
+        validator.resolve_validation_device("cuda:0", "torch_hash", cuda_available=False)
+
+
+def test_static_validator_writes_exact_torch_hash_cpu_report(tmp_path, monkeypatch) -> None:
+    from cardioresp4d.training.build_model import build_source_first_model
+
+    validator = _load_script("validate_respiratory_s2vdreme_reference_static")
+    root = Path(__file__).resolve().parents[1]
+    config_path = root / "configs" / "respiratory_s2vdreme_reference_v1.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    domain = {"world_min_mm": [-4., -4., -4.], "world_max_mm": [4., 4., 4.], "cardiac_box": {"min_mm": [-2., -2., -2.], "max_mm": [2., 2., 2.]}}
+    domain_path = tmp_path / "domain.json"; domain_path.write_text(json.dumps(domain))
+    model_path = tmp_path / "model.pt"
+    source = build_source_first_model(config, domain, n_dynamic_frames=1, device=torch.device("cpu"))
+    torch.save({"model": source.canonical.inr.state_dict(), "args": source.canonical.args}, model_path)
+    output = tmp_path / "validation.json"
+    monkeypatch.setattr(sys, "argv", ["validate", "--experiment-config", str(config_path), "--canonical-domain", str(domain_path), "--static-model", str(model_path), "--output", str(output), "--device", "cpu"])
+    validator.main()
+    report = json.loads(output.read_text())
+    assert report["accepted"] and report["encoding_backend"] == "torch_hash" and report["strict_load"]
+    assert report["world_to_internal_matrix"] == [[-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]]
+
+
+def test_formal_preflight_writes_admission_artifacts_without_training(tmp_path, monkeypatch) -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import CorrectedStaticPose
+    from cardioresp4d.training.build_model import build_source_first_model
+
+    launcher = _load_script("train_respiratory_s2vdreme_reference_v1")
+    root = Path(__file__).resolve().parents[1]
+    config_path = root / "configs" / "respiratory_s2vdreme_reference_v1.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    domain = {"world_min_mm": [-4., -4., -4.], "world_max_mm": [4., 4., 4.], "cardiac_box": {"min_mm": [-2., -2., -2.], "max_mm": [2., 2., 2.]}}
+    domain_path = tmp_path / "domain.json"; domain_path.write_text(json.dumps(domain))
+    static_model = tmp_path / "model.pt"
+    source = build_source_first_model(config, domain, n_dynamic_frames=1, device=torch.device("cpu"))
+    torch.save({"model": source.canonical.inr.state_dict(), "args": source.canonical.args}, static_model)
+    manifest_path = tmp_path / "manifest.csv"; manifest_path.write_text("manifest\n")
+    qc_path = tmp_path / "qc.csv"; qc_path.write_text("qc\n")
+    volume_path = tmp_path / "static.nii.gz"; volume_path.write_bytes(b"volume")
+    poses_path = tmp_path / "poses.json"; poses_path.write_text("{}")
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    static_manifest = tmp_path / "static_manifest.json"
+    static_manifest.write_text(json.dumps({"source_manifest_sha256": digest(manifest_path), "qc_table_sha256": digest(qc_path), "scientific_contract": {"output_intensity_mean": 0}, "outputs": {"model": {"path": str(static_model), "sha256": digest(static_model)}, "volume": {"path": str(volume_path), "sha256": digest(volume_path)}}, "corrected_pose_manifest": {"path": str(poses_path), "sha256": digest(poses_path)}}))
+    geometry = {"center_mm": [0., 0., 0.], "row_direction": [1., 0., 0.], "column_direction": [0., 1., 0.], "normal": [0., 0., 1.], "pixel_spacing_mm": [1., 1.], "slice_thickness_mm": 4., "image_shape": [1, 4, 5]}
+    pose_map = {(view, "a"): CorrectedStaticPose(view, "a", "stack", 0, geometry, geometry, [], "slice.nii.gz") for view in ("SAX", "2CH", "4CH")}
+    monkeypatch.setattr(launcher, "verify_vendored_source_lock", lambda _: {"verified": True})
+    monkeypatch.setattr(launcher, "observations_from_manifest", lambda *args, **kwargs: ([_observation(view=view) for view in ("SAX", "2CH", "4CH")], {}, []))
+    monkeypatch.setattr(launcher, "load_corrected_pose_map", lambda _: pose_map)
+    monkeypatch.setattr(launcher, "static_reference_diagnostics", lambda *_: {"reconstruction_mse_full": 0.0})
+    monkeypatch.setattr(launcher.S2VDREMEReferenceRunner, "run_segment", lambda *_: pytest.fail("preflight must not run a training segment"))
+    output = tmp_path / "out"
+    monkeypatch.setattr(sys, "argv", ["train", "--experiment-config", str(config_path), "--manifest", str(manifest_path), "--qc-table", str(qc_path), "--canonical-domain", str(domain_path), "--static-manifest", str(static_manifest), "--output-dir", str(output), "--device", "cpu", "--preflight-only"])
+    launcher.main()
+    report = json.loads((output / "preflight_report.json").read_text())
+    assert report["status"] == "PASS" and report["formal_training_started"] is False
+    assert (output / "static_reference_ready.json").is_file()
+    assert not list(output.glob("checkpoint_*.pt"))
 
 
 def test_formal_and_smoke_fallback_policies_are_explicit_and_distinct() -> None:

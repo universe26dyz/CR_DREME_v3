@@ -81,7 +81,7 @@ def main() -> None:
     parser.add_argument("--manifest", required=True, type=Path); parser.add_argument("--qc-table", required=True, type=Path); parser.add_argument("--canonical-domain", required=True, type=Path)
     parser.add_argument("--static-manifest", required=True, type=Path, help="authoritative static_reference_manifest.json")
     parser.add_argument("--static-volume", type=Path, help="Verified static NeSVoR NIfTI override for explicit MSE fallback")
-    parser.add_argument("--output-dir", required=True, type=Path); parser.add_argument("--device", default="cuda"); parser.add_argument("--pixel-samples", type=int, default=256); parser.add_argument("--resume", type=Path)
+    parser.add_argument("--output-dir", required=True, type=Path); parser.add_argument("--device", default="cuda"); parser.add_argument("--pixel-samples", type=int, default=256); parser.add_argument("--resume", type=Path); parser.add_argument("--preflight-only", action="store_true", help="Validate formal static admission and diagnostics without training.")
     args = parser.parse_args(); device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available(): parser.error("CUDA requested but unavailable")
     config = _load_config(args.experiment_config); validate_reference_config(config)
@@ -126,7 +126,7 @@ def main() -> None:
     observations, normalization, normalization_groups = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=config["training"]["normalization"]["mode"], assign_slice_positions=True)
     pose_map = load_corrected_pose_map(pose_manifest)
     containment = corrected_pose_containment_audit(pose_map, lower_world_mm=domain["world_min_mm"], upper_world_mm=domain["world_max_mm"])
-    internal_containment = (corrected_pose_internal_inr_containment_audit(pose_map, internal_lower_world_mm=static_internal_bounds[0].tolist(), internal_upper_world_mm=static_internal_bounds[1].tolist(), world_to_internal_transform=world_to_internal) if direct_preflight_error is None else {"passed": False, "reason": str(direct_preflight_error), "policy": "not_assessed_without_static_inr_bbox"})
+    static_inr_bbox_diagnostic = (corrected_pose_internal_inr_containment_audit(pose_map, internal_lower_world_mm=static_internal_bounds[0].tolist(), internal_upper_world_mm=static_internal_bounds[1].tolist(), world_to_internal_transform=world_to_internal) if direct_preflight_error is None else {"reason": str(direct_preflight_error), "policy": "not_assessed_without_static_inr_bbox"})
     observations = apply_corrected_static_poses(observations, pose_map)
     checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
     model = build_source_first_model(config, domain, n_dynamic_frames=max(item.dynamic_frame_id for item in observations) + 1, device=device, canonical_encoding_backend=static_backend, canonical_internal_bounds_world_mm=static_internal_bounds.to(device), canonical_world_to_internal_transform=(world_to_internal.to(device) if direct_preflight_error is None else None)).to(device)
@@ -137,6 +137,8 @@ def main() -> None:
             raise RuntimeError("model external canonical LPS bounds differ from canonical_domain.json")
         static_state = strict_canonical_state_from_static_checkpoint(static_payload, model.canonical.inr.state_dict(), internal_bounds_world_mm=static_internal_bounds, expected_architecture=model.canonical.args, expected_encoding_backend=static_backend, world_to_internal_transform=model.canonical.input_world_to_internal.cpu())
     except ValueError as error:
+        if args.preflight_only:
+            raise ValueError(f"preflight requires direct exact static state admission: {error}") from error
         fallback = config["static_reference"]["canonical_initialization"]["fallback"]
         if fallback["mode"] != "fixed_steps":
             raise ValueError(f"direct static state admission rejected: {error}; formal fallback is calibration_required and cannot be selected by CLI") from error
@@ -160,10 +162,14 @@ def main() -> None:
         start = resume_next_segment_index(checkpoint, segments, provenance)
         model.load_state_dict(checkpoint["model"]); runner.load_boundary_state(checkpoint["runner_state"]); restore_rng_state(checkpoint["rng_state"])
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    effective = {"requested": config, "constructed": {**effective_model_config(model), "optimizer": config["training"]["optimizer"], "schedule": [segment.__dict__ for segment in reference_schedule()], "observations_per_update": runner.observations_per_update, "loss_weights": config["training"]["loss_weights"]}, "source_lock": source_lock}
+    effective = {"requested": config, "constructed": {**effective_model_config(model), "optimizer": config["training"]["optimizer"], "schedule": [{**segment.__dict__, "owners": sorted(segment.owners)} for segment in reference_schedule()], "observations_per_update": runner.observations_per_update, "loss_weights": config["training"]["loss_weights"]}, "source_lock": source_lock}
     (args.output_dir / "effective_config.json").write_text(json.dumps(effective, indent=2) + "\n")
     static_diagnostics = static_reference_diagnostics(model, sampler)
-    (args.output_dir / "static_reference_ready.json").write_text(json.dumps({**static_init, **static_diagnostics, "canonical_coordinate_frames": coordinate_frames, "external_lps_domain_containment": containment, "internal_static_inr_domain_containment": internal_containment, "static_manifest": str(args.static_manifest), "static_manifest_sha256": _sha256(args.static_manifest), "static_pose_map": str(pose_manifest)}, indent=2) + "\n")
+    (args.output_dir / "static_reference_ready.json").write_text(json.dumps({**static_init, **static_diagnostics, "canonical_coordinate_frames": coordinate_frames, "external_lps_domain_containment": containment, "static_inr_bbox_diagnostic": static_inr_bbox_diagnostic, "static_manifest": str(args.static_manifest), "static_manifest_sha256": _sha256(args.static_manifest), "static_pose_map": str(pose_manifest)}, indent=2) + "\n")
+    if args.preflight_only:
+        report = {"status": "PASS", "git_sha": _git_head(), "static_initialization_mode": static_init["mode"], "encoding_backend": static_backend, "external_lps_domain_containment": containment, "static_inr_bbox_diagnostic": static_inr_bbox_diagnostic, "canonical_coordinate_frames": coordinate_frames, "static_reference_reconstruction": static_diagnostics, "formal_training_started": False}
+        (args.output_dir / "preflight_report.json").write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report, indent=2)); return
     for segment in segments[start:]:
         runner.run_segment(segment)
         payload = _checkpoint(model=model, runner=runner, config=config, provenance=provenance, static_init=static_init)

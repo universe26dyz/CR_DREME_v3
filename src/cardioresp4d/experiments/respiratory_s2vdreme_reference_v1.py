@@ -346,16 +346,18 @@ def corrected_pose_containment_audit(poses: Mapping[tuple[str, str], CorrectedSt
 
 
 def corrected_pose_internal_inr_containment_audit(poses: Mapping[tuple[str, str], CorrectedStaticPose | Mapping[str, Any]], *, internal_lower_world_mm: Sequence[float], internal_upper_world_mm: Sequence[float], world_to_internal_transform: torch.Tensor, tolerance_mm: float = 1e-5) -> dict[str, Any]:
-    """Fail closed when corrected LPS slice support exceeds inherited INR RAS support.
+    """Report final-pose relation to NeSVoR's saved coordinate-normalization bbox.
 
-    The tolerance is explicit because the NeSVoR corrected affine and saved INR
-    box are float32 artifacts; it is not a domain expansion.
+    NeSVoR restores the pre-optimization bbox after transformation optimization,
+    so it is a reconstruction/normalization bbox rather than a proven hard
+    support mask for final corrected slices.  External LPS containment remains
+    the fail-closed geometry admission check.
     """
     lower, upper = np.asarray(internal_lower_world_mm, dtype=float), np.asarray(internal_upper_world_mm, dtype=float)
     transform = np.asarray(torch.as_tensor(world_to_internal_transform, dtype=torch.float64).cpu(), dtype=float)
     if lower.shape != (3,) or upper.shape != (3,) or transform.shape != (3, 3) or np.any(upper <= lower) or tolerance_mm < 0:
         raise ValueError("internal INR containment bounds/transform/tolerance are invalid")
-    minimum_margin = math.inf
+    minimum_margin = math.inf; maximum_violation = 0.; maximum_violation_by_axis = np.zeros(3); inside_count = 0; outside_count = 0; worst_view: str | None = None; worst_slice_id: str | None = None
     for (view, slice_id), value in sorted(poses.items()):
         geometry = value.corrected_geometry if isinstance(value, CorrectedStaticPose) else value
         _, height, width = geometry["image_shape"]
@@ -365,12 +367,18 @@ def corrected_pose_internal_inr_containment_audit(poses: Mapping[tuple[str, str]
         ras_corners = lps_corners @ transform.T
         below, above = lower - ras_corners.min(axis=0), ras_corners.max(axis=0) - upper
         violation = np.maximum(np.maximum(below, above), 0.)
-        if np.any(violation > tolerance_mm):
-            raise ValueError(f"corrected pose outside static INR support for {view}/{slice_id}: corrected_lps_min={lps_corners.min(axis=0).tolist()} corrected_lps_max={lps_corners.max(axis=0).tolist()} converted_ras_min={ras_corners.min(axis=0).tolist()} converted_ras_max={ras_corners.max(axis=0).tolist()} static_inr_ras_min={lower.tolist()} static_inr_ras_max={upper.tolist()} violation_mm={violation.tolist()}")
+        location_violation = float(violation.max())
+        if location_violation > tolerance_mm:
+            outside_count += 1
+            if location_violation > maximum_violation:
+                maximum_violation = location_violation; worst_view = view; worst_slice_id = slice_id
+        else:
+            inside_count += 1
+        maximum_violation_by_axis = np.maximum(maximum_violation_by_axis, violation)
         minimum_margin = min(minimum_margin, float(np.minimum(ras_corners - lower, upper - ras_corners).min()))
     if not poses:
         raise ValueError("internal INR containment requires at least one location")
-    return {"policy": "corrected_slice_corners_lps_to_ras", "tolerance_mm": tolerance_mm, "location_count": len(poses), "minimum_margin_to_boundary_mm": minimum_margin, "passed": True}
+    return {"policy": "diagnostic_corrected_slice_corners_vs_static_inr_bbox", "tolerance_mm": tolerance_mm, "location_count": len(poses), "inside_location_count": inside_count, "outside_location_count": outside_count, "maximum_violation_mm": maximum_violation, "maximum_violation_by_axis_mm": maximum_violation_by_axis.tolist(), "minimum_margin_to_bbox_mm": minimum_margin, "worst_view": worst_view, "worst_slice_id": worst_slice_id}
 
 
 def write_static_reference_manifest(*, output_dir: str | Path, source_manifest: str | Path, qc_table: str | Path, mean_slice_manifest: str | Path, command: Sequence[str], executable: str, version: str, mode: str) -> Path:
