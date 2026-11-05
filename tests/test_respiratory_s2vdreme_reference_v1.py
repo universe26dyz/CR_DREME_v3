@@ -98,7 +98,10 @@ def test_temporal_mean_export_accepts_multiple_integer_gaps_and_numeric_jitter(t
 
 
 def test_formal_and_smoke_nesvor_commands_are_distinct_and_complete() -> None:
+    from cardioresp4d.adapters._upstream import add_upstream_to_path
     from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import nesvor_reconstruct_command
+    add_upstream_to_path("NeSVoR")
+    from nesvor.cli.parsers import main_parser
 
     formal = nesvor_reconstruct_command(["sax.nii.gz", "2ch.nii.gz", "4ch.nii.gz"], output_dir="out", thicknesses_mm=[4.0, 4.0, 4.0], smoke=False)
     smoke = nesvor_reconstruct_command(["sax.nii.gz"], output_dir="out", thicknesses_mm=[4.0], smoke=True)
@@ -111,6 +114,10 @@ def test_formal_and_smoke_nesvor_commands_are_distinct_and_complete() -> None:
     assert formal[formal.index("--output-intensity-mean") + 1] == "0"
     assert formal[formal.index("--background-threshold") + 1] == "0"
     assert "--output-slices" in formal and "--output-log" in formal
+    assert "--weight-pixel-var-smooth" not in formal
+    assert "--pixel-variance-weight" not in formal
+    parser, _ = main_parser()
+    assert parser.parse_args(formal[1:]).command == "reconstruct"
 
 
 def test_static_manifest_requires_explicit_zero_background_threshold(tmp_path) -> None:

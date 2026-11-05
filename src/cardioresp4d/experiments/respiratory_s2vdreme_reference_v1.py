@@ -30,11 +30,11 @@ LATTICE_TOLERANCE_MM = 1e-3
 FORMAL_NESVOR_OPTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("--registration", ("stack",)), ("--scanner-space", ()), ("--metric", ("none",)),
     ("--weight-transformation", ("1",)), ("--weight-deform", ("0.1",)), ("--weight-image", ("1",)),
-    ("--weight-pixel-var-smooth", ("0",)), ("--output-resolution", ("1.0",)), ("--output-psf-factor", ("1",)),
+    ("--output-resolution", ("1.0",)), ("--output-psf-factor", ("1",)),
     ("--no-slice-scale", ()), ("--single-precision", ()), ("--log2-hashmap-size", ("19",)),
     ("--batch-size", ("2000",)), ("--n-iter", ("10000",)), ("--n-samples", ("256",)),
     ("--n-inference-samples", ("128",)), ("--inference-batch-size", ("16000",)),
-    ("--pixel-variance-weight", ("1",)), ("--coarsest-resolution", ("16",)), ("--finest-resolution", ("0.5",)),
+    ("--coarsest-resolution", ("16",)), ("--finest-resolution", ("0.5",)),
     ("--level-scale", ("1.3819",)), ("--n-features-per-level", ("2",)), ("--depth", ("1",)),
     ("--width", ("64",)), ("--n-features-z", ("15",)), ("--n-features-slice", ("16",)),
     ("--weight-bias", ("100",)), ("--image-regularization", ("edge",)), ("--delta", ("0.2",)),
