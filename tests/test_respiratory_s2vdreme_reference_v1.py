@@ -98,10 +98,7 @@ def test_temporal_mean_export_accepts_multiple_integer_gaps_and_numeric_jitter(t
 
 
 def test_formal_and_smoke_nesvor_commands_are_distinct_and_complete() -> None:
-    from cardioresp4d.adapters._upstream import add_upstream_to_path
     from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import nesvor_reconstruct_command
-    add_upstream_to_path("NeSVoR")
-    from nesvor.cli.parsers import main_parser
 
     formal = nesvor_reconstruct_command(["sax.nii.gz", "2ch.nii.gz", "4ch.nii.gz"], output_dir="out", thicknesses_mm=[4.0, 4.0, 4.0], smoke=False)
     smoke = nesvor_reconstruct_command(["sax.nii.gz"], output_dir="out", thicknesses_mm=[4.0], smoke=True)
@@ -114,10 +111,111 @@ def test_formal_and_smoke_nesvor_commands_are_distinct_and_complete() -> None:
     assert formal[formal.index("--output-intensity-mean") + 1] == "0"
     assert formal[formal.index("--background-threshold") + 1] == "0"
     assert "--output-slices" in formal and "--output-log" in formal
-    assert "--weight-pixel-var-smooth" not in formal
-    assert "--pixel-variance-weight" not in formal
-    parser, _ = main_parser()
-    assert parser.parse_args(formal[1:]).command == "reconstruct"
+    assert formal[formal.index("--pixel-variance-weight") + 1] == "1"
+    assert formal[formal.index("--weight-pixel-var-smooth") + 1] == "0"
+    assert "--no-slice-scale" in formal
+    assert "--no-pixel-variance" not in formal and "--no-slice-variance" not in formal
+    assert smoke[smoke.index("--pixel-variance-weight") + 1] == "1"
+    assert smoke[smoke.index("--weight-pixel-var-smooth") + 1] == "0"
+    assert "--no-slice-scale" in smoke
+
+
+def _historical_runtime_fixture(tmp_path, monkeypatch, *, version: str = "0.6.0rc1", omit_flag: str | None = None, package_inside: bool = True):
+    import cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 as reference
+
+    source_root = tmp_path / "nesvor"
+    package_root = source_root if package_inside else tmp_path / "outside" / "nesvor"
+    package_root.mkdir(parents=True)
+    (package_root / "__init__.py").write_text("")
+    (package_root / "version.py").write_text(f'__version__ = "{version}"\n')
+    hashes = {}
+    for relative in ("inr/models.py", "inr/train.py", "cli/parsers.py", "cli/io.py"):
+        path = source_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# {relative}\n")
+        hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    monkeypatch.setattr(reference, "HISTORICAL_NESVOR_SOURCE_SHA256", hashes)
+    runtime_python = tmp_path / "historical-python"
+    runtime_python.write_text(f"#!/bin/sh\nPYTHONPATH='{package_root.parent}' exec '{sys.executable}' \"$@\"\n")
+    runtime_python.chmod(0o755)
+    flags = [flag for flag in reference.HISTORICAL_NESVOR_REQUIRED_FLAGS if flag != omit_flag]
+    executable = tmp_path / "historical-nesvor"
+    executable.write_text("#!/bin/sh\n"
+                          "if [ \"$1\" = \"--version\" ]; then echo '" + version + "'; exit 0; fi\n"
+                          "if [ \"$1\" = \"reconstruct\" ] && [ \"$2\" = \"--help\" ]; then printf '%s\\n' '" + "' '".join(flags) + "'; exit 0; fi\n"
+                          "exit 1\n")
+    executable.chmod(0o755)
+    return reference, executable, runtime_python, source_root
+
+
+def test_historical_nesvor_runtime_verifier_accepts_exact_contract(tmp_path, monkeypatch) -> None:
+    reference, executable, runtime_python, source_root = _historical_runtime_fixture(tmp_path, monkeypatch)
+
+    provenance = reference.verify_historical_nesvor_runtime(executable=executable, runtime_python=runtime_python, source_root=source_root)
+
+    assert provenance["runtime_profile"] == "historical_nesvor_v5_128_w1"
+    assert provenance["version"] == "0.6.0rc1"
+    assert provenance["package_path"] == str((source_root / "__init__.py").resolve())
+    assert provenance["required_flags_verified"] == list(reference.HISTORICAL_NESVOR_REQUIRED_FLAGS)
+    assert provenance["source_files_sha256"] == reference.HISTORICAL_NESVOR_SOURCE_SHA256
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"omit_flag": "--pixel-variance-weight"}, "--pixel-variance-weight"),
+        ({"omit_flag": "--weight-pixel-var-smooth"}, "--weight-pixel-var-smooth"),
+        ({"version": "0.6.0"}, "version"),
+        ({"package_inside": False}, "outside source root"),
+    ],
+)
+def test_historical_nesvor_runtime_verifier_rejects_invalid_identity(tmp_path, monkeypatch, kwargs, message) -> None:
+    reference, executable, runtime_python, source_root = _historical_runtime_fixture(tmp_path, monkeypatch, **kwargs)
+
+    with pytest.raises(ValueError, match=message):
+        reference.verify_historical_nesvor_runtime(executable=executable, runtime_python=runtime_python, source_root=source_root)
+
+
+def test_historical_nesvor_runtime_verifier_rejects_source_hash_mismatch(tmp_path, monkeypatch) -> None:
+    reference, executable, runtime_python, source_root = _historical_runtime_fixture(tmp_path, monkeypatch)
+    (source_root / "inr" / "models.py").write_text("tampered\n")
+
+    with pytest.raises(ValueError, match="hash"):
+        reference.verify_historical_nesvor_runtime(executable=executable, runtime_python=runtime_python, source_root=source_root)
+
+
+def test_static_manifest_records_verified_historical_runtime(tmp_path, monkeypatch) -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import nesvor_reconstruct_command, write_static_reference_manifest
+
+    reference, executable, runtime_python, source_root = _historical_runtime_fixture(tmp_path, monkeypatch)
+    runtime = reference.verify_historical_nesvor_runtime(executable=executable, runtime_python=runtime_python, source_root=source_root)
+    source = tmp_path / "source.csv"; source.write_text("source\n")
+    qc = tmp_path / "qc.csv"; qc.write_text("qc\n")
+    stack = tmp_path / "mean_stack_SAX.nii.gz"
+    nib.save(nib.Nifti1Image(np.zeros((5, 4, 1), dtype=np.float32), np.eye(4)), stack)
+    geometry = {"center_mm": [0., 0., 0.], "row_direction": [1., 0., 0.], "column_direction": [0., 1., 0.], "normal": [0., 0., 1.], "pixel_spacing_mm": [1., 1.], "slice_thickness_mm": 4., "image_shape": [1, 4, 5]}
+    mean = tmp_path / "mean.json"
+    mean.write_text(json.dumps({"locations": [{"view": "SAX", "slice_id": "a", "stack_file": stack.name, "stack_index": 0, "geometry": geometry, "geometry_hash": "geometry", "stack_thickness_mm": 4.}]}))
+    output = tmp_path / "output"; (output / "slices").mkdir(parents=True)
+    nib.save(nib.Nifti1Image(np.zeros((5, 4, 1), dtype=np.float32), np.eye(4)), output / "slices" / "0.nii.gz")
+    nib.save(nib.Nifti1Image(np.zeros((5, 4, 1), dtype=np.float32), np.eye(4)), output / "static_reference.nii.gz")
+    for filename in ("model.pt", "nesvor_effective_args.json", "nesvor.log"):
+        (output / filename).write_text(filename)
+    command = nesvor_reconstruct_command([stack], output_dir=output, thicknesses_mm=[4.0])
+    command[0] = str(executable)
+
+    manifest = json.loads(write_static_reference_manifest(output_dir=output, source_manifest=source, qc_table=qc, mean_slice_manifest=mean, command=command, runtime_provenance=runtime, mode="formal").read_text())
+
+    nesvor = manifest["nesvor"]
+    assert nesvor["runtime_profile"] == "historical_nesvor_v5_128_w1"
+    assert nesvor["executable"] == str(executable.resolve())
+    assert nesvor["runtime_python"] == str(runtime_python.resolve())
+    assert nesvor["source_root"] == str(source_root.resolve())
+    assert nesvor["package_path"] == str((source_root / "__init__.py").resolve())
+    assert nesvor["source_files_sha256"] == reference.HISTORICAL_NESVOR_SOURCE_SHA256
+    assert "--pixel-variance-weight" in nesvor["required_flags_verified"]
+    assert "pinned_commit" not in nesvor
+    assert manifest["scientific_contract"] == {"registration": "stack", "transformation_optimization": "enabled", "output_intensity_mean": 0, "background_threshold": 0, "formal_n_iter": 10000, "formal_n_samples": 256}
 
 
 def test_static_manifest_requires_explicit_zero_background_threshold(tmp_path) -> None:
@@ -127,7 +225,7 @@ def test_static_manifest_requires_explicit_zero_background_threshold(tmp_path) -
     qc = tmp_path / "qc.csv"; qc.write_text("x")
     mean = tmp_path / "mean.json"; mean.write_text(json.dumps({"locations": []}))
     with pytest.raises(ValueError, match="background_threshold"):
-        write_static_reference_manifest(output_dir=tmp_path, source_manifest=source, qc_table=qc, mean_slice_manifest=mean, command=["nesvor", "reconstruct", "--output-intensity-mean", "0"], executable="nesvor", version="0.6.0rc1", mode="formal")
+        write_static_reference_manifest(output_dir=tmp_path, source_manifest=source, qc_table=qc, mean_slice_manifest=mean, command=["nesvor", "reconstruct", "--output-intensity-mean", "0"], runtime_provenance={}, mode="formal")
 
 
 def test_reference_encoder_has_eight_film_layers_and_gradients() -> None:
@@ -293,7 +391,9 @@ def test_corrected_pose_map_propagates_per_location_without_changing_frame_conte
     for index, x in enumerate((10., 20.)):
         affine = np.eye(4); affine[:3, 3] = [-(x + 2.), 0., 0.]  # RAS origin; slice centre maps to LPS +x.
         nib.save(nib.Nifti1Image(np.zeros((5, 4, 1), dtype=np.float32), affine), slices / f"{index}.nii.gz")
+        nib.save(nib.Nifti1Image(np.zeros((5, 4, 1), dtype=np.float32), affine), slices / f"mask_{index}.nii.gz")
     pose_map = build_corrected_pose_map(mean_manifest, slices)
+    assert len(pose_map) == 2
     frames = [_observation(slice_id="a", timestamp=2., value=3.), _observation(slice_id="a", timestamp=1., value=4.), _observation(slice_id="b", timestamp=0., value=5.)]
     corrected = apply_corrected_static_poses(list(reversed(frames)), pose_map)
     assert [item.slice_id for item in corrected] == ["a", "a", "b"]

@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import subprocess
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -27,11 +29,25 @@ from cardioresp4d.training.stage_contract import stage_contract
 
 REFERENCE_LOSS_WEIGHTS = {"image": 2e-6, "mbc_normalization": 1e-2, "smooth_resp": 1e-3}
 LATTICE_TOLERANCE_MM = 1e-3
+HISTORICAL_NESVOR_RUNTIME_PROFILE = "historical_nesvor_v5_128_w1"
+HISTORICAL_NESVOR_VERSION = "0.6.0rc1"
+HISTORICAL_NESVOR_REQUIRED_FLAGS = (
+    "--pixel-variance-weight", "--weight-pixel-var-smooth", "--no-slice-scale",
+    "--no-pixel-variance", "--no-slice-variance", "--n-inference-samples",
+    "--n-samples", "--batch-size", "--n-iter", "--output-psf-factor",
+)
+HISTORICAL_NESVOR_SOURCE_SHA256 = {
+    "inr/models.py": "3a81fb1781c374871e68f99f3655ed1f6e243a6427e9de11e532e80cfc20bfb2",
+    "inr/train.py": "fe8330dbe159ea5340bb32bb0042e054ed137d232a220240ecd9fda5714e6dee",
+    "cli/parsers.py": "88f8d73b81e23ea29475a1ea220a17f796d809d374ff3e16da1a9ad2267ce099",
+    "cli/io.py": "37753d428c4166eddb90ba80f8fd68846e91f8d343721f4c8977232f0f8135a6",
+}
 FORMAL_NESVOR_OPTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("--registration", ("stack",)), ("--scanner-space", ()), ("--metric", ("none",)),
     ("--weight-transformation", ("1",)), ("--weight-deform", ("0.1",)), ("--weight-image", ("1",)),
     ("--output-resolution", ("1.0",)), ("--output-psf-factor", ("1",)),
-    ("--no-slice-scale", ()), ("--single-precision", ()), ("--log2-hashmap-size", ("19",)),
+    ("--no-slice-scale", ()), ("--pixel-variance-weight", ("1",)), ("--weight-pixel-var-smooth", ("0",)),
+    ("--single-precision", ()), ("--log2-hashmap-size", ("19",)),
     ("--batch-size", ("2000",)), ("--n-iter", ("10000",)), ("--n-samples", ("256",)),
     ("--n-inference-samples", ("128",)), ("--inference-batch-size", ("16000",)),
     ("--coarsest-resolution", ("16",)), ("--finest-resolution", ("0.5",)),
@@ -40,6 +56,63 @@ FORMAL_NESVOR_OPTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("--weight-bias", ("100",)), ("--image-regularization", ("edge",)), ("--delta", ("0.2",)),
     ("--learning-rate", ("0.005",)), ("--gamma", ("0.33",)), ("--milestones", ("0.5", "0.75", "0.9")), ("--seed", ("20260823",)),
 )
+
+
+def verify_historical_nesvor_runtime(*, executable: str | Path, runtime_python: str | Path, source_root: str | Path) -> dict[str, Any]:
+    """Fail closed unless the static runtime is the audited historical NeSVoR."""
+    executable_path = Path(executable).resolve()
+    python_path = Path(runtime_python).resolve()
+    source_path = Path(source_root).resolve()
+    for label, path in (("NeSVoR executable", executable_path), ("NeSVoR runtime Python", python_path)):
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise ValueError(f"{label} is not an executable file: {path}")
+    if not source_path.is_dir():
+        raise ValueError(f"NeSVoR source root is not a directory: {source_path}")
+
+    def run_checked(command: Sequence[str]) -> str:
+        completed = subprocess.run(command, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if completed.returncode != 0:
+            raise ValueError(f"historical NeSVoR runtime verification failed: {' '.join(command)}\n{completed.stdout.strip()}")
+        return completed.stdout.strip()
+
+    version = run_checked([str(executable_path), "--version"])
+    if version != HISTORICAL_NESVOR_VERSION:
+        raise ValueError(f"historical NeSVoR executable version must be {HISTORICAL_NESVOR_VERSION}, got {version!r}")
+    help_text = run_checked([str(executable_path), "reconstruct", "--help"])
+    missing_flags = [flag for flag in HISTORICAL_NESVOR_REQUIRED_FLAGS if flag not in help_text]
+    if missing_flags:
+        raise ValueError(f"historical NeSVoR reconstruct parser is missing required flags: {', '.join(missing_flags)}")
+    probe = "import json, nesvor; from nesvor.version import __version__; print(json.dumps({'version': __version__, 'package_path': nesvor.__file__}))"
+    try:
+        package = json.loads(run_checked([str(python_path), "-c", probe]))
+    except json.JSONDecodeError as error:
+        raise ValueError("historical NeSVoR runtime Python did not emit package provenance JSON") from error
+    package_path = Path(package.get("package_path", "")).resolve()
+    if package.get("version") != HISTORICAL_NESVOR_VERSION:
+        raise ValueError(f"historical NeSVoR runtime Python version must be {HISTORICAL_NESVOR_VERSION}, got {package.get('version')!r}")
+    try:
+        package_path.relative_to(source_path)
+    except ValueError as error:
+        raise ValueError(f"historical NeSVoR package path is outside source root: {package_path}") from error
+    source_hashes = {}
+    for relative, expected_hash in HISTORICAL_NESVOR_SOURCE_SHA256.items():
+        path = source_path / relative
+        if not path.is_file():
+            raise ValueError(f"historical NeSVoR critical source file is missing: {path}")
+        actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            raise ValueError(f"historical NeSVoR source hash mismatch for {relative}: expected {expected_hash}, got {actual_hash}")
+        source_hashes[relative] = actual_hash
+    return {
+        "runtime_profile": HISTORICAL_NESVOR_RUNTIME_PROFILE,
+        "version": version,
+        "executable": str(executable_path),
+        "runtime_python": str(python_path),
+        "source_root": str(source_path),
+        "package_path": str(package_path),
+        "required_flags_verified": list(HISTORICAL_NESVOR_REQUIRED_FLAGS),
+        "source_files_sha256": source_hashes,
+    }
 
 
 @dataclass(frozen=True)
@@ -435,11 +508,14 @@ def corrected_pose_internal_inr_containment_audit(poses: Mapping[tuple[str, str]
     return {"policy": "diagnostic_corrected_slice_corners_vs_static_inr_bbox", "tolerance_mm": tolerance_mm, "location_count": len(poses), "inside_location_count": inside_count, "outside_location_count": outside_count, "maximum_violation_mm": maximum_violation, "maximum_violation_by_axis_mm": maximum_violation_by_axis.tolist(), "minimum_margin_to_bbox_mm": minimum_margin, "worst_view": worst_view, "worst_slice_id": worst_slice_id}
 
 
-def write_static_reference_manifest(*, output_dir: str | Path, source_manifest: str | Path, qc_table: str | Path, mean_slice_manifest: str | Path, command: Sequence[str], executable: str, version: str, mode: str) -> Path:
+def write_static_reference_manifest(*, output_dir: str | Path, source_manifest: str | Path, qc_table: str | Path, mean_slice_manifest: str | Path, command: Sequence[str], runtime_provenance: Mapping[str, Any], mode: str) -> Path:
     """Close the static artifact/provenance chain after NeSVoR has completed."""
     output = Path(output_dir); mean_path = Path(mean_slice_manifest)
     if mode not in {"formal", "smoke"} or "--output-intensity-mean" not in command or command[command.index("--output-intensity-mean") + 1] != "0" or "--background-threshold" not in command or command[command.index("--background-threshold") + 1] != "0":
         raise ValueError("static manifest requires explicit output_intensity_mean=0 and background_threshold=0")
+    required_provenance = {"runtime_profile", "version", "executable", "runtime_python", "source_root", "package_path", "required_flags_verified", "source_files_sha256"}
+    if runtime_provenance.get("runtime_profile") != HISTORICAL_NESVOR_RUNTIME_PROFILE or not required_provenance.issubset(runtime_provenance):
+        raise ValueError("static manifest requires verified historical NeSVoR runtime provenance")
     pose_map = build_corrected_pose_map(mean_path, output / "slices")
     pose_path = output / "corrected_pose_manifest.json"
     pose_path.write_text(json.dumps({"mapping_policy": "NeSVoR output_slices follows deterministic input-stack then intra-stack order", "poses": {f"{view}/{slice_id}": asdict(pose) for (view, slice_id), pose in sorted(pose_map.items())}}, indent=2) + "\n")
@@ -452,7 +528,7 @@ def write_static_reference_manifest(*, output_dir: str | Path, source_manifest: 
     for stack in stack_paths:
         locations = sorted((item for item in mean["locations"] if item["stack_file"] == stack), key=lambda item: int(item["stack_index"]))
         stacks.append({"path": str(mean_path.parent / stack), "sha256": hashlib.sha256((mean_path.parent / stack).read_bytes()).hexdigest(), "view": locations[0]["view"], "location_count": len(locations), "slice_ids_in_stack_order": [item["slice_id"] for item in locations], "thickness_mm": locations[0]["stack_thickness_mm"], "geometry_hashes": [item["geometry_hash"] for item in locations]})
-    payload = {"source_manifest_sha256": hashlib.sha256(Path(source_manifest).read_bytes()).hexdigest(), "qc_table_sha256": hashlib.sha256(Path(qc_table).read_bytes()).hexdigest(), "mean_slice_manifest": artifact(mean_path), "mean_stacks": stacks, "nesvor": {"executable": executable, "version": version, "command": list(command), "mode": mode, "pinned_commit": "2e96a91bdd30174210caea911e03a2778c65adbe"}, "outputs": outputs, "corrected_pose_manifest": artifact(pose_path), "pose_location_count": len(pose_map), "scientific_contract": {"registration": "stack", "transformation_optimization": "enabled", "output_intensity_mean": 0, "background_threshold": 0, "formal_n_iter": 10000, "formal_n_samples": 256}}
+    payload = {"source_manifest_sha256": hashlib.sha256(Path(source_manifest).read_bytes()).hexdigest(), "qc_table_sha256": hashlib.sha256(Path(qc_table).read_bytes()).hexdigest(), "mean_slice_manifest": artifact(mean_path), "mean_stacks": stacks, "nesvor": {**dict(runtime_provenance), "command": list(command), "mode": mode}, "outputs": outputs, "corrected_pose_manifest": artifact(pose_path), "pose_location_count": len(pose_map), "scientific_contract": {"registration": "stack", "transformation_optimization": "enabled", "output_intensity_mean": 0, "background_threshold": 0, "formal_n_iter": 10000, "formal_n_samples": 256}}
     manifest = output / "static_reference_manifest.json"; manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return manifest
 
