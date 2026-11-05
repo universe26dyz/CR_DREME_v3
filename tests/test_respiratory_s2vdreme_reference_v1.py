@@ -383,7 +383,7 @@ def test_static_validator_writes_exact_torch_hash_cpu_report(tmp_path, monkeypat
     domain = {"world_min_mm": [-4., -4., -4.], "world_max_mm": [4., 4., 4.], "cardiac_box": {"min_mm": [-2., -2., -2.], "max_mm": [2., 2., 2.]}}
     domain_path = tmp_path / "domain.json"; domain_path.write_text(json.dumps(domain))
     model_path = tmp_path / "model.pt"
-    source = build_source_first_model(config, domain, n_dynamic_frames=1, device=torch.device("cpu"))
+    source = build_source_first_model(config, domain, n_dynamic_frames=1, device=torch.device("cpu"), canonical_encoding_backend="torch_hash")
     torch.save({"model": source.canonical.inr.state_dict(), "args": source.canonical.args}, model_path)
     output = tmp_path / "validation.json"
     monkeypatch.setattr(sys, "argv", ["validate", "--experiment-config", str(config_path), "--canonical-domain", str(domain_path), "--static-model", str(model_path), "--output", str(output), "--device", "cpu"])
@@ -404,7 +404,7 @@ def test_formal_preflight_writes_admission_artifacts_without_training(tmp_path, 
     domain = {"world_min_mm": [-4., -4., -4.], "world_max_mm": [4., 4., 4.], "cardiac_box": {"min_mm": [-2., -2., -2.], "max_mm": [2., 2., 2.]}}
     domain_path = tmp_path / "domain.json"; domain_path.write_text(json.dumps(domain))
     static_model = tmp_path / "model.pt"
-    source = build_source_first_model(config, domain, n_dynamic_frames=1, device=torch.device("cpu"))
+    source = build_source_first_model(config, domain, n_dynamic_frames=1, device=torch.device("cpu"), canonical_encoding_backend="torch_hash")
     torch.save({"model": source.canonical.inr.state_dict(), "args": source.canonical.args}, static_model)
     manifest_path = tmp_path / "manifest.csv"; manifest_path.write_text("manifest\n")
     qc_path = tmp_path / "qc.csv"; qc_path.write_text("qc\n")
