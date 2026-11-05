@@ -453,6 +453,65 @@ def apply_corrected_static_poses(observations: Iterable[DynamicObservation], pos
     return result
 
 
+def _corrected_inplane_corners(value: CorrectedStaticPose | Mapping[str, Any]) -> np.ndarray:
+    geometry = value.corrected_geometry if isinstance(value, CorrectedStaticPose) else value
+    image_shape = geometry.get("image_shape")
+    if not isinstance(image_shape, (list, tuple)) or len(image_shape) != 3:
+        raise ValueError("corrected pose image_shape must contain three values")
+    _, height, width = (int(item) for item in image_shape)
+    if height <= 0 or width <= 0:
+        raise ValueError("corrected pose image_shape must be positive")
+    center, row, column = (np.asarray(geometry[key], dtype=float) for key in ("center_mm", "row_direction", "column_direction"))
+    spacing_row, spacing_column = (float(item) for item in geometry["pixel_spacing_mm"])
+    if any(array.shape != (3,) or not np.isfinite(array).all() for array in (center, row, column)) or not np.isfinite([spacing_row, spacing_column]).all() or spacing_row <= 0 or spacing_column <= 0:
+        raise ValueError("corrected pose geometry must be finite with positive pixel spacing")
+    return np.asarray([center + (u - (width - 1) / 2.) * spacing_column * row + (v - (height - 1) / 2.) * spacing_row * column for u in (0., width - 1.) for v in (0., height - 1.)])
+
+
+def derive_effective_external_domain(poses: Mapping[tuple[str, str], CorrectedStaticPose | Mapping[str, Any]], phase1_lower_world_mm: Sequence[float], phase1_upper_world_mm: Sequence[float]) -> dict[str, Any]:
+    """Derive the dynamic LPS domain as the exact source/corrected-FOV union."""
+    source_lower, source_upper = np.asarray(phase1_lower_world_mm, dtype=float), np.asarray(phase1_upper_world_mm, dtype=float)
+    if source_lower.shape != (3,) or source_upper.shape != (3,) or not np.isfinite(source_lower).all() or not np.isfinite(source_upper).all() or np.any(source_upper <= source_lower):
+        raise ValueError("Phase-1 external domain bounds must be finite ordered [3] values")
+    if not poses:
+        raise ValueError("effective external domain requires at least one corrected pose")
+    corners_by_location = {f"{view}/{slice_id}": _corrected_inplane_corners(value) for (view, slice_id), value in sorted(poses.items())}
+    all_corners = np.concatenate(tuple(corners_by_location.values()), axis=0)
+    corrected_lower, corrected_upper = all_corners.min(axis=0), all_corners.max(axis=0)
+    exact_lower, exact_upper = np.minimum(source_lower, corrected_lower), np.maximum(source_upper, corrected_upper)
+    model_lower32 = np.asarray(exact_lower, dtype=np.float32)
+    model_upper32 = np.asarray(exact_upper, dtype=np.float32)
+    for index in range(3):
+        if float(model_lower32[index]) > exact_lower[index]:
+            model_lower32[index] = np.nextafter(model_lower32[index], np.float32(-np.inf))
+        if float(model_upper32[index]) < exact_upper[index]:
+            model_upper32[index] = np.nextafter(model_upper32[index], np.float32(np.inf))
+    model_lower, model_upper = model_lower32.astype(np.float64), model_upper32.astype(np.float64)
+    lower_expansion = np.maximum(source_lower - exact_lower, 0.)
+    upper_expansion = np.maximum(exact_upper - source_upper, 0.)
+    violating_count = 0; maximum_violation = 0.; worst_location: str | None = None
+    for location, corners in corners_by_location.items():
+        violation = np.maximum(np.maximum(source_lower - corners.min(axis=0), corners.max(axis=0) - source_upper), 0.)
+        location_violation = float(violation.max())
+        if location_violation > 0.:
+            violating_count += 1
+            if location_violation > maximum_violation:
+                maximum_violation, worst_location = location_violation, location
+    return {
+        "policy": "phase1_domain_union_corrected_static_inplane_fov",
+        "source_phase1_domain": {"lower_lps_mm": source_lower.tolist(), "upper_lps_mm": source_upper.tolist()},
+        "corrected_static_fov_union": {"lower_lps_mm": corrected_lower.tolist(), "upper_lps_mm": corrected_upper.tolist()},
+        "exact_effective_domain": {"lower_lps_mm": exact_lower.tolist(), "upper_lps_mm": exact_upper.tolist()},
+        "model_float32_effective_domain": {"lower_lps_mm": model_lower.tolist(), "upper_lps_mm": model_upper.tolist()},
+        "physical_expansion_mm": {"lower_xyz": lower_expansion.tolist(), "upper_xyz": upper_expansion.tolist(), "maximum": float(max(lower_expansion.max(), upper_expansion.max()))},
+        "float32_outward_adjustment_mm": {"lower_xyz": (model_lower - exact_lower).tolist(), "upper_xyz": (model_upper - exact_upper).tolist()},
+        "corrected_location_count": len(corners_by_location),
+        "source_domain_violating_location_count": violating_count,
+        "maximum_source_domain_violation_mm": maximum_violation,
+        "worst_location": worst_location,
+    }
+
+
 def corrected_pose_containment_audit(poses: Mapping[tuple[str, str], CorrectedStaticPose | Mapping[str, Any]], *, lower_world_mm: Sequence[float], upper_world_mm: Sequence[float], tolerance_mm: float = 1e-5) -> dict[str, Any]:
     """Fail-closed corrected in-plane-corner admission using DynamicObservation geometry."""
     lower, upper = np.asarray(lower_world_mm, dtype=float), np.asarray(upper_world_mm, dtype=float)
@@ -460,11 +519,7 @@ def corrected_pose_containment_audit(poses: Mapping[tuple[str, str], CorrectedSt
         raise ValueError("canonical containment bounds/tolerance are invalid")
     min_margin = math.inf; max_margin = -math.inf
     for (view, slice_id), value in sorted(poses.items()):
-        geometry = value.corrected_geometry if isinstance(value, CorrectedStaticPose) else value
-        _, height, width = geometry["image_shape"]
-        center, row, column = (np.asarray(geometry[key], dtype=float) for key in ("center_mm", "row_direction", "column_direction"))
-        spacing_row, spacing_column = geometry["pixel_spacing_mm"]
-        corners = np.asarray([center + (u - (width - 1) / 2.) * spacing_column * row + (v - (height - 1) / 2.) * spacing_row * column for u in (0., width - 1.) for v in (0., height - 1.)])
+        corners = _corrected_inplane_corners(value)
         below, above = lower - corners.min(axis=0), corners.max(axis=0) - upper
         violation = np.maximum(np.maximum(below, above), 0.)
         if np.any(violation > tolerance_mm):
@@ -490,11 +545,7 @@ def corrected_pose_internal_inr_containment_audit(poses: Mapping[tuple[str, str]
         raise ValueError("internal INR containment bounds/transform/tolerance are invalid")
     minimum_margin = math.inf; maximum_violation = 0.; maximum_violation_by_axis = np.zeros(3); inside_count = 0; outside_count = 0; worst_view: str | None = None; worst_slice_id: str | None = None
     for (view, slice_id), value in sorted(poses.items()):
-        geometry = value.corrected_geometry if isinstance(value, CorrectedStaticPose) else value
-        _, height, width = geometry["image_shape"]
-        center, row, column = (np.asarray(geometry[key], dtype=float) for key in ("center_mm", "row_direction", "column_direction"))
-        spacing_row, spacing_column = geometry["pixel_spacing_mm"]
-        lps_corners = np.asarray([center + (u - (width - 1) / 2.) * spacing_column * row + (v - (height - 1) / 2.) * spacing_row * column for u in (0., width - 1.) for v in (0., height - 1.)])
+        lps_corners = _corrected_inplane_corners(value)
         ras_corners = lps_corners @ transform.T
         below, above = lower - ras_corners.min(axis=0), ras_corners.max(axis=0) - upper
         violation = np.maximum(np.maximum(below, above), 0.)

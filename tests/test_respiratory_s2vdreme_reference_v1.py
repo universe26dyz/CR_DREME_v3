@@ -359,6 +359,9 @@ def test_static_inr_bridge_keeps_external_motion_bounds_separate() -> None:
     model = build_source_first_model(config, domain, n_dynamic_frames=1, device=torch.device("cpu"), canonical_internal_bounds_world_mm=internal, canonical_world_to_internal_transform=lps_to_ras_world_matrix())
     torch.testing.assert_close(model.canonical_lower_world_mm, torch.tensor(domain["world_min_mm"]))
     torch.testing.assert_close(model.canonical_upper_world_mm, torch.tensor(domain["world_max_mm"]))
+    for level in model.respiratory_mbc.levels:
+        torch.testing.assert_close(level.lower_world_mm, torch.tensor(domain["world_min_mm"]))
+        torch.testing.assert_close(level.upper_world_mm, torch.tensor(domain["world_max_mm"]))
     torch.testing.assert_close(model.canonical.inr.bounding_box, internal)
     torch.testing.assert_close(model.canonical.world_to_internal(torch.tensor([[1., 2., 3.]])), torch.tensor([[-1., -2., 3.]]))
 
@@ -439,6 +442,63 @@ def test_corrected_pose_containment_is_fail_closed_and_reports_margins() -> None
     outside = {("SAX", "a"): {**inside[("SAX", "a")], "center_mm": [5., 0., 0.]}}
     with pytest.raises(ValueError, match="SAX/a"):
         corrected_pose_containment_audit(outside, lower_world_mm=[-3., -3., -3.], upper_world_mm=[3., 3., 3.])
+
+
+def _domain_pose(center: tuple[float, float, float], *, image_shape: list[int] | None = None) -> dict[str, object]:
+    return {"center_mm": list(center), "row_direction": [1., 0., 0.], "column_direction": [0., 1., 0.], "normal": [0., 0., 1.], "pixel_spacing_mm": [1., 1.], "slice_thickness_mm": 4., "image_shape": [1, 2, 2] if image_shape is None else image_shape}
+
+
+def test_effective_external_domain_has_no_expansion_when_corners_are_inside() -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import derive_effective_external_domain
+
+    report = derive_effective_external_domain({("SAX", "a"): _domain_pose((5., 5., 5.))}, [0., 0., 0.], [10., 10., 10.])
+    assert report["exact_effective_domain"] == {"lower_lps_mm": [0., 0., 0.], "upper_lps_mm": [10., 10., 10.]}
+    assert report["physical_expansion_mm"] == {"lower_xyz": [0., 0., 0.], "upper_xyz": [0., 0., 0.], "maximum": 0.}
+    assert report["source_domain_violating_location_count"] == 0
+
+
+def test_effective_external_domain_is_componentwise_union_and_reports_violations() -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import corrected_pose_containment_audit, derive_effective_external_domain
+
+    poses = {
+        ("SAX", "x"): _domain_pose((-1.5, 5., 5.)),
+        ("SAX", "y"): _domain_pose((5., 11.5, 5.)),
+        ("SAX", "z"): _domain_pose((5., 5., -1.)),
+    }
+    report = derive_effective_external_domain(poses, [0., 0., 0.], [10., 10., 10.])
+    assert report["corrected_static_fov_union"] == {"lower_lps_mm": [-2., 4.5, -1.], "upper_lps_mm": [5.5, 12., 5.]}
+    assert report["exact_effective_domain"] == {"lower_lps_mm": [-2., 0., -1.], "upper_lps_mm": [10., 12., 10.]}
+    assert report["physical_expansion_mm"] == {"lower_xyz": [2., 0., 1.], "upper_xyz": [0., 2., 0.], "maximum": 2.}
+    assert report["source_domain_violating_location_count"] == 3
+    assert report["maximum_source_domain_violation_mm"] == pytest.approx(2.)
+    assert report["worst_location"] == "SAX/x"
+    effective = report["model_float32_effective_domain"]
+    assert corrected_pose_containment_audit(poses, lower_world_mm=effective["lower_lps_mm"], upper_world_mm=effective["upper_lps_mm"])["passed"]
+
+
+def test_effective_external_domain_never_shrinks_and_rounds_float32_outward() -> None:
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import derive_effective_external_domain
+
+    source_lower = [0.100000001, 0.2, 0.3]
+    source_upper = [1.1, 1.2, 1.3]
+    report = derive_effective_external_domain({("SAX", "a"): _domain_pose((0.600000001, 0.7, 0.8))}, source_lower, source_upper)
+    exact = report["exact_effective_domain"]
+    model = report["model_float32_effective_domain"]
+    assert all(model["lower_lps_mm"][i] <= exact["lower_lps_mm"][i] for i in range(3))
+    assert all(model["upper_lps_mm"][i] >= exact["upper_lps_mm"][i] for i in range(3))
+    assert any(value != 0. for value in report["float32_outward_adjustment_mm"]["lower_xyz"] + report["float32_outward_adjustment_mm"]["upper_xyz"])
+
+
+def test_effective_domain_provenance_binds_resume_admission() -> None:
+    launcher = _load_script("train_respiratory_s2vdreme_reference_v1")
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import reference_schedule
+
+    provenance = {"effective_external_domain": {"exact_effective_domain": {"lower_lps_mm": [0., 0., 0.]}}}
+    checkpoint = {"checkpoint_schema": launcher.CHECKPOINT_SCHEMA, "provenance": provenance, "runner_state": {"completed": []}}
+    assert launcher.resume_next_segment_index(checkpoint, reference_schedule(), provenance) == 0
+    changed = {"effective_external_domain": {"exact_effective_domain": {"lower_lps_mm": [-1., 0., 0.]}}}
+    with pytest.raises(ValueError, match="provenance"):
+        launcher.resume_next_segment_index(checkpoint, reference_schedule(), changed)
 
 
 def test_corrected_pose_internal_inr_containment_uses_lps_ras_corners() -> None:
@@ -531,6 +591,10 @@ def test_formal_preflight_writes_admission_artifacts_without_training(tmp_path, 
     report = json.loads((output / "preflight_report.json").read_text())
     assert report["status"] == "PASS" and report["formal_training_started"] is False
     assert (output / "static_reference_ready.json").is_file()
+    assert (output / "effective_external_domain.json").is_file()
+    assert report["effective_domain_containment"]["passed"] is True
+    effective_config = json.loads((output / "effective_config.json").read_text())
+    assert effective_config["constructed"]["canonical"]["external_world_bounds_mm"] == [[-4.0, -4.0, -4.0], [4.0, 4.0, 4.0]]
     assert not list(output.glob("checkpoint_*.pt"))
 
 

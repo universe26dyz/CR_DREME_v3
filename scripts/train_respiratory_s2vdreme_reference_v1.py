@@ -23,7 +23,7 @@ from cardioresp4d.adapters.source_lock import verify_vendored_source_lock
 from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import (
     REFERENCE_CHECKPOINT_BOUNDARIES, S2VDREMEReferenceRunner, canonical_init_provenance, joint_stage_audits,
     reference_schedule, strict_canonical_state_from_static_checkpoint, validate_reference_config,
-    static_volume_samples, warm_start_canonical_from_static_volume, apply_corrected_static_poses, load_corrected_pose_map, static_reference_diagnostics, corrected_pose_containment_audit, corrected_pose_internal_inr_containment_audit,
+    static_volume_samples, warm_start_canonical_from_static_volume, apply_corrected_static_poses, load_corrected_pose_map, static_reference_diagnostics, corrected_pose_containment_audit, corrected_pose_internal_inr_containment_audit, derive_effective_external_domain,
 )
 from cardioresp4d.training.build_model import build_source_first_model, effective_model_config
 from cardioresp4d.training.runtime_state import capture_rng_state, restore_rng_state, set_reproducibility
@@ -54,8 +54,8 @@ def _git_head() -> str:
     return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
 
 
-def _provenance(config: Mapping[str, Any], args, source_lock: Mapping[str, Any], coordinate_frames: Mapping[str, Any]) -> dict[str, Any]:
-    return {"config_sha256": hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(), "git_sha": _git_head(), "manifest_sha256": _sha256(args.manifest), "qc_table_sha256": _sha256(args.qc_table), "canonical_domain_sha256": _sha256(args.canonical_domain), "static_manifest_sha256": _sha256(args.static_manifest), "source_lock": dict(source_lock), "canonical_coordinate_frames": dict(coordinate_frames)}
+def _provenance(config: Mapping[str, Any], args, source_lock: Mapping[str, Any], coordinate_frames: Mapping[str, Any], effective_external_domain: Mapping[str, Any]) -> dict[str, Any]:
+    return {"config_sha256": hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(), "git_sha": _git_head(), "manifest_sha256": _sha256(args.manifest), "qc_table_sha256": _sha256(args.qc_table), "canonical_domain_sha256": _sha256(args.canonical_domain), "static_manifest_sha256": _sha256(args.static_manifest), "source_lock": dict(source_lock), "canonical_coordinate_frames": dict(coordinate_frames), "effective_external_domain": dict(effective_external_domain)}
 
 
 def resume_next_segment_index(checkpoint: Mapping[str, Any], segments, provenance: Mapping[str, Any]) -> int:
@@ -97,7 +97,12 @@ def main() -> None:
     if _sha256(static_model) != static_manifest["outputs"]["model"]["sha256"] or _sha256(static_volume) != static_manifest["outputs"]["volume"]["sha256"] or _sha256(pose_manifest) != static_manifest["corrected_pose_manifest"]["sha256"]:
         raise ValueError("static manifest artifact hashes do not match")
     domain = json.loads(args.canonical_domain.read_text()); reproducibility = set_reproducibility(int(config["training"]["seed"]))
-    external_bounds = torch.tensor([domain["world_min_mm"], domain["world_max_mm"]], dtype=torch.float32)
+    pose_map = load_corrected_pose_map(pose_manifest)
+    effective_external_domain = derive_effective_external_domain(pose_map, domain["world_min_mm"], domain["world_max_mm"])
+    effective_domain = {**domain, "world_min_mm": effective_external_domain["model_float32_effective_domain"]["lower_lps_mm"], "world_max_mm": effective_external_domain["model_float32_effective_domain"]["upper_lps_mm"]}
+    external_bounds = torch.tensor([effective_domain["world_min_mm"], effective_domain["world_max_mm"],], dtype=torch.float32)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "effective_external_domain.json").write_text(json.dumps(effective_external_domain, indent=2) + "\n")
     world_to_internal = lps_to_ras_world_matrix()
     static_payload = torch.load(static_model, map_location="cpu", weights_only=False)
     static_candidate = static_payload.get("model", static_payload.get("inr_state_dict"))
@@ -118,23 +123,24 @@ def main() -> None:
         "external_world_frame": "DICOM_patient_LPS_mm",
         "internal_inr_frame": "NIfTI_RAS_mm",
         "world_to_internal_matrix": [[-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]],
-        "external_lps_bbox": external_bounds.tolist(),
+        "source_phase1_external_lps_bbox": effective_external_domain["source_phase1_domain"],
+        "effective_dynamic_external_lps_bbox": effective_external_domain["model_float32_effective_domain"],
         "internal_static_ras_bbox": static_internal_bounds.tolist(),
         "static_encoding_backend": static_backend,
+        "effective_external_domain_policy": effective_external_domain["policy"],
     }
-    provenance = _provenance(config, args, source_lock, coordinate_frames)
+    provenance = _provenance(config, args, source_lock, coordinate_frames, effective_external_domain)
     observations, normalization, normalization_groups = observations_from_manifest(args.manifest, args.qc_table, device, normalization_mode=config["training"]["normalization"]["mode"], assign_slice_positions=True)
-    pose_map = load_corrected_pose_map(pose_manifest)
-    containment = corrected_pose_containment_audit(pose_map, lower_world_mm=domain["world_min_mm"], upper_world_mm=domain["world_max_mm"])
+    containment = corrected_pose_containment_audit(pose_map, lower_world_mm=effective_domain["world_min_mm"], upper_world_mm=effective_domain["world_max_mm"])
     static_inr_bbox_diagnostic = (corrected_pose_internal_inr_containment_audit(pose_map, internal_lower_world_mm=static_internal_bounds[0].tolist(), internal_upper_world_mm=static_internal_bounds[1].tolist(), world_to_internal_transform=world_to_internal) if direct_preflight_error is None else {"reason": str(direct_preflight_error), "policy": "not_assessed_without_static_inr_bbox"})
     observations = apply_corrected_static_poses(observations, pose_map)
     checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
-    model = build_source_first_model(config, domain, n_dynamic_frames=max(item.dynamic_frame_id for item in observations) + 1, device=device, canonical_encoding_backend=static_backend, canonical_internal_bounds_world_mm=static_internal_bounds.to(device), canonical_world_to_internal_transform=(world_to_internal.to(device) if direct_preflight_error is None else None)).to(device)
+    model = build_source_first_model(config, effective_domain, n_dynamic_frames=max(item.dynamic_frame_id for item in observations) + 1, device=device, canonical_encoding_backend=static_backend, canonical_internal_bounds_world_mm=static_internal_bounds.to(device), canonical_world_to_internal_transform=(world_to_internal.to(device) if direct_preflight_error is None else None)).to(device)
     try:
         if direct_preflight_error is not None:
             raise direct_preflight_error
         if not torch.allclose(torch.stack((model.canonical_lower_world_mm, model.canonical_upper_world_mm)).cpu(), external_bounds, atol=1e-5, rtol=0.0):
-            raise RuntimeError("model external canonical LPS bounds differ from canonical_domain.json")
+            raise RuntimeError("model external canonical LPS bounds differ from effective external domain")
         static_state = strict_canonical_state_from_static_checkpoint(static_payload, model.canonical.inr.state_dict(), internal_bounds_world_mm=static_internal_bounds, expected_architecture=model.canonical.args, expected_encoding_backend=static_backend, world_to_internal_transform=model.canonical.input_world_to_internal.cpu())
     except ValueError as error:
         if args.preflight_only:
@@ -154,20 +160,19 @@ def main() -> None:
     else:
         model.canonical.inr.load_state_dict(static_state, strict=True)
         if not torch.allclose(model.canonical.inr.bounding_box.cpu(), static_internal_bounds, atol=1e-5, rtol=0.0): raise RuntimeError("direct static load changed internal INR bounding_box")
-        static_init = {**canonical_init_provenance(static_model, mode="direct_exact_state_with_coordinate_bridge"), "direct_state_admission": {"accepted": True, "reason": None, "static_bbox": static_state["bounding_box"].detach().cpu().tolist(), "internal_inr_bbox": static_internal_bounds.tolist(), "external_lps_bbox": external_bounds.tolist(), "bbox_tolerance_mm": 1e-5, "architecture_match": True, "encoding_backend_match": True, "state_key_match": True, "state_shape_match": True, "strict_load": True, "coordinate_bridge_match": True}}
+        static_init = {**canonical_init_provenance(static_model, mode="direct_exact_state_with_coordinate_bridge"), "direct_state_admission": {"accepted": True, "reason": None, "static_bbox": static_state["bounding_box"].detach().cpu().tolist(), "internal_inr_bbox": static_internal_bounds.tolist(), "source_phase1_external_lps_bbox": effective_external_domain["source_phase1_domain"], "effective_dynamic_external_lps_bbox": effective_external_domain["model_float32_effective_domain"], "bbox_tolerance_mm": 1e-5, "architecture_match": True, "encoding_backend_match": True, "state_key_match": True, "state_shape_match": True, "strict_load": True, "coordinate_bridge_match": True}}
     sampler = ViewLocationBalancedSampler(observations, seed=int(config["training"]["seed"]))
     runner = S2VDREMEReferenceRunner(model, sampler, pixel_samples=args.pixel_samples, observations_per_update=int(config["training"]["observations_per_update"]), optimizer_config=config["training"]["optimizer"])
     segments = reference_schedule(); start = 0
     if checkpoint is not None:
         start = resume_next_segment_index(checkpoint, segments, provenance)
         model.load_state_dict(checkpoint["model"]); runner.load_boundary_state(checkpoint["runner_state"]); restore_rng_state(checkpoint["rng_state"])
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    effective = {"requested": config, "constructed": {**effective_model_config(model), "optimizer": config["training"]["optimizer"], "schedule": [{**segment.__dict__, "owners": sorted(segment.owners)} for segment in reference_schedule()], "observations_per_update": runner.observations_per_update, "loss_weights": config["training"]["loss_weights"]}, "source_lock": source_lock}
+    effective = {"requested": config, "constructed": {**effective_model_config(model), "optimizer": config["training"]["optimizer"], "schedule": [{**segment.__dict__, "owners": sorted(segment.owners)} for segment in reference_schedule()], "observations_per_update": runner.observations_per_update, "loss_weights": config["training"]["loss_weights"]}, "source_lock": source_lock, "effective_external_domain": effective_external_domain}
     (args.output_dir / "effective_config.json").write_text(json.dumps(effective, indent=2) + "\n")
     static_diagnostics = static_reference_diagnostics(model, sampler)
-    (args.output_dir / "static_reference_ready.json").write_text(json.dumps({**static_init, **static_diagnostics, "canonical_coordinate_frames": coordinate_frames, "external_lps_domain_containment": containment, "static_inr_bbox_diagnostic": static_inr_bbox_diagnostic, "static_manifest": str(args.static_manifest), "static_manifest_sha256": _sha256(args.static_manifest), "static_pose_map": str(pose_manifest)}, indent=2) + "\n")
+    (args.output_dir / "static_reference_ready.json").write_text(json.dumps({**static_init, **static_diagnostics, "canonical_coordinate_frames": coordinate_frames, "effective_external_domain": effective_external_domain, "effective_domain_containment": containment, "static_inr_bbox_diagnostic": static_inr_bbox_diagnostic, "static_manifest": str(args.static_manifest), "static_manifest_sha256": _sha256(args.static_manifest), "static_pose_map": str(pose_manifest)}, indent=2) + "\n")
     if args.preflight_only:
-        report = {"status": "PASS", "git_sha": _git_head(), "static_initialization_mode": static_init["mode"], "encoding_backend": static_backend, "external_lps_domain_containment": containment, "static_inr_bbox_diagnostic": static_inr_bbox_diagnostic, "canonical_coordinate_frames": coordinate_frames, "static_reference_reconstruction": static_diagnostics, "formal_training_started": False}
+        report = {"status": "PASS", "git_sha": _git_head(), "static_initialization_mode": static_init["mode"], "encoding_backend": static_backend, "effective_external_domain": effective_external_domain, "effective_domain_containment": containment, "external_lps_domain_containment": containment, "static_inr_bbox_diagnostic": static_inr_bbox_diagnostic, "canonical_coordinate_frames": coordinate_frames, "static_reference_reconstruction": static_diagnostics, "formal_training_started": False}
         (args.output_dir / "preflight_report.json").write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report, indent=2)); return
     for segment in segments[start:]:
