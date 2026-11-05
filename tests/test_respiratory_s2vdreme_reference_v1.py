@@ -120,7 +120,7 @@ def test_formal_and_smoke_nesvor_commands_are_distinct_and_complete() -> None:
     assert "--no-slice-scale" in smoke
 
 
-def _historical_runtime_fixture(tmp_path, monkeypatch, *, version: str = "0.6.0rc1", omit_flag: str | None = None, package_inside: bool = True):
+def _historical_runtime_fixture(tmp_path, monkeypatch, *, version: str = "0.6.0rc1", version_output: str = "nesvor v0.6.0rc1", omit_flag: str | None = None, package_inside: bool = True):
     import cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 as reference
 
     source_root = tmp_path / "nesvor"
@@ -141,7 +141,7 @@ def _historical_runtime_fixture(tmp_path, monkeypatch, *, version: str = "0.6.0r
     flags = [flag for flag in reference.HISTORICAL_NESVOR_REQUIRED_FLAGS if flag != omit_flag]
     executable = tmp_path / "historical-nesvor"
     executable.write_text("#!/bin/sh\n"
-                          "if [ \"$1\" = \"--version\" ]; then echo '" + version + "'; exit 0; fi\n"
+                          "if [ \"$1\" = \"--version\" ]; then echo '" + version_output + "'; exit 0; fi\n"
                           "if [ \"$1\" = \"reconstruct\" ] && [ \"$2\" = \"--help\" ]; then printf '%s\\n' '" + "' '".join(flags) + "'; exit 0; fi\n"
                           "exit 1\n")
     executable.chmod(0o755)
@@ -155,6 +155,7 @@ def test_historical_nesvor_runtime_verifier_accepts_exact_contract(tmp_path, mon
 
     assert provenance["runtime_profile"] == "historical_nesvor_v5_128_w1"
     assert provenance["version"] == "0.6.0rc1"
+    assert provenance["version_output"] == "nesvor v0.6.0rc1"
     assert provenance["package_path"] == str((source_root / "__init__.py").resolve())
     assert provenance["required_flags_verified"] == list(reference.HISTORICAL_NESVOR_REQUIRED_FLAGS)
     assert provenance["source_files_sha256"] == reference.HISTORICAL_NESVOR_SOURCE_SHA256
@@ -165,7 +166,9 @@ def test_historical_nesvor_runtime_verifier_accepts_exact_contract(tmp_path, mon
     [
         ({"omit_flag": "--pixel-variance-weight"}, "--pixel-variance-weight"),
         ({"omit_flag": "--weight-pixel-var-smooth"}, "--weight-pixel-var-smooth"),
-        ({"version": "0.6.0"}, "version"),
+        ({"version_output": "nesvor v0.6.0"}, "version"),
+        ({"version_output": "nesvor v0.6.0rc2"}, "version"),
+        ({"version_output": "unrelated output"}, "version"),
         ({"package_inside": False}, "outside source root"),
     ],
 )
@@ -208,6 +211,8 @@ def test_static_manifest_records_verified_historical_runtime(tmp_path, monkeypat
 
     nesvor = manifest["nesvor"]
     assert nesvor["runtime_profile"] == "historical_nesvor_v5_128_w1"
+    assert nesvor["version"] == "0.6.0rc1"
+    assert nesvor["version_output"] == "nesvor v0.6.0rc1"
     assert nesvor["executable"] == str(executable.resolve())
     assert nesvor["runtime_python"] == str(runtime_python.resolve())
     assert nesvor["source_root"] == str(source_root.resolve())

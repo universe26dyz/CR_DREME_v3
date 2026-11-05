@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
@@ -75,9 +76,11 @@ def verify_historical_nesvor_runtime(*, executable: str | Path, runtime_python: 
             raise ValueError(f"historical NeSVoR runtime verification failed: {' '.join(command)}\n{completed.stdout.strip()}")
         return completed.stdout.strip()
 
-    version = run_checked([str(executable_path), "--version"])
-    if version != HISTORICAL_NESVOR_VERSION:
-        raise ValueError(f"historical NeSVoR executable version must be {HISTORICAL_NESVOR_VERSION}, got {version!r}")
+    version_output = run_checked([str(executable_path), "--version"])
+    version_match = re.fullmatch(r"(?:nesvor v)?(0\.6\.0rc1)", version_output)
+    if version_match is None:
+        raise ValueError(f"historical NeSVoR executable version must be {HISTORICAL_NESVOR_VERSION}, got {version_output!r}")
+    version = version_match.group(1)
     help_text = run_checked([str(executable_path), "reconstruct", "--help"])
     missing_flags = [flag for flag in HISTORICAL_NESVOR_REQUIRED_FLAGS if flag not in help_text]
     if missing_flags:
@@ -106,6 +109,7 @@ def verify_historical_nesvor_runtime(*, executable: str | Path, runtime_python: 
     return {
         "runtime_profile": HISTORICAL_NESVOR_RUNTIME_PROFILE,
         "version": version,
+        "version_output": version_output,
         "executable": str(executable_path),
         "runtime_python": str(python_path),
         "source_root": str(source_path),
@@ -513,7 +517,7 @@ def write_static_reference_manifest(*, output_dir: str | Path, source_manifest: 
     output = Path(output_dir); mean_path = Path(mean_slice_manifest)
     if mode not in {"formal", "smoke"} or "--output-intensity-mean" not in command or command[command.index("--output-intensity-mean") + 1] != "0" or "--background-threshold" not in command or command[command.index("--background-threshold") + 1] != "0":
         raise ValueError("static manifest requires explicit output_intensity_mean=0 and background_threshold=0")
-    required_provenance = {"runtime_profile", "version", "executable", "runtime_python", "source_root", "package_path", "required_flags_verified", "source_files_sha256"}
+    required_provenance = {"runtime_profile", "version", "version_output", "executable", "runtime_python", "source_root", "package_path", "required_flags_verified", "source_files_sha256"}
     if runtime_provenance.get("runtime_profile") != HISTORICAL_NESVOR_RUNTIME_PROFILE or not required_provenance.issubset(runtime_provenance):
         raise ValueError("static manifest requires verified historical NeSVoR runtime provenance")
     pose_map = build_corrected_pose_map(mean_path, output / "slices")
