@@ -17,7 +17,7 @@ from cardioresp4d.visualization.contract import ensure_safe_output_dir
 from cardioresp4d.visualization.report import write_audit_manifest, write_html_report
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment", required=True); parser.add_argument("--experiment-root", required=True, type=Path)
     parser.add_argument("--manifest", required=True, type=Path); parser.add_argument("--qc-table", required=True, type=Path)
@@ -33,8 +33,14 @@ def main() -> None:
     audit = json.loads(manifest_path.read_text()); audit["scientific_status"] = dict(adapter.scientific_status); manifest_path.write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n")
     summary = {**dict(adapter.scientific_status), "stage_status": stages}; (output / "audit_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     write_html_report(output / "report.html", audit, stages)
+    mandatory = {f"V{index}_{name}" for index, name in enumerate(("raw_acquisition", "normalization", "temporal_mean", "stack_geometry", "registration", "static_support", "static_inr", "static_reprojection"))}
+    failed = {name: value.get("reason", "unknown failure") for name, value in stages.items() if name in mandatory and value.get("render_status") == "failed"}
+    if failed:
+        print(json.dumps({"mandatory_stage_failures": failed, "report": str(output / "report.html")}, indent=2), file=sys.stderr)
+        return 2
     print(json.dumps({"output_dir": str(output), **dict(adapter.scientific_status)}, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

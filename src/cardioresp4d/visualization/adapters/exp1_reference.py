@@ -15,9 +15,10 @@ from ..contract import ExperimentVisualizationAdapter, STAGES, stage_status
 from ..geometry_utils import (LPS_RAS, compare_plane_corners_lps, location_token,
                               numeric_corrected_slices, ordered_representative_locations,
                               plane_corners_lps, pose_delta, stack_tiles)
-from ..image_utils import (evaluate_inr_on_nifti_lattice, export_support_mask,
+from ..image_utils import (aggregate_clip_fractions, evaluate_inr_on_nifti_lattice,
+                           evaluate_inr_psf_on_nifti_lattice, export_support_mask,
                            save_unmasked_static_inr, support_metrics, volume_summary)
-from ..renderers import fixed_window, render_montage, render_paired_images
+from ..renderers import fixed_window, render_independent_images, render_montage, render_paired_images
 
 
 class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
@@ -30,7 +31,8 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
     def source_artifacts(self, experiment_root: Path, manifest: Path, qc_table: Path, canonical_domain: Path) -> dict[str, Path]:
         static = experiment_root / "02_static_nesvor"; mean = experiment_root / "01_temporal_mean"
         paths = {"manifest": manifest, "qc_table": qc_table, "canonical_domain": canonical_domain,
-                 "mean_slice_manifest": mean / "mean_slice_manifest.json", "static_reference": static / "static_reference.nii.gz",
+                 "mean_slice_manifest": mean / "mean_slice_manifest.json", "mean_stack_SAX": mean / "mean_stack_SAX.nii.gz", "mean_stack_2CH": mean / "mean_stack_2CH.nii.gz", "mean_stack_4CH": mean / "mean_stack_4CH.nii.gz",
+                 "static_reference_manifest": static / "static_reference_manifest.json", "nesvor_static_command": static / "nesvor_static_command.json", "nesvor_effective_args": static / "nesvor_effective_args.json", "static_reference": static / "static_reference.nii.gz",
                  "static_model": static / "model.pt", "corrected_pose_manifest": static / "corrected_pose_manifest.json",
                  "corrected_slices_directory": static / "slices"}
         return {name: path for name, path in paths.items() if path.exists()}
@@ -79,51 +81,69 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
     def _frame_indices(rows: list[tuple[dict[str, str], int]]) -> list[int]:
         return sorted(set(np.linspace(0, len(rows) - 1, min(5, len(rows))).round().astype(int).tolist()))
 
+    @staticmethod
+    def _series_frames(dataset, view: str, slice_id: str) -> list[tuple[dict[str, str], int]]:
+        frames = [(row, index) for index, row in enumerate(dataset._rows) if row["view"].upper() == view and row["slice_id"] == slice_id and row["qc_valid"] not in ("0", "false", "False")]
+        return sorted(frames, key=lambda item: float(item[0].get("timestamp_s", item[1])))
+
+    @staticmethod
+    def _bounded_sample(arrays: list[np.ndarray], *, per_array: int = 8192, total: int = 100000) -> np.ndarray:
+        sampled = [array[np.linspace(0, array.size - 1, min(array.size, per_array), dtype=int)] for array in (np.asarray(value).reshape(-1) for value in arrays) if array.size]
+        if not sampled:
+            return np.empty(0, dtype=np.float32)
+        values = np.concatenate(sampled)
+        return values[np.linspace(0, values.size - 1, min(values.size, total), dtype=int)]
+
     def _v0_raw(self, manifest: Path, qc_table: Path, output: Path) -> dict[str, Any]:
         dataset = self._dataset(manifest, qc_table); selected = self._ordered_rows(dataset); rendered = 0
+        figures: dict[str, Any] = {}
         for view, locations in selected.items():
             panels: list[np.ndarray] = []; labels: list[str] = []
             for row, first_index in [locations[index] for index in sorted(set((0, len(locations) // 2, len(locations) - 1)))]:
-                frames = [(candidate, idx) for candidate, idx in enumerate(dataset._rows) if candidate["view"].upper() == view and candidate["slice_id"] == row["slice_id"] and candidate["qc_valid"] not in ("0", "false", "False")]
+                frames = self._series_frames(dataset, view, row["slice_id"])
+                first_time = float(frames[0][0].get("timestamp_s", dataset[frames[0][1]].get("timestamp_s", 0.)))
                 for local_index in self._frame_indices(frames):
                     sample = dataset[frames[local_index][1]]; image = np.asarray(sample["rescaled_image"], dtype=np.float32); stats = np.percentile(image, (50, 95, 99))
-                    relative_time = local_index / max(1, len(frames) - 1)
-                    panels.append(image); labels.append(f"{view} {location_token(view, row['slice_id'])} frame {local_index} t={relative_time:.0%}\nmin/P50/P95/P99/max={image.min():.3g}/{stats[0]:.3g}/{stats[1]:.3g}/{stats[2]:.3g}/{image.max():.3g}")
+                    frame_row = frames[local_index][0]; frame_number = frame_row.get("frame_index", local_index); relative_time = float(sample.get("timestamp_s", frame_row.get("timestamp_s", first_time))) - first_time
+                    panels.append(image); labels.append(f"{view} {location_token(view, row['slice_id'])} frame {frame_number} Δt={relative_time:.3g}s\nmin/P50/P95/P99/max={image.min():.3g}/{stats[0]:.3g}/{stats[1]:.3g}/{stats[2]:.3g}/{image.max():.3g}")
             if panels:
-                render_montage(output / f"{view}_representative_frames.png", panels, labels, columns=5); rendered += len(panels)
-            view_indices = [index for index, row in enumerate(dataset._rows) if row["view"].upper() == view and row["qc_valid"] not in ("0", "false", "False")]
-            if view_indices:
-                contact = sorted(set(np.linspace(0, len(view_indices) - 1, min(20, len(view_indices))).round().astype(int).tolist()))
-                contact_samples = [dataset[view_indices[index]] for index in contact]
-                render_montage(output / f"{view}_temporal_contact_sheet.png", [np.asarray(sample["rescaled_image"]) for sample in contact_samples], [f"{view} {location_token(view, sample['slice_id'])}" for sample in contact_samples], columns=5)
-        return stage_status("rendered", frame_panels=rendered, display_window_policy="per_image_robust")
+                name = f"{view}_representative_frames.png"; figures[name] = {"policy": render_montage(output / name, panels, labels, columns=5)}; rendered += len(panels)
+            if locations:
+                middle_row, _ = locations[len(locations) // 2]; frames = self._series_frames(dataset, view, middle_row["slice_id"]); first_time = float(frames[0][0].get("timestamp_s", dataset[frames[0][1]].get("timestamp_s", 0.))); contact = self._frame_indices(frames); contact_samples = [dataset[frames[index][1]] for index in contact]
+                labels = [f"{view} {location_token(view, middle_row['slice_id'])} frame {frames[index][0].get('frame_index', index)} Δt={float(contact_samples[offset].get('timestamp_s', frames[index][0].get('timestamp_s', first_time))) - first_time:.3g}s" for offset, index in enumerate(contact)]
+                name = f"{view}_temporal_contact_sheet.png"; policy = render_montage(output / name, [np.asarray(sample["rescaled_image"]) for sample in contact_samples], labels, columns=5); figures[name] = {"policy": policy, "location": location_token(view, middle_row["slice_id"])}
+        return stage_status("rendered", frame_panels=rendered, figures=figures)
 
     def _v1_normalization(self, manifest: Path, qc_table: Path, output: Path) -> dict[str, Any]:
-        dataset = self._dataset(manifest, qc_table); rows: list[dict[str, Any]] = []; images_before: dict[str, list[np.ndarray]] = defaultdict(list); images_after: dict[str, list[np.ndarray]] = defaultdict(list)
+        dataset = self._dataset(manifest, qc_table); rows: list[dict[str, Any]] = []; images_before: dict[str, list[np.ndarray]] = defaultdict(list); images_after: dict[str, list[np.ndarray]] = defaultdict(list); figures: dict[str, Any] = {}
         grouped: dict[tuple[str, str], list[int]] = defaultdict(list)
         for index, row in enumerate(dataset._rows):
             if row["qc_valid"] not in ("0", "false", "False"): grouped[(row["view"].upper(), row["slice_id"])].append(index)
         representative = {(view, row["slice_id"]) for view, locations in self._ordered_rows(dataset).items() for row, _ in [locations[index] for index in sorted(set((0, len(locations) // 2, len(locations) - 1))) ]}
         for (view, slice_id), indices in sorted(grouped.items()):
-            sample = dataset[indices[0]]; raw, normalized = np.asarray(sample["rescaled_image"]), np.asarray(sample["image"])
             key = dataset._normalization_key(dataset._rows[indices[0]]); params = dataset.normalization_parameters[key]
-            rows.append({"view": view, "opaque_slice_id": location_token(view, slice_id), "P1": params["lower"], "P99": params["upper"], "P99_minus_P1": params["upper"] - params["lower"], "low_clip_fraction": float(np.mean(raw <= params["lower"])), "high_clip_fraction": float(np.mean(raw >= params["upper"]))})
-            images_before[view].append(raw.ravel()); images_after[view].append(normalized.ravel())
+            clip = aggregate_clip_fractions((np.asarray(dataset[index]["rescaled_image"]) for index in indices), lower=params["lower"], upper=params["upper"])
+            rows.append({"view": view, "opaque_slice_id": location_token(view, slice_id), "P1": params["lower"], "P99": params["upper"], "P99_minus_P1": params["upper"] - params["lower"], **clip})
+            images_before[view].extend(self._bounded_sample([np.asarray(dataset[index]["rescaled_image"])]) for index in indices); images_after[view].extend(self._bounded_sample([np.asarray(dataset[index]["image"])]) for index in indices)
             if (view, slice_id) in representative:
                 for frame_index in self._frame_indices([(dataset._rows[index], index) for index in indices]):
-                    frame = dataset[indices[frame_index]]; raw_frame, normal_frame = np.asarray(frame["rescaled_image"]), np.asarray(frame["image"])
-                    render_paired_images(output / f"{location_token(view, slice_id)}_frame_{frame_index:03d}.png", [raw_frame, normal_frame], ["modality-rescaled", "per-series normalized"], window=(min(float(raw_frame.min()), 0.), max(float(raw_frame.max()), 1.)))
+                    frame = dataset[indices[frame_index]]; raw_frame, normal_frame = np.asarray(frame["rescaled_image"]), np.asarray(frame["image"]); raw_window = fixed_window(raw_frame, robust=True); name = f"{location_token(view, slice_id)}_frame_{frame_index:03d}.png"
+                    figures[name] = render_independent_images(output / name, [raw_frame, normal_frame], ["modality-rescaled", "per-series normalized"], [raw_window, (0., 1.)])
         with (output / "normalization_parameters.csv").open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]) if rows else ["view"]); writer.writeheader(); writer.writerows(rows)
         import matplotlib.pyplot as plt
-        figure, axis = plt.subplots(figsize=(8, 4)); axis.scatter(range(len(rows)), [row["P99_minus_P1"] for row in rows]); axis.set_xlabel("physical location order within grouped views"); axis.set_ylabel("P99-P1"); figure.tight_layout(); figure.savefig(output / "location_scale.png", dpi=140); plt.close(figure)
-        return stage_status("rendered", location_count=len(rows), display_window_policy="paired_fixed_per_location")
+        figure, axes = plt.subplots(1, max(1, len(images_before)), figsize=(5 * max(1, len(images_before)), 4), squeeze=False)
+        for axis, (view, values) in zip(axes.ravel(), sorted(images_before.items())):
+            row_by_token = {row["opaque_slice_id"]: row for row in rows}; ordered_tokens = [location_token(view, location[0]["slice_id"]) for location in self._ordered_rows(dataset).get(view, [])]; view_rows = [row_by_token[token] for token in ordered_tokens if token in row_by_token]; axis.plot(range(len(view_rows)), [row["P99_minus_P1"] for row in view_rows], marker="o"); axis.set_title(view); axis.set_xlabel("physical location order"); axis.set_ylabel("P99-P1")
+            raw_sample = self._bounded_sample(values); normalized_sample = self._bounded_sample(images_after[view]); hist_name = f"{view}_intensity_histograms.png"; hist_figure, hist_axes = plt.subplots(1, 2, figsize=(9, 4)); hist_axes[0].hist(raw_sample, bins=64); hist_axes[0].set_title(f"{view} modality-rescaled"); hist_axes[1].hist(normalized_sample, bins=64, range=(0., 1.)); hist_axes[1].set_title(f"{view} normalized"); hist_figure.tight_layout(); hist_figure.savefig(output / hist_name, dpi=140); plt.close(hist_figure); figures[hist_name] = {"raw": "per-view deterministic bounded sample", "normalized": "per-view deterministic bounded sample"}
+        figure.tight_layout(); figure.savefig(output / "location_scale.png", dpi=140); plt.close(figure); figures["location_scale.png"] = {"policy": "physical_order_by_view"}
+        return stage_status("rendered", location_count=len(rows), figures=figures)
 
     def _mean(self, experiment_root: Path) -> tuple[dict[str, Any], Path]:
         directory = experiment_root / "01_temporal_mean"; return json.loads((directory / "mean_slice_manifest.json").read_text()), directory
 
     def _v2_temporal_mean(self, experiment_root: Path, output: Path) -> dict[str, Any]:
-        manifest, directory = self._mean(experiment_root); table: list[dict[str, Any]] = []
+        manifest, directory = self._mean(experiment_root); table: list[dict[str, Any]] = []; figures: dict[str, Any] = {}
         for view in ("SAX", "2CH", "4CH"):
             records = [record for record in manifest["locations"] if record["view"].upper() == view]
             if not records: continue
@@ -132,40 +152,41 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
             pages = [tiles[start:start + 12] for start in range(0, len(tiles), 12)]
             for page_index, page in enumerate(pages):
                 panels = [data[..., int(tile["stack_index"])].T if tile["real"] else np.zeros(data.shape[:2][::-1]) for tile in page]
-                render_montage(output / f"{view}_mean_page_{page_index:02d}.png", panels, [tile["label"] for tile in page], columns=4)
+                name = f"{view}_mean_page_{page_index:02d}.png"; figures[name] = {"policy": render_montage(output / name, panels, [tile["label"] for tile in page], columns=4)}
             for tile in tiles:
                 if tile["real"]:
                     values = data[..., int(tile["stack_index"])]
                     table.append({"view": view, "opaque_slice_id": location_token(view, str(tile["slice_id"])), "lattice_index": tile["stack_index"], **{key: value for key, value in volume_summary(values).items() if key in {"min", "p1", "p50", "p95", "p99", "max", "zero_fraction"}}})
         with (output / "temporal_mean_intensity.csv").open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(table[0]) if table else ["view"]); writer.writeheader(); writer.writerows(table)
-        return stage_status("rendered", location_count=len(table), rescaled_signal="not_rendered")
+        return stage_status("rendered", location_count=len(table), rescaled_signal="not_rendered", figures=figures)
 
     def _v3_geometry(self, experiment_root: Path, canonical_domain: Path, output: Path) -> dict[str, Any]:
-        manifest, directory = self._mean(experiment_root); geometry: dict[str, Any] = {}; errors: list[float] = []
+        manifest, directory = self._mean(experiment_root); geometry: dict[str, Any] = {}; errors: list[tuple[float, str, str]] = []; tolerance_mm = 1e-3
         for stack in sorted({record["stack_file"] for record in manifest["locations"]}):
             image = nib.load(str(directory / stack)); header = image.header; records = [record for record in manifest["locations"] if record["stack_file"] == stack]
             rows = []
             for record in records:
-                result = compare_plane_corners_lps(plane_corners_lps(record["geometry"]), image.affine, image.shape, int(record["stack_index"])); errors.append(result["max_error_mm"]); rows.append({"opaque_slice_id": location_token(record["view"], record["slice_id"]), "stack_index": record["stack_index"], **result})
+                result = compare_plane_corners_lps(plane_corners_lps(record["geometry"]), image.affine, image.shape, int(record["stack_index"])); errors.append((result["max_error_mm"], location_token(record["view"], record["slice_id"]), stack)); rows.append({"opaque_slice_id": location_token(record["view"], record["slice_id"]), "stack_index": record["stack_index"], **result})
             geometry[stack] = {"shape": list(image.shape), "voxel_sizes": list(header.get_zooms()), "qform": image.get_qform().tolist(), "sform": image.get_sform().tolist(), "affine": image.affine.tolist(), "orientation_codes": list(nib.aff2axcodes(image.affine)), "affine_determinant": float(np.linalg.det(image.affine[:3, :3])), "corner_round_trip": rows}
         (output / "stack_geometry.json").write_text(json.dumps(geometry, indent=2) + "\n")
         import matplotlib.pyplot as plt
         figure = plt.figure(figsize=(8, 7)); axis = figure.add_subplot(projection="3d")
         all_corners = []
+        colours = {"SAX": "tab:blue", "2CH": "tab:orange", "4CH": "tab:green"}
         for record in manifest["locations"]:
             corners = plane_corners_lps(record["geometry"]); loop = np.vstack((corners[[0, 1, 3, 2]], corners[0]))
-            axis.plot(loop[:, 0], loop[:, 1], loop[:, 2], label=record["view"] if record["view"] not in axis.get_legend_handles_labels()[1] else None)
+            view = record["view"].upper(); axis.plot(loop[:, 0], loop[:, 1], loop[:, 2], color=colours.get(view, "black"), label=view if view not in axis.get_legend_handles_labels()[1] else None)
             all_corners.append(corners)
         domain = json.loads(canonical_domain.read_text()); box = domain.get("cardiac_box", {})
         if "min_mm" in box and "max_mm" in box:
-            lower, upper = np.asarray(box["min_mm"]), np.asarray(box["max_mm"]); axis.scatter(*lower, c="black", marker="x"); axis.scatter(*upper, c="black", marker="x")
+            lower, upper = np.asarray(box["min_mm"]), np.asarray(box["max_mm"]); corners = np.asarray([[x, y, z] for x in (lower[0], upper[0]) for y in (lower[1], upper[1]) for z in (lower[2], upper[2])]); edges = ((0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3), (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7)); [axis.plot(corners[list(edge), 0], corners[list(edge), 1], corners[list(edge), 2], color="black", alpha=.5) for edge in edges]
         axis.set(xlabel="LPS x (mm)", ylabel="LPS y (mm)", zlabel="LPS z (mm)"); axis.legend(); figure.tight_layout(); figure.savefig(output / "stack_geometry_lps_3d.png", dpi=140); plt.close(figure)
         points = np.concatenate(all_corners, axis=0); figure, axes = plt.subplots(1, 3, figsize=(12, 4))
         for axis, pair, title in zip(axes, ((0, 1), (0, 2), (1, 2)), ("LPS XY", "LPS XZ", "LPS YZ")):
             axis.scatter(points[:, pair[0]], points[:, pair[1]], s=6); axis.set_title(title); axis.set_aspect("equal")
         figure.tight_layout(); figure.savefig(output / "stack_geometry_lps_projections.png", dpi=140); plt.close(figure)
-        return stage_status("rendered", maximum_world_corner_error_mm=max(errors, default=0.), geometry_file="stack_geometry.json")
+        worst = max(errors, default=(0., None, None)); return stage_status("rendered", maximum_world_corner_error_mm=worst[0], worst_opaque_location=worst[1], worst_stack=worst[2], numerical_tolerance_mm=tolerance_mm, geometry_warning="world corner error exceeds tolerance" if worst[0] > tolerance_mm else None, geometry_file="stack_geometry.json")
 
     def _v4_registration(self, experiment_root: Path, output: Path) -> dict[str, Any]:
         from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import load_corrected_pose_map
@@ -175,15 +196,35 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]) if rows else ["view"]); writer.writeheader(); writer.writerows(rows)
         corrected = numeric_corrected_slices(experiment_root / "02_static_nesvor" / "slices")
         if corrected:
-            panels = [np.asanyarray(nib.load(str(path)).dataobj).squeeze().T for path in corrected[:12]]; render_montage(output / "corrected_slices.png", panels, [f"corrected {index}" for index in range(len(panels))], columns=4)
+            pages = [corrected[start:start + 12] for start in range(0, len(corrected), 12)]
+            for page_index, page in enumerate(pages):
+                labels = []
+                panels = []
+                for path in page:
+                    numeric_index = int(path.name.split(".", 1)[0]); match = next((pose for pose in poses.values() if Path(pose.corrected_slice_file).name == path.name), None)
+                    labels.append(f"{match.view if match else 'unknown'} {location_token(match.view, match.slice_id) if match else 'unknown'}\nphysical {match.source_stack_index if match else numeric_index} / NIfTI {numeric_index}"); panels.append(np.asanyarray(nib.load(str(path)).dataobj).squeeze().T)
+                render_montage(output / f"corrected_slices_page_{page_index:03d}.png", panels, labels, columns=4)
         import matplotlib.pyplot as plt
         figure, axes = plt.subplots(1, 2, figsize=(10, 4)); axes[0].hist([row["translation_mm"] for row in rows]); axes[0].set_title("translation magnitude (mm)"); axes[1].hist([row["rotation_deg"] for row in rows]); axes[1].set_title("rotation angle (degrees)"); figure.tight_layout(); figure.savefig(output / "registration_distributions.png", dpi=140); plt.close(figure)
-        figure = plt.figure(figsize=(8, 7)); axis = figure.add_subplot(projection="3d")
-        for pose in poses.values():
-            for geometry, colour in ((pose.original_geometry, "tab:blue"), (pose.corrected_geometry, "tab:orange")):
-                corners = plane_corners_lps(geometry); loop = np.vstack((corners[[0, 1, 3, 2]], corners[0])); axis.plot(loop[:, 0], loop[:, 1], loop[:, 2], color=colour, alpha=.45)
-        axis.set(xlabel="LPS x (mm)", ylabel="LPS y (mm)", zlabel="LPS z (mm)"); figure.tight_layout(); figure.savefig(output / "registration_lps_overlay.png", dpi=140); plt.close(figure)
-        return stage_status("rendered", location_count=len(rows), corrected_numeric_slice_count=len(corrected))
+        def overlay(path: Path, selected_poses: Mapping[tuple[str, str], Any]) -> None:
+            figure = plt.figure(figsize=(8, 7)); axis = figure.add_subplot(projection="3d"); labels = {"original": "tab:blue", "corrected": "tab:orange"}
+            for pose in selected_poses.values():
+                for label, geometry in (("original", pose.original_geometry), ("corrected", pose.corrected_geometry)):
+                    corners = plane_corners_lps(geometry); loop = np.vstack((corners[[0, 1, 3, 2]], corners[0])); axis.plot(loop[:, 0], loop[:, 1], loop[:, 2], color=labels[label], alpha=.45, label=label if label not in axis.get_legend_handles_labels()[1] else None)
+            axis.set(xlabel="LPS x (mm)", ylabel="LPS y (mm)", zlabel="LPS z (mm)"); axis.legend(); figure.tight_layout(); figure.savefig(path, dpi=140); plt.close(figure)
+        overlay(output / "registration_lps_overlay.png", poses)
+        for view in ("SAX", "2CH", "4CH"):
+            overlay(output / f"registration_{view}_overlay.png", {key: value for key, value in poses.items() if key[0].upper() == view})
+        largest_translation = max(rows, key=lambda row: row["translation_mm"], default=None); largest_rotation = max(rows, key=lambda row: row["rotation_deg"], default=None); largest_normal = max(rows, key=lambda row: row["normal_angle_deg"], default=None)
+        return stage_status("rendered", location_count=len(rows), corrected_numeric_slice_count=len(corrected), largest_translation=largest_translation, largest_rotation=largest_rotation, largest_normal_angle=largest_normal)
+
+    @staticmethod
+    def _representative_pose_keys(poses: Mapping[tuple[str, str], Any]) -> list[tuple[str, str]]:
+        selected: list[tuple[str, str]] = []
+        for view in ("SAX", "2CH", "4CH"):
+            keys = sorted((key for key in poses if key[0].upper() == view), key=lambda key: (str(getattr(poses[key], "source_stack_file", "")), int(getattr(poses[key], "source_stack_index", 0)), str(key[1])))
+            selected.extend(keys[index] for index in sorted(set((0, len(keys) // 2, len(keys) - 1))) if keys)
+        return selected
 
     @staticmethod
     def _load_static_model(experiment_root: Path, device: str):
@@ -199,38 +240,45 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
         from nesvor.image.image_utils import transformation2affine
         affine = transformation2affine(mask.image, mask.transformation, float(mask.resolution_x), float(mask.resolution_y), float(mask.resolution_z))
         path = export_support_mask(mask.mask, affine, output / "static_support_mask.nii.gz"); data = np.asanyarray(nib.load(str(path)).dataobj)
-        center = tuple(size // 2 for size in data.shape); panels = [data[center[0], :, :], data[:, center[1], :], data[:, :, center[2]]]
-        render_montage(output / "support_orthogonal.png", panels, ["axial", "coronal", "sagittal"], columns=3, window=(0., 1.))
+        center = tuple(size // 2 for size in data.shape); planes = {"sagittal": {"voxel_index": [center[0], None, None], "image": data[center[0], :, :].T}, "coronal": {"voxel_index": [None, center[1], None], "image": data[:, center[1], :].T}, "axial": {"voxel_index": [None, None, center[2]], "image": data[:, :, center[2]].T}}
+        for value in planes.values():
+            indices = [index if index is not None else 0 for index in value["voxel_index"]]; value["world_mm_ras"] = nib.affines.apply_affine(affine, indices).tolist()
+        (output / "orthogonal_planes.json").write_text(json.dumps({key: {"voxel_index": value["voxel_index"], "world_mm_ras": value["world_mm_ras"]} for key, value in planes.items()}, indent=2) + "\n")
+        render_montage(output / "support_orthogonal.png", [planes[name]["image"] for name in ("sagittal", "coronal", "axial")], [f"{name} ({planes[name]['world_mm_ras']})" for name in ("sagittal", "coronal", "axial")], columns=3, window=(0., 1.))
         render_montage(output / "support_projections.png", [data.max(axis=0), data.max(axis=1), data.max(axis=2), data.mean(axis=0), data.mean(axis=1), data.mean(axis=2)], ["max x", "max y", "max z", "mean x", "mean y", "mean z"], columns=3, window=(0., 1.))
         metrics = support_metrics(data, affine); (output / "support_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
-        return stage_status("rendered", **metrics)
+        return stage_status("rendered", figures={"support_orthogonal.png": {"window": (0., 1.), "axis_convention": "sagittal=X fixed, coronal=Y fixed, axial=Z fixed"}, "support_projections.png": {"window": (0., 1.)}}, **metrics)
 
     def _v6_inr(self, experiment_root: Path, output: Path, device: str) -> dict[str, Any]:
         target = nib.load(str(experiment_root / "02_static_nesvor" / "static_reference.nii.gz")); payload, model, backend = self._load_static_model(experiment_root, device)
-        values = evaluate_inr_on_nifti_lattice(model, target, device=torch.device(device)); unmasked = save_unmasked_static_inr(values, target, output / "static_inr_unmasked.nii.gz")
+        values = evaluate_inr_on_nifti_lattice(model, target, device=torch.device(device)); save_unmasked_static_inr(values, target, output / "static_inr_center_unmasked.nii.gz")
+        args = payload["args"]; output_resolution = float(getattr(args, "output_resolution", min(target.header.get_zooms()[:3]))); psf_factor = float(getattr(args, "output_psf_factor", 1.)); n_samples = int(getattr(args, "n_inference_samples", 128)); diagnostic_seed = 20261106
+        psf_values = evaluate_inr_psf_on_nifti_lattice(model, target, device=torch.device(device), psf_resolution=output_resolution * psf_factor, n_samples=n_samples, seed=diagnostic_seed)
+        save_unmasked_static_inr(psf_values, target, output / "static_inr_psf_unmasked.nii.gz")
         mask = payload["mask"]; from nesvor.image.image_utils import transformation2affine
         mask_affine = transformation2affine(mask.image, mask.transformation, float(mask.resolution_x), float(mask.resolution_y), float(mask.resolution_z))
         support = export_support_mask(mask.mask, mask_affine, output / "static_support_mask_for_comparison.nii.gz")
         from nibabel.processing import resample_from_to
         support_on_static = resample_from_to(nib.load(str(support)), target, order=0); nib.save(support_on_static, str(output / "support_on_static_lattice.nii.gz"))
         masked = np.asanyarray(target.dataobj); support_values = np.asanyarray(support_on_static.dataobj); panel = [values[..., values.shape[2] // 2].T, support_values[..., support_values.shape[2] // 2].T, masked[..., masked.shape[2] // 2].T]
-        raw_window = (min(float(values.min()), float(masked.min())), max(float(values.max()), float(masked.max())))
-        render_paired_images(output / "inr_support_masked_raw.png", panel, ["unmasked INR", "support mask", "masked static reference"], window=raw_window)
-        render_paired_images(output / "inr_support_masked_robust.png", panel, ["unmasked INR", "support mask", "masked static reference"], window=fixed_window(np.concatenate((values.ravel(), masked.ravel())), robust=True))
-        summary = {"unmasked": volume_summary(values), "masked": volume_summary(masked), "encoding_backend": backend}; (output / "intensity_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-        return stage_status("rendered", **summary)
+        raw_window = fixed_window(np.concatenate((psf_values.ravel(), masked.ravel())), robust=True); figures = {"inr_support_masked.png": {"psf_sampled_unmasked_and_formal_window": raw_window, "mask_window": (0., 1.)}}
+        center = values[..., values.shape[2] // 2].T; psf_panel = psf_values[..., psf_values.shape[2] // 2].T; mask_panel = support_values[..., support_values.shape[2] // 2].T; formal = masked[..., masked.shape[2] // 2].T
+        render_independent_images(output / "inr_support_masked.png", [center, psf_panel, mask_panel, formal], ["PSF-free INR center", "PSF-sampled unmasked", "support mask", "formal masked static"], [fixed_window(values, robust=True), raw_window, (0., 1.), raw_window])
+        inside = support_values > .5; diff = psf_values[inside] - masked[inside]; metrics = {"support_mae": float(np.mean(np.abs(diff))) if diff.size else None, "support_rmse": float(np.sqrt(np.mean(diff ** 2))) if diff.size else None, "support_correlation": float(np.corrcoef(psf_values[inside], masked[inside])[0, 1]) if diff.size > 1 and np.std(psf_values[inside]) > 0 and np.std(masked[inside]) > 0 else None}
+        summary = {"center_unmasked": volume_summary(values), "psf_unmasked": volume_summary(psf_values), "formal_masked": volume_summary(masked), "encoding_backend": backend, "quantity": {"center": "psf_free_inr_center_value", "psf": "same_sampling_semantics_independent_deterministic_diagnostic_realization"}, "psf_resolution": output_resolution * psf_factor, "n_samples": n_samples, "diagnostic_rng_seed": diagnostic_seed, **metrics}; (output / "intensity_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        return stage_status("rendered", figures=figures, **summary)
 
     def _v7_reprojection(self, experiment_root: Path, output: Path, device: str) -> dict[str, Any]:
         """Use pinned NeSVoR ``sample_slices``; no central-plane substitute is used."""
         payload, model, _ = self._load_static_model(experiment_root, device)
         from nesvor.image import load_slices
         from nesvor.inr.sample import sample_slices
-        files = numeric_corrected_slices(experiment_root / "02_static_nesvor" / "slices")
-        chosen = [files[index] for index in sorted(set((0, len(files) // 2, len(files) - 1)))] if files else []
+        corrected_dir = experiment_root / "02_static_nesvor" / "slices"; files = numeric_corrected_slices(corrected_dir); pose_path = experiment_root / "02_static_nesvor" / "corrected_pose_manifest.json"
+        from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import load_corrected_pose_map
+        poses = load_corrected_pose_map(pose_path); selected_keys = self._representative_pose_keys(poses); selected_names = {Path(poses[key].corrected_slice_file).name for key in selected_keys}; chosen = [path for path in files if path.name in selected_names]
         if not chosen: return stage_status("partial", "no numeric corrected slices available")
-        observed = load_slices([str(path) for path in chosen], torch.device(device)); simulated = sample_slices(model, observed, payload["mask"], float(getattr(payload["args"], "output_psf_factor", 1.0)), int(getattr(payload["args"], "n_inference_samples", 128)))
-        panels: list[np.ndarray] = []; labels: list[str] = []
+        all_observed = load_slices(str(corrected_dir), torch.device(device)); by_index = {int(path.name.split(".", 1)[0]): item for path, item in zip(files, all_observed)}; observed = [by_index[int(path.name.split(".", 1)[0])] for path in chosen]; simulated = sample_slices(model, observed, payload["mask"], float(getattr(payload["args"], "output_psf_factor", 1.0)), int(getattr(payload["args"], "n_inference_samples", 128)))
+        figures: dict[str, Any] = {}
         for index, (source, predicted) in enumerate(zip(observed, simulated)):
-            raw, estimate = source.image.squeeze().detach().cpu().numpy(), predicted.image.squeeze().detach().cpu().numpy(); panels.extend((raw, estimate, np.abs(raw - estimate))); labels.extend((f"corrected observed {index}", "NeSVoR PSF reprojection", "absolute residual"))
-        render_montage(output / "reprojections.png", panels, labels, columns=3)
-        return stage_status("rendered", slice_count=len(chosen), simulation_path="pinned_nesvor_sample_slices")
+            raw, estimate = source.image.squeeze().detach().cpu().numpy(), predicted.image.squeeze().detach().cpu().numpy(); residual = np.abs(raw - estimate); intensity_window = fixed_window(np.concatenate((raw.ravel(), estimate.ravel())), robust=True); residual_window = (0., max(float(residual.max()), 1e-6)); key = next((candidate for candidate in selected_keys if Path(poses[candidate].corrected_slice_file).name == chosen[index].name), None); label = f"{key[0]}_{location_token(key[0], key[1])}" if key else f"slice_{index:03d}"; name = f"reprojection_{label}.png"; figures[name] = render_independent_images(output / name, [raw, estimate, residual], ["corrected observed", "NeSVoR PSF reprojection", "absolute residual"], [intensity_window, intensity_window, residual_window]); figures[name]["observed_predicted_window"] = intensity_window; figures[name]["residual_window"] = residual_window; figures[name]["policy"] = "shared observed/predicted; separate nonnegative residual"
+        return stage_status("rendered", slice_count=len(chosen), simulation_path="nesvor.inr.sample.sample_slices(directory, device)", figures=figures)

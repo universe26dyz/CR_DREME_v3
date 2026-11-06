@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,6 +17,12 @@ STAGES = tuple(f"V{index}_{name}" for index, name in enumerate((
 
 def sha256(path: str | Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def directory_manifest(path: str | Path) -> tuple[list[dict[str, str]], str]:
+    root = Path(path); entries = [{"relative_filename": file.relative_to(root).as_posix(), "sha256": sha256(file)} for file in sorted(root.rglob("*")) if file.is_file()]
+    tree_hash = hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return entries, tree_hash
 
 
 def ensure_safe_output_dir(output_dir: str | Path, authoritative_artifacts: list[str | Path]) -> Path:

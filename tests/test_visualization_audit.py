@@ -90,12 +90,136 @@ def test_pose_deltas_and_numeric_slice_filter(tmp_path: Path) -> None:
     assert [path.name for path in numeric_corrected_slices(tmp_path)] == ["0.nii.gz", "1.nii.gz"]
 
 
+def test_v0_representative_frames_use_one_location_and_true_relative_seconds(monkeypatch, tmp_path: Path) -> None:
+    from cardioresp4d.visualization.adapters.exp1_reference import Exp1ReferenceAdapter
+    import cardioresp4d.visualization.adapters.exp1_reference as module
+
+    rows = []
+    samples = {}
+    for slice_id, z in (("a", 0.), ("b", 10.)):
+        for frame_index, timestamp in enumerate((10., 13., 20.)):
+            row = {"view": "SAX", "slice_id": slice_id, "qc_valid": "1", "image_orientation_patient": "[1,0,0,0,1,0]", "image_position_patient": f"[0,0,{z}]"}
+            rows.append(row); samples[len(rows) - 1] = {"rescaled_image": np.full((3, 3), frame_index + z), "timestamp_s": timestamp, "slice_id": slice_id, "source_file_token": f"tok-{slice_id}-{frame_index}"}
+
+    class FakeDataset:
+        _rows = rows
+        def __getitem__(self, index): return samples[index]
+
+    captured = []
+    monkeypatch.setattr(Exp1ReferenceAdapter, "_dataset", staticmethod(lambda *_: FakeDataset()))
+    monkeypatch.setattr(module, "render_montage", lambda *args, **kwargs: captured.append((args, kwargs)) or {"kind": "fixed"})
+    Exp1ReferenceAdapter()._v0_raw(Path("manifest"), Path("qc"), tmp_path)
+    contacts = [item for item in captured if "temporal_contact_sheet" in str(item[0][0])]
+    assert len(contacts) == 1
+    labels = contacts[0][0][2]
+    panels = contacts[0][0][1]
+    assert len({label.split(" frame")[0] for label in labels}) == 1
+    assert all("Δt=" in label for label in labels)
+    assert any("Δt=3s" in label for label in labels) and any("Δt=10s" in label for label in labels)
+    assert all(float(panel[0, 0]) >= 10. for panel in panels)
+
+
+def test_clip_fractions_aggregate_full_series_and_display_windows_are_independent() -> None:
+    from cardioresp4d.visualization.image_utils import aggregate_clip_fractions
+
+    frames = [np.array([0., 1., 2.]), np.array([100., 101., 102.])]
+    result = aggregate_clip_fractions(frames, lower=1., upper=101.)
+    assert result["low_clip_fraction"] == pytest.approx(2 / 6)
+    assert result["high_clip_fraction"] == pytest.approx(2 / 6)
+
+
+def test_support_export_uses_official_nesvor_transpose_and_round_trips(tmp_path: Path) -> None:
+    from cardioresp4d.visualization.image_utils import export_support_mask
+    import cardioresp4d.adapters.nesvor_inr  # registers the vendored NeSVoR path
+    from nesvor.image.image_utils import load_nii_volume
+
+    internal = np.zeros((2, 3, 5), dtype=bool); internal[0, 1, 4] = True; internal[1, 2, 0] = True
+    path = export_support_mask(internal, np.eye(4), tmp_path / "mask.nii.gz")
+    assert nib.load(str(path)).shape == (5, 3, 2)
+    restored, _, _ = load_nii_volume(path)
+    np.testing.assert_array_equal(restored.astype(bool), internal)
+
+
+def test_support_bbox_uses_all_eight_corners_and_reports_lps() -> None:
+    from cardioresp4d.visualization.image_utils import support_metrics
+
+    affine = np.array([[1., 1., 0., 0.], [0., 1., 1., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]])
+    values = np.ones((2, 2, 2), dtype=np.uint8)
+    result = support_metrics(values, affine)
+    assert result["voxel_index_bbox"] == [[0, 0, 0], [1, 1, 1]]
+    assert result["world_bbox_ras_mm"] == [[0., 0., 0.], [2., 2., 1.]]
+    assert "world_bbox_lps_mm" in result
+
+
+def test_pose_delta_uses_full_so3_rotation_when_row_is_unchanged() -> None:
+    from cardioresp4d.visualization.geometry_utils import pose_delta
+
+    original = _geometry(0.)
+    corrected = _geometry(0.)
+    corrected["column_direction"] = [0., 0., 1.]
+    corrected["normal"] = [0., -1., 0.]
+    result = pose_delta(original, corrected)
+    assert result["rotation_deg"] == pytest.approx(90.)
+    assert result["normal_angle_deg"] == pytest.approx(90.)
+
+
+def test_v7_representative_indices_cover_all_views() -> None:
+    from cardioresp4d.visualization.adapters.exp1_reference import Exp1ReferenceAdapter
+
+    poses = {("SAX", str(i)): object() for i in range(3)} | {("2CH", str(i)): object() for i in range(2)} | {("4CH", str(i)): object() for i in range(4)}
+    selected = Exp1ReferenceAdapter._representative_pose_keys(poses)
+    assert {view for view, _ in selected} == {"SAX", "2CH", "4CH"}
+
+
+def test_cli_returns_nonzero_after_mandatory_failure_but_allows_partial_hooks(monkeypatch, tmp_path: Path) -> None:
+    import scripts.render_experiment_audit as cli
+
+    class FakeAdapter:
+        name = "fake"
+        scientific_status = {}
+        def source_artifacts(self, *args): return {}
+        def render(self, **kwargs):
+            return {**{name: {"render_status": "rendered", "manual_admission": "pending"} for name in ("V0_raw_acquisition", "V1_normalization", "V2_temporal_mean", "V3_stack_geometry", "V4_registration", "V5_static_support", "V6_static_inr", "V7_static_reprojection")}, "V8_dynamic_zero_motion": {"render_status": "partial"}, "V9_dynamic_boundaries": {"render_status": "partial"}}
+    monkeypatch.setattr(cli, "adapter_for", lambda _: FakeAdapter())
+    monkeypatch.setattr(cli, "write_audit_manifest", lambda path, **kwargs: (path.write_text("{}"), path)[1])
+    monkeypatch.setattr(cli, "write_html_report", lambda *args: None)
+    monkeypatch.setattr(cli, "ensure_safe_output_dir", lambda path, _: path.mkdir(parents=True, exist_ok=True) or path)
+    monkeypatch.setattr(cli, "json", json)
+    monkeypatch.setattr(cli.sys, "argv", ["render", "--experiment", "fake", "--experiment-root", str(tmp_path), "--manifest", str(tmp_path / "m"), "--qc-table", str(tmp_path / "q"), "--canonical-domain", str(tmp_path / "d"), "--output-dir", str(tmp_path / "out")])
+    assert cli.main() == 0
+
+
+def test_cli_fails_closed_when_mandatory_stage_failed(monkeypatch, tmp_path: Path) -> None:
+    import scripts.render_experiment_audit as cli
+    class FakeAdapter:
+        name = "fake"; scientific_status = {}
+        def source_artifacts(self, *args): return {}
+        def render(self, **kwargs): return {"V0_raw_acquisition": {"render_status": "failed", "reason": "boom"}, **{f"V{i}_x": {"render_status": "rendered"} for i in range(1, 10)}}
+    monkeypatch.setattr(cli, "adapter_for", lambda _: FakeAdapter())
+    monkeypatch.setattr(cli, "write_audit_manifest", lambda path, **kwargs: (path.write_text("{}"), path)[1])
+    monkeypatch.setattr(cli, "write_html_report", lambda *args: None)
+    monkeypatch.setattr(cli.sys, "argv", ["render", "--experiment", "fake", "--experiment-root", str(tmp_path), "--manifest", str(tmp_path / "m"), "--qc-table", str(tmp_path / "q"), "--canonical-domain", str(tmp_path / "d"), "--output-dir", str(tmp_path / "out")])
+    assert cli.main() == 2
+
+
+def test_psf_free_and_psf_sampled_lattice_helpers_are_distinct_and_deterministic() -> None:
+    from cardioresp4d.visualization.image_utils import evaluate_inr_on_nifti_lattice, evaluate_inr_psf_on_nifti_lattice
+    import cardioresp4d.adapters.nesvor_inr
+    class Model(torch.nn.Module):
+        def forward(self, points): return points[..., 0]
+        def sample_batch(self, points, transformation, sigma, n_samples): return points[:, None, :].expand(-1, n_samples, -1) + torch.randn(points.shape[0], n_samples, 3) * float(sigma)
+    target = nib.Nifti1Image(np.zeros((2, 2, 2), dtype=np.float32), np.eye(4)); model = Model()
+    center = evaluate_inr_on_nifti_lattice(model, target, device=torch.device("cpu")); sampled_a = evaluate_inr_psf_on_nifti_lattice(model, target, device=torch.device("cpu"), psf_resolution=1., n_samples=4, seed=7); sampled_b = evaluate_inr_psf_on_nifti_lattice(model, target, device=torch.device("cpu"), psf_resolution=1., n_samples=4, seed=7)
+    assert center.shape == sampled_a.shape == target.shape
+    np.testing.assert_array_equal(sampled_a, sampled_b)
+
+
 def test_support_export_preserves_values_and_unmasked_lattice(tmp_path: Path) -> None:
     from cardioresp4d.visualization.image_utils import export_support_mask, save_unmasked_static_inr
 
     mask = torch.tensor([[[0, 1], [1, 0]]], dtype=torch.bool)
     mask_path = export_support_mask(mask, np.eye(4), tmp_path / "mask.nii.gz")
-    np.testing.assert_array_equal(nib.load(str(mask_path)).get_fdata(), mask.numpy())
+    np.testing.assert_array_equal(nib.load(str(mask_path)).get_fdata(), mask.numpy().transpose(2, 1, 0))
     target = nib.Nifti1Image(np.zeros((2, 3, 4), dtype=np.float32), np.diag([1., 2., 3., 1.]))
     result = save_unmasked_static_inr(np.ones((2, 3, 4), dtype=np.float32), target, tmp_path / "inr.nii.gz")
     image = nib.load(str(result))

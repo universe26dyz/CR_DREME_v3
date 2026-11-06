@@ -82,7 +82,14 @@ def pose_delta(original: Mapping[str, Any], corrected: Mapping[str, Any]) -> dic
     normal_a = np.asarray(original["normal"], dtype=float); normal_b = np.asarray(corrected["normal"], dtype=float)
     normal_angle = math.degrees(math.acos(np.clip(np.dot(normal_a, normal_b) / (np.linalg.norm(normal_a) * np.linalg.norm(normal_b)), -1., 1.)))
     row_a = np.asarray(original["row_direction"], dtype=float); row_b = np.asarray(corrected["row_direction"], dtype=float)
-    rotation = math.degrees(math.acos(np.clip(np.dot(row_a, row_b) / (np.linalg.norm(row_a) * np.linalg.norm(row_b)), -1., 1.)))
+    column_a = np.asarray(original["column_direction"], dtype=float); column_b = np.asarray(corrected["column_direction"], dtype=float)
+    def orientation(row: np.ndarray, column: np.ndarray, normal: np.ndarray) -> np.ndarray:
+        row = row / np.linalg.norm(row); column = column - row * np.dot(row, column); column = column / np.linalg.norm(column)
+        computed_normal = np.cross(row, column); computed_normal *= 1. if np.dot(computed_normal, normal) >= 0 else -1.
+        return np.column_stack((row, column, computed_normal))
+    matrix_a = orientation(row_a, column_a, normal_a); matrix_b = orientation(row_b, column_b, normal_b)
+    delta = matrix_b @ matrix_a.T
+    rotation = math.degrees(math.acos(np.clip((np.trace(delta) - 1.) / 2., -1., 1.)))
     return {"translation_mm": float(np.linalg.norm(center_delta)), "rotation_deg": float(rotation), "center_displacement_mm": float(np.linalg.norm(center_delta)), "normal_angle_deg": float(normal_angle)}
 
 

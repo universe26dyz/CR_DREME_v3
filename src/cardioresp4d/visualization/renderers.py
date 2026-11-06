@@ -27,6 +27,17 @@ def render_paired_images(output: str | Path, images: Sequence[np.ndarray], title
     return {"kind": "fixed", "vmin": float(window[0]), "vmax": float(window[1])}
 
 
+def render_independent_images(output: str | Path, images: Sequence[np.ndarray], titles: Sequence[str], windows: Sequence[tuple[float, float]]) -> dict[str, object]:
+    if len(images) != len(titles) or len(images) != len(windows) or not images:
+        raise ValueError("independent rendering needs matching nonempty images, titles, and windows")
+    path = Path(output); path.parent.mkdir(parents=True, exist_ok=True)
+    figure, axes = plt.subplots(1, len(images), figsize=(4 * len(images), 4), squeeze=False)
+    for axis, image, title, window in zip(axes.ravel(), images, titles, windows):
+        axis.imshow(np.asarray(image), cmap="gray", vmin=window[0], vmax=window[1]); axis.set_title(title); axis.axis("off")
+    figure.tight_layout(); figure.savefig(path, dpi=140); plt.close(figure)
+    return {title: {"kind": "fixed", "vmin": float(window[0]), "vmax": float(window[1])} for title, window in zip(titles, windows)}
+
+
 def render_montage(output: str | Path, images: Sequence[np.ndarray], labels: Sequence[str], *, columns: int = 6, window: tuple[float, float] | None = None) -> dict[str, float | str]:
     if len(images) != len(labels): raise ValueError("montage images/labels mismatch")
     rows = max(1, int(np.ceil(len(images) / columns))); figure, axes = plt.subplots(rows, columns, figsize=(3 * columns, 3 * rows), squeeze=False)

@@ -6,11 +6,16 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from .contract import sha256
+from .contract import directory_manifest, sha256
 
 
 def write_audit_manifest(output: str | Path, *, adapter: str, sources: Mapping[str, Path], stages: Mapping[str, Mapping[str, Any]], display_policies: Mapping[str, Any], render_configuration: Mapping[str, Any] | None = None) -> Path:
-    payload = {"schema_version": 1, "experiment_adapter": adapter, "source_artifacts": {name: {"source_token": name, "artifact_name": path.name, "sha256": sha256(path)} for name, path in sources.items() if path.is_file()}, "render_configuration": dict(render_configuration or {}), "display_window_policies": dict(display_policies), "stage_status": {name: dict(value) for name, value in stages.items()}}
+    artifacts = {}
+    for name, path in sources.items():
+        if path.is_file(): artifacts[name] = {"source_token": name, "artifact_name": path.name, "sha256": sha256(path)}
+        elif path.is_dir():
+            entries, tree_hash = directory_manifest(path); artifacts[name] = {"source_token": name, "artifact_name": path.name, "content_manifest": entries, "tree_sha256": tree_hash}
+    payload = {"schema_version": 1, "experiment_adapter": adapter, "source_artifacts": artifacts, "render_configuration": dict(render_configuration or {}), "display_window_policies": dict(display_policies), "stage_status": {name: dict(value) for name, value in stages.items()}}
     path = Path(output); path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"); return path
 
 
