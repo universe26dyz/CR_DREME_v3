@@ -8,10 +8,9 @@ from typing import Any, Mapping
 
 import torch
 
-from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField
 from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import (ReferenceSegment, S2VDREMEReferenceRunner, boundary_motion_diagnostics,
                                                                         configure_reference_segment, reference_loss)
-from cardioresp4d.visualization.dynamic_audit import fixed_physical_grid, location_local_rms_metrics
+from cardioresp4d.visualization.dynamic_audit import fixed_physical_grid, location_local_rms_metrics, weighted_dvf_from_precomputed_basis
 
 
 EXP2A_PROTOCOL = {
@@ -110,6 +109,38 @@ def exp2a_provenance(*, manifest: Path, qc_table: Path, canonical_domain: Path, 
     return result
 
 
+def exp2a_input_bindings(*, manifest: Path, qc_table: Path, canonical_domain: Path, static_manifest: Path, mean_manifest: Path, static_model: Path, corrected_pose_manifest: Path) -> dict[str, Any]:
+    """Create the small immutable input binding consumed by the V9 adapter."""
+    def artifact(path: Path) -> dict[str, str]:
+        path = Path(path).resolve()
+        return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    mean_payload = json.loads(Path(mean_manifest).read_text())
+    stack_paths = {}
+    for record in mean_payload.get("locations", []):
+        if record.get("real", True) is False or str(record.get("slice_id", "")).upper().startswith("MISSING"):
+            continue
+        stack = (Path(mean_manifest).resolve().parent / str(record["stack_file"])).resolve()
+        stack_paths[stack.name] = artifact(stack)
+    return {"schema_version": 1, "manifest": artifact(manifest), "qc_table": artifact(qc_table), "canonical_domain": artifact(canonical_domain), "static_manifest": artifact(static_manifest), "mean_manifest": artifact(mean_manifest), "static_model": artifact(static_model), "corrected_pose_manifest": artifact(corrected_pose_manifest), "mean_stacks": stack_paths}
+
+
+def verify_exp2a_input_bindings(bindings: Mapping[str, Any]) -> None:
+    """Fail closed if any immutable Exp2-A input changed after training."""
+    artifacts = dict(bindings)
+    for name, item in artifacts.items():
+        if name == "schema_version":
+            continue
+        if name == "mean_stacks":
+            for stack_name, stack_item in dict(item).items():
+                path = Path(stack_item["path"])
+                if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != stack_item["sha256"]:
+                    raise ValueError(f"Exp2-A input binding changed: mean_stacks/{stack_name}")
+            continue
+        path = Path(item["path"])
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
+            raise ValueError(f"Exp2-A input binding changed: {name}")
+
+
 def exp2a_parameter_groups(model: torch.nn.Module) -> dict[str, list[torch.nn.Parameter]]:
     """Freeze canonical and inactive levels; return only Exp2-A optimizer owners."""
     for parameter in model.parameters():
@@ -128,6 +159,7 @@ def exp2a_gauge_diagnostics(model: Any, sampler: Any, *, grid_shape: tuple[int, 
     if not cohort:
         raise ValueError("Exp2-A gauge diagnostics require a non-empty cohort")
     grid, _ = fixed_physical_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, grid_shape)
+    raw_basis = model.respiratory_mbc.raw_active(grid, active_levels=1).detach()
     score_values = {name: [] for name in ("raw", "reference", "effective")}; dvf_values = {name: [] for name in score_values}
     with torch.no_grad():
         for _, _, frames in cohort:
@@ -135,11 +167,11 @@ def exp2a_gauge_diagnostics(model: Any, sampler: Any, *, grid_shape: tuple[int, 
             for observation in frames:
                 raw = model.encode_motion_scores_raw(observation)["resp_scores"][:, :1]
                 reference = model.encode_reference_scores(observation)["resp_scores"][:, :1]
-                effective = model.encode_motion_scores(observation)["resp_scores"][:, :1]
+                effective = raw - reference
                 scores_by_kind["raw"].append(raw[0]); scores_by_kind["reference"].append(reference[0]); scores_by_kind["effective"].append(effective[0])
             for name, values in scores_by_kind.items():
                 sequence = torch.stack(values); score_values[name].append(sequence)
-                dvf_values[name].append(torch.stack([ScoreWeightedMBCField(model.respiratory_mbc, value[None])(grid)[0] for value in values]))
+                dvf_values[name].append(torch.stack([weighted_dvf_from_precomputed_basis(raw_basis, value[None])[0] for value in values]))
     result: dict[str, Any] = {"location_count": len(cohort), "frame_count": sum(len(frames) for _, _, frames in cohort)}
     by_view: dict[str, dict[str, list[torch.Tensor]]] = {}
     for index, (view, _, _) in enumerate(cohort):

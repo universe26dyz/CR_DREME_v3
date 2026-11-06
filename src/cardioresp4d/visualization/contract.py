@@ -40,8 +40,8 @@ def ensure_safe_output_dir(output_dir: str | Path, authoritative_artifacts: list
 
 
 def stage_status(render_status: str = "partial", reason: str | None = None, **details: Any) -> dict[str, Any]:
-    if render_status not in {"rendered", "partial", "failed"}:
-        raise ValueError("render_status must be rendered, partial, or failed")
+    if render_status not in {"rendered", "partial", "failed", "skipped"}:
+        raise ValueError("render_status must be rendered, partial, failed, or skipped")
     payload: dict[str, Any] = {"render_status": render_status, "manual_admission": "pending"}
     if reason is not None:
         payload["reason"] = reason
@@ -62,7 +62,7 @@ class ExperimentVisualizationAdapter(ABC):
     def source_artifacts(self, experiment_root: Path, manifest: Path, qc_table: Path, canonical_domain: Path) -> dict[str, Path]: ...
 
     @abstractmethod
-    def render(self, *, experiment_root: Path, manifest: Path, qc_table: Path, canonical_domain: Path, output_dir: Path, device: str) -> dict[str, dict[str, Any]]: ...
+    def render(self, *, experiment_root: Path, manifest: Path, qc_table: Path, canonical_domain: Path, output_dir: Path, device: str, stages: tuple[str, ...] | None = None) -> dict[str, dict[str, Any]]: ...
 
     # Stable extension points: future adapters can implement a dynamic renderer
     # without coupling generic report/safety code to a checkpoint schema.

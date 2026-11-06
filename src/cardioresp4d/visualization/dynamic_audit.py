@@ -9,7 +9,6 @@ from typing import Any, Iterable, Mapping
 import torch
 
 from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend, lps_to_ras_world_matrix
-from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField
 from cardioresp4d.training.build_model import build_source_first_model
 from cardioresp4d.diagnostics.change5c import diagnostic_rng, stable_diagnostic_seed
 from cardioresp4d.training.stage_contract import stage_contract
@@ -30,6 +29,30 @@ _BOUNDARIES = (
     ("L2_warm", "stage2b"), ("L2_joint", "stage2b"),
     ("L3_warm", "stage2c"), ("L3_joint", "stage2c"),
 )
+
+
+def select_boundary_subset(boundaries: Iterable[CheckpointBoundary], requested: str | None) -> list[CheckpointBoundary]:
+    """Return a validated, protocol-ordered boundary subset.
+
+    ``requested`` is the comma-separated CLI spelling used by retrospective
+    audits.  Validation happens before filtering so a typo cannot silently
+    produce an empty or scientifically different audit.
+    """
+    available = list(boundaries)
+    if requested is None or not requested.strip():
+        return available
+    names = [item.strip() for item in requested.split(",") if item.strip()]
+    known = {label for label, _ in _BOUNDARIES} | {"last"}
+    unknown = sorted(set(names) - known)
+    if unknown:
+        raise ValueError(f"unknown boundary name(s): {', '.join(unknown)}")
+    if len(names) != len(set(names)):
+        raise ValueError("boundary names must be unique")
+    by_name = {item.label: item for item in available}
+    missing = [name for name in names if name not in by_name]
+    if missing:
+        raise FileNotFoundError(f"requested boundary checkpoint(s) are unavailable: {', '.join(missing)}")
+    return [by_name[name] for name in names]
 
 
 def _sha256(path: Path) -> str:
@@ -124,6 +147,28 @@ def dynamic_field_labels() -> dict[str, str]:
     return {"raw_mbc": "raw MBC basis field", "weighted_dvf": "score-weighted DVF"}
 
 
+def weighted_dvf_from_precomputed_basis(raw_basis: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+    """Apply score weighting to a precomputed ``[B,L,N,3]`` MBC basis.
+
+    This is diagnostic-only algebra.  It is intentionally equivalent to
+    ``ScoreWeightedMBCField(mbc, scores)(grid)`` while avoiding repeated basis
+    evaluation for every temporal frame on a fixed grid.
+    """
+    if raw_basis.ndim == 3:
+        raw_basis = raw_basis.unsqueeze(0)
+    if scores.ndim == 2:
+        scores = scores.unsqueeze(0)
+    if raw_basis.ndim != 4 or scores.ndim != 3:
+        raise ValueError(f"basis/scores shape mismatch: {tuple(raw_basis.shape)} vs {tuple(scores.shape)}")
+    batch_compatible = raw_basis.shape[0] in (1, scores.shape[0]) or scores.shape[0] in (1, raw_basis.shape[0])
+    if raw_basis.shape[1] != scores.shape[1] or raw_basis.shape[-1] != scores.shape[-1] or not batch_compatible:
+        raise ValueError(f"basis/scores shape mismatch: {tuple(raw_basis.shape)} vs {tuple(scores.shape)}")
+    batch = max(raw_basis.shape[0], scores.shape[0])
+    raw_basis = raw_basis.expand(batch, -1, -1, -1)
+    scores = scores.expand(batch, -1, -1)
+    return (raw_basis * scores.unsqueeze(-2)).sum(dim=1)
+
+
 def reconstruct_exp1_checkpoint(checkpoint: dict[str, Any], domain: dict[str, Any], observations: list[Any], device: torch.device) -> torch.nn.Module:
     """Reconstruct the exact source-first model encoded by an Exp1 checkpoint."""
     config = checkpoint.get("effective_config")
@@ -153,4 +198,5 @@ def predict_observation_slice(model: torch.nn.Module, observation: Any, stage: s
 
 
 def dvf_from_scores(model: Any, grid: torch.Tensor, scores: torch.Tensor, active_levels: int) -> torch.Tensor:
-    return ScoreWeightedMBCField(model.respiratory_mbc, scores[:, :active_levels])(grid)
+    basis = model.respiratory_mbc.raw_active(grid, active_levels=active_levels)
+    return weighted_dvf_from_precomputed_basis(basis, scores[:, :active_levels])

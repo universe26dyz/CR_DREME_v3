@@ -151,3 +151,28 @@ def test_exp2a_runner_state_isolated_and_rejects_exp1_schedule() -> None:
     state = {"experiment": "respiratory_reference_gauge_exp2a", "segment": "exp2a_step_200", "steps": 200, "stage": "stage2a", "active_levels": 1, "owners": ["respiratory_encoder", "respiratory_mbc"], "canonical_frozen": True}
     assert state["experiment"] == "respiratory_reference_gauge_exp2a" and state["owners"][-1] == "respiratory_mbc"
     assert Exp2AReferenceRunner.__name__ == "Exp2AReferenceRunner"
+
+
+def test_retrospective_score_and_dvf_location_metrics_are_json_serializable() -> None:
+    from scripts.audit_exp1_reference_score_gauge import dvf_sequence_metrics, score_sequence_metrics
+
+    scores = torch.tensor([[1., 2., 3.], [2., 4., 6.]])
+    dvf = torch.randn(2, 7, 3)
+    score_payload = score_sequence_metrics(scores); dvf_payload = dvf_sequence_metrics(dvf)
+    json.dumps({"score": score_payload, "dvf": dvf_payload})
+    assert len(score_payload["temporal_mean_components"]) == 3
+    assert isinstance(dvf_payload["magnitude_max_mm"], float)
+
+
+def test_exp2a_input_bindings_fail_closed_when_mean_stack_changes(tmp_path: Path) -> None:
+    from cardioresp4d.experiments.respiratory_reference_gauge_exp2a import exp2a_input_bindings, verify_exp2a_input_bindings
+
+    stack = tmp_path / "mean_stack_SAX.nii.gz"; nib.save(nib.Nifti1Image(np.zeros((2, 2, 1), dtype=np.float32), np.eye(4)), str(stack))
+    mean = tmp_path / "mean.json"; mean.write_text(json.dumps({"locations": [{"view": "SAX", "slice_id": "s0", "stack_file": stack.name, "stack_index": 0}]}))
+    files = [tmp_path / name for name in ("manifest", "qc", "domain", "static.json", "model.pt", "pose.json")]
+    for path in files: path.write_bytes(path.name.encode())
+    bindings = exp2a_input_bindings(manifest=files[0], qc_table=files[1], canonical_domain=files[2], static_manifest=files[3], mean_manifest=mean, static_model=files[4], corrected_pose_manifest=files[5])
+    verify_exp2a_input_bindings(bindings)
+    stack.write_bytes(b"changed")
+    with pytest.raises(ValueError, match="mean_stacks"):
+        verify_exp2a_input_bindings(bindings)

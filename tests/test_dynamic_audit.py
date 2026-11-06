@@ -51,6 +51,33 @@ def test_dynamic_audit_active_levels_centering_grid_and_field_labels() -> None:
     assert dynamic_field_labels() == {"raw_mbc": "raw MBC basis field", "weighted_dvf": "score-weighted DVF"}
 
 
+def test_boundary_subset_validates_and_preserves_requested_protocol_order(tmp_path: Path) -> None:
+    from cardioresp4d.visualization.dynamic_audit import discover_boundary_checkpoints, select_boundary_subset
+
+    for name in ("L1_warm", "L1_joint"):
+        (tmp_path / f"checkpoint_{name}_end.pt").write_bytes(name.encode())
+    boundaries = discover_boundary_checkpoints(tmp_path)
+    assert [item.label for item in select_boundary_subset(boundaries, "L1_joint,L1_warm")] == ["L1_joint", "L1_warm"]
+    import pytest
+    with pytest.raises(ValueError, match="unknown boundary"):
+        select_boundary_subset(boundaries, "L4_warm")
+
+
+def test_precomputed_basis_weighting_matches_score_weighted_field() -> None:
+    from cardioresp4d.models.bspline_mbc import RespiratoryMBC
+    from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField
+    from cardioresp4d.visualization.dynamic_audit import weighted_dvf_from_precomputed_basis
+
+    mbc = RespiratoryMBC(torch.tensor([-1., -1., -1.]), torch.tensor([1., 1., 1.]), resolutions=(4, 5, 6))
+    with torch.no_grad():
+        for level in mbc.levels:
+            level.controls.copy_(torch.randn_like(level.controls))
+    points = torch.randn(2, 11, 3).clamp(-.8, .8); scores = torch.randn(2, 3, 3)
+    expected = ScoreWeightedMBCField(mbc, scores)(points)
+    basis = mbc(points)
+    torch.testing.assert_close(weighted_dvf_from_precomputed_basis(basis, scores), expected)
+
+
 def test_location_local_pooling_does_not_turn_location_offsets_into_dynamics() -> None:
     from cardioresp4d.visualization.dynamic_audit import location_local_rms_metrics, pool_location_metrics_by_view
 

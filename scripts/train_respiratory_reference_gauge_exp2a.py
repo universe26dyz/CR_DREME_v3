@@ -16,7 +16,8 @@ sys.path.insert(0, str(ROOT / "src")); sys.path.insert(0, str(ROOT / "scripts"))
 from train_respiratory_s2vdreme_reference_v1 import _load_config
 from train_source_first import observations_from_manifest
 from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend, lps_to_ras_world_matrix
-from cardioresp4d.experiments.respiratory_reference_gauge_exp2a import EXP2A_PROTOCOL, Exp2AReferenceRunner, exp2a_gauge_diagnostics, exp2a_provenance
+from cardioresp4d.experiments.respiratory_reference_gauge_exp2a import (EXP2A_PROTOCOL, Exp2AReferenceRunner, exp2a_gauge_diagnostics,
+                                                                        exp2a_input_bindings, exp2a_provenance)
 from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import ReferenceSegment, apply_corrected_static_poses, derive_effective_external_domain, load_corrected_pose_map, strict_canonical_state_from_static_checkpoint
 from cardioresp4d.training.build_model import build_source_first_model
 from cardioresp4d.training.runtime_state import capture_rng_state, restore_rng_state, set_reproducibility
@@ -89,6 +90,9 @@ def main() -> None:
             raise ValueError("Exp2-A resume checkpoint is not a hard reference-gauge checkpoint")
         model.load_state_dict(checkpoint["model"], strict=True); runner.load_boundary_state(checkpoint["runner_state"]); restore_rng_state(checkpoint["rng_state"])
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    input_bindings = exp2a_input_bindings(manifest=args.manifest, qc_table=args.qc_table, canonical_domain=args.canonical_domain, static_manifest=args.static_manifest, mean_manifest=args.mean_manifest, static_model=static_model, corrected_pose_manifest=pose_manifest)
+    (args.output_dir / "experiment_inputs.json").write_text(json.dumps(input_bindings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (args.output_dir / "effective_config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     initialization_audit = {"seed": EXP2A_PROTOCOL["seed"], "encoder_initial_state_sha256": _state_digest(model.film_encoder), "l1_mbc_initial_state_sha256": _state_digest(model.respiratory_mbc.levels[0]), "model_config_sha256": provenance["config_sha256"], "initialization_policy": "fresh deterministic Exp2-A construction after set_reproducibility(seed)", "same_seeded_initialization_expected_by_protocol": True, "exact_historical_pretraining_weight_equality_not_directly_observable": True}
     if checkpoint is not None and checkpoint.get("initialization_audit"):
         initialization_audit = checkpoint["initialization_audit"]
@@ -101,7 +105,7 @@ def main() -> None:
     static_initialization = {"mode": "direct_exact_state_with_coordinate_bridge", "static_model_sha256": _sha256(static_model), "internal_inr_bounds_mm": internal_bounds.tolist(), "encoding_backend": backend, "canonical_frozen": True}
     payload = {"checkpoint_schema": CHECKPOINT_SCHEMA, "model": model.state_dict(), "runner_state": runner.state_dict(), "rng_state": capture_rng_state(), "effective_config": config, "provenance": provenance, "static_initialization": static_initialization, "score_gauge": {"policy": EXP2A_PROTOCOL["score_policy"], "reference_manifest_sha256": provider.provenance["mean_manifest_sha256"], "reference_artifact_hashes": provider.provenance["mean_stacks"]}, "diagnostics": {"step_0": before, "step_200": after}, "initialization_audit": initialization_audit}
     torch.save(payload, args.output_dir / "checkpoint_step_200.pt"); torch.save(payload, args.output_dir / "checkpoint_last.pt")
-    (args.output_dir / "training_report.json").write_text(json.dumps({"experiment": EXP2A_PROTOCOL["experiment"], "protocol": EXP2A_PROTOCOL, "runner_report": report, "diagnostics": payload["diagnostics"], "initialization_audit": initialization_audit, "provenance": provenance, "normalization_parameters": normalization, "normalization_groups": groups}, indent=2) + "\n")
+    (args.output_dir / "training_report.json").write_text(json.dumps({"experiment": EXP2A_PROTOCOL["experiment"], "protocol": EXP2A_PROTOCOL, "runner_report": report, "diagnostics": payload["diagnostics"], "initialization_audit": initialization_audit, "provenance": provenance, "input_bindings": input_bindings, "normalization_parameters": normalization, "normalization_groups": groups}, indent=2) + "\n")
     print(json.dumps({"status": "trained", "output": str(args.output_dir), "global_step": runner.global_step}, indent=2))
 
 

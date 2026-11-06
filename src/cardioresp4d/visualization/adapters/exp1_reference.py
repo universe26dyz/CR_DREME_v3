@@ -25,7 +25,7 @@ from ..image_utils import (aggregate_clip_fractions, evaluate_inr_on_nifti_latti
 from ..report import json_safe
 from ..renderers import fixed_window, render_independent_images, render_montage, render_paired_images
 from ..dynamic_audit import (CheckpointBoundary, discover_boundary_checkpoints, resolve_dynamic_checkpoint_root,
-                             dvf_from_scores, fixed_physical_grid,
+                             fixed_physical_grid, weighted_dvf_from_precomputed_basis,
                              posthoc_center_scores, predict_observation_slice,
                              reconstruct_exp1_checkpoint,
                              select_fixed_location_frames, static_dynamic_rms)
@@ -62,7 +62,11 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
                 paths[f"training_{name}"] = training / name
         return {name: path for name, path in paths.items() if path.exists()}
 
-    def render(self, *, experiment_root: Path, manifest: Path, qc_table: Path, canonical_domain: Path, output_dir: Path, device: str) -> dict[str, dict[str, Any]]:
+    def render(self, *, experiment_root: Path, manifest: Path, qc_table: Path, canonical_domain: Path, output_dir: Path, device: str, stages: tuple[str, ...] | None = None) -> dict[str, dict[str, Any]]:
+        requested = set(STAGES if stages is None else stages)
+        unknown = requested - set(STAGES)
+        if unknown:
+            raise ValueError(f"unknown visualization stage(s): {', '.join(sorted(unknown))}")
         for stage in STAGES: (output_dir / stage).mkdir(parents=True, exist_ok=True)
         state: dict[str, dict[str, Any]] = {}
         workers = (
@@ -76,18 +80,21 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
             ("V7_static_reprojection", lambda: self._v7_reprojection(experiment_root, output_dir / "V7_static_reprojection", device)),
         )
         for name, worker in workers:
+            if name not in requested:
+                state[name] = stage_status("skipped", "stage not requested")
+                continue
             try:
                 state[name] = worker()
             except Exception as error:  # Individual audit stages must explain rather than silently disappear.
                 state[name] = stage_status("failed", f"{type(error).__name__}: {error}")
-        try:
-            state["V8_dynamic_zero_motion"] = self.render_v8_dynamic_zero_motion(experiment_root=experiment_root, manifest=manifest, qc_table=qc_table, canonical_domain=canonical_domain, output=output_dir / "V8_dynamic_zero_motion", device=device)
-        except Exception as error:
-            state["V8_dynamic_zero_motion"] = stage_status("failed", f"{type(error).__name__}: {error}")
-        try:
-            state["V9_dynamic_boundaries"] = self.render_v9_dynamic_boundaries(experiment_root=experiment_root, manifest=manifest, qc_table=qc_table, canonical_domain=canonical_domain, output=output_dir / "V9_dynamic_boundaries", device=device)
-        except Exception as error:
-            state["V9_dynamic_boundaries"] = stage_status("failed", f"{type(error).__name__}: {error}")
+        for name, worker in (("V8_dynamic_zero_motion", self.render_v8_dynamic_zero_motion), ("V9_dynamic_boundaries", self.render_v9_dynamic_boundaries)):
+            if name not in requested:
+                state[name] = stage_status("skipped", "stage not requested")
+                continue
+            try:
+                state[name] = worker(experiment_root=experiment_root, manifest=manifest, qc_table=qc_table, canonical_domain=canonical_domain, output=output_dir / name, device=device)
+            except Exception as error:
+                state[name] = stage_status("failed", f"{type(error).__name__}: {error}")
         return state
 
     @staticmethod
@@ -330,22 +337,22 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
             for name in ("scores", "dvf", "mbc", "reprojection"):
                 (checkpoint_dir / name).mkdir(parents=True, exist_ok=True)
             grid, _ = fixed_physical_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, (16, 16, 16))
+            raw_mbc = model.respiratory_mbc.raw_active(grid, active_levels=boundary.active_levels).detach()
+            per_level_rms = raw_mbc.square().mean(dim=(0, 2, 3)).sqrt()
+            per_level_max = raw_mbc.abs().amax(dim=(0, 2, 3))
+            for level in range(boundary.active_levels):
+                _render_vector_field_planes(checkpoint_dir / "mbc", f"L{level + 1}", raw_mbc[0, level], label="RAW MBC BASIS FIELD — not score-weighted DVF")
+            np.savez_compressed(checkpoint_dir / "mbc" / "raw_mbc_basis.npz", world_grid_mm=grid.detach().cpu().numpy(), raw_mbc_basis_mm=raw_mbc.cpu().numpy(), per_level_rms_mm=per_level_rms.cpu().numpy(), per_level_max_mm=per_level_max.cpu().numpy(), label="RAW MBC BASIS FIELD", score_weighted_label="score-weighted DVF")
             location_rows = []
             for key_location, frames in selected.items():
                 full_frames = all_frames_by_location[key_location]
                 raw_scores = torch.cat([model.encode_motion_scores_raw(frame)["resp_scores"][:, :boundary.active_levels] for frame in full_frames], dim=0)
                 centered = posthoc_center_scores(raw_scores)
-                dvfs = torch.cat([dvf_from_scores(model, grid, model.encode_motion_scores_raw(frame)["resp_scores"], boundary.active_levels) for frame in full_frames], dim=0)
-                raw_mbc = model.respiratory_mbc.raw_active(grid, active_levels=boundary.active_levels).detach()
-                per_level_rms = raw_mbc.square().mean(dim=(0, 2, 3)).sqrt()
-                per_level_max = raw_mbc.abs().amax(dim=(0, 2, 3))
+                dvfs = torch.cat([weighted_dvf_from_precomputed_basis(raw_mbc, model.encode_motion_scores_raw(frame)["resp_scores"][:, :boundary.active_levels]) for frame in full_frames], dim=0)
                 token = location_token(*key_location)
                 np.savez_compressed(checkpoint_dir / "dvf" / f"{key_location[0]}_{token}.npz", world_grid_mm=grid.detach().cpu().numpy(), dvf_mm=dvfs.detach().cpu().numpy(), dvf_mean_mm=dvfs.mean(0).detach().cpu().numpy(), dvf_dynamic_mm=(dvfs - dvfs.mean(0)).detach().cpu().numpy())
-                np.savez_compressed(checkpoint_dir / "mbc" / f"{key_location[0]}_{token}.npz", raw_mbc_basis_mm=raw_mbc.cpu().numpy(), per_level_rms_mm=per_level_rms.cpu().numpy(), per_level_max_mm=per_level_max.cpu().numpy(), label="raw MBC basis field", score_weighted_label="score-weighted DVF")
                 import matplotlib.pyplot as plt
                 _render_vector_field_planes(checkpoint_dir / "dvf", f"{key_location[0]}_{token}_frame_middle", dvfs[len(dvfs) // 2], label="score-weighted DVF")
-                for level in range(boundary.active_levels):
-                    _render_vector_field_planes(checkpoint_dir / "mbc", f"{key_location[0]}_{token}_L{level + 1}", raw_mbc[0, level], label="RAW MBC BASIS FIELD — not score-weighted DVF")
                 figure, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
                 flat = raw_scores.detach().cpu().numpy().reshape(len(full_frames), -1); flat_centered = centered.detach().cpu().numpy().reshape(len(full_frames), -1)
                 for index in range(flat.shape[1]):
