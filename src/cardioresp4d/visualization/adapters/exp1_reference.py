@@ -16,8 +16,9 @@ from ..geometry_utils import (LPS_RAS, compare_plane_corners_lps, location_token
                               numeric_corrected_slices, ordered_representative_locations,
                               plane_corners_lps, pose_delta, stack_tiles)
 from ..image_utils import (aggregate_clip_fractions, evaluate_inr_on_nifti_lattice,
-                           evaluate_inr_psf_on_nifti_lattice, export_support_mask,
-                           save_unmasked_static_inr, support_metrics, volume_summary)
+                           evaluate_inr_psf_plane, export_support_mask,
+                           representative_plane_specs, save_unmasked_static_inr,
+                           support_metrics, support_point_agreement, volume_summary)
 from ..renderers import fixed_window, render_independent_images, render_montage, render_paired_images
 
 
@@ -251,21 +252,30 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
 
     def _v6_inr(self, experiment_root: Path, output: Path, device: str) -> dict[str, Any]:
         target = nib.load(str(experiment_root / "02_static_nesvor" / "static_reference.nii.gz")); payload, model, backend = self._load_static_model(experiment_root, device)
-        values = evaluate_inr_on_nifti_lattice(model, target, device=torch.device(device)); save_unmasked_static_inr(values, target, output / "static_inr_center_unmasked.nii.gz")
-        args = payload["args"]; output_resolution = float(getattr(args, "output_resolution", min(target.header.get_zooms()[:3]))); psf_factor = float(getattr(args, "output_psf_factor", 1.)); n_samples = int(getattr(args, "n_inference_samples", 128)); diagnostic_seed = 20261106
-        psf_values = evaluate_inr_psf_on_nifti_lattice(model, target, device=torch.device(device), psf_resolution=output_resolution * psf_factor, n_samples=n_samples, seed=diagnostic_seed)
-        save_unmasked_static_inr(psf_values, target, output / "static_inr_psf_unmasked.nii.gz")
+        center_point_batch_size = 8192; psf_point_batch_size = 4096; max_support_points = 100000; diagnostic_seed = 20261106
+        values = evaluate_inr_on_nifti_lattice(model, target, device=torch.device(device), chunk_size=center_point_batch_size)
+        save_unmasked_static_inr(values, target, output / "static_inr_center_unmasked.nii.gz")
+        args = payload["args"]; output_resolution = float(getattr(args, "output_resolution", min(target.header.get_zooms()[:3]))); psf_factor = float(getattr(args, "output_psf_factor", 1.)); n_samples = int(getattr(args, "n_inference_samples", 128)); psf_resolution = output_resolution * psf_factor
         mask = payload["mask"]; from nesvor.image.image_utils import transformation2affine
         mask_affine = transformation2affine(mask.image, mask.transformation, float(mask.resolution_x), float(mask.resolution_y), float(mask.resolution_z))
         support = export_support_mask(mask.mask, mask_affine, output / "static_support_mask_for_comparison.nii.gz")
         from nibabel.processing import resample_from_to
         support_on_static = resample_from_to(nib.load(str(support)), target, order=0); nib.save(support_on_static, str(output / "support_on_static_lattice.nii.gz"))
-        masked = np.asanyarray(target.dataobj); support_values = np.asanyarray(support_on_static.dataobj); panel = [values[..., values.shape[2] // 2].T, support_values[..., support_values.shape[2] // 2].T, masked[..., masked.shape[2] // 2].T]
-        raw_window = fixed_window(np.concatenate((psf_values.ravel(), masked.ravel())), robust=True); figures = {"inr_support_masked.png": {"psf_sampled_unmasked_and_formal_window": raw_window, "mask_window": (0., 1.)}}
-        center = values[..., values.shape[2] // 2].T; psf_panel = psf_values[..., psf_values.shape[2] // 2].T; mask_panel = support_values[..., support_values.shape[2] // 2].T; formal = masked[..., masked.shape[2] // 2].T
-        render_independent_images(output / "inr_support_masked.png", [center, psf_panel, mask_panel, formal], ["PSF-free INR center", "PSF-sampled unmasked", "support mask", "formal masked static"], [fixed_window(values, robust=True), raw_window, (0., 1.), raw_window])
-        inside = support_values > .5; diff = psf_values[inside] - masked[inside]; metrics = {"support_mae": float(np.mean(np.abs(diff))) if diff.size else None, "support_rmse": float(np.sqrt(np.mean(diff ** 2))) if diff.size else None, "support_correlation": float(np.corrcoef(psf_values[inside], masked[inside])[0, 1]) if diff.size > 1 and np.std(psf_values[inside]) > 0 and np.std(masked[inside]) > 0 else None}
-        summary = {"center_unmasked": volume_summary(values), "psf_unmasked": volume_summary(psf_values), "formal_masked": volume_summary(masked), "encoding_backend": backend, "quantity": {"center": "psf_free_inr_center_value", "psf": "same_sampling_semantics_independent_deterministic_diagnostic_realization"}, "psf_resolution": output_resolution * psf_factor, "n_samples": n_samples, "diagnostic_rng_seed": diagnostic_seed, **metrics}; (output / "intensity_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        masked = np.asanyarray(target.dataobj).astype(np.float32); support_values = np.asanyarray(support_on_static.dataobj).astype(np.float32); support_mask = support_values > .5
+        figures: dict[str, Any] = {}; plane_metadata: list[dict[str, Any]] = []
+        for spec in representative_plane_specs(target):
+            axis = spec["axis"]; axis_index = int(spec["axis_index"]); fixed_index = int(spec["fixed_index"])
+            psf_values = evaluate_inr_psf_plane(model, target, spec, device=torch.device(device), psf_resolution=psf_resolution, n_samples=n_samples, seed=diagnostic_seed, point_batch_size=psf_point_batch_size)
+            plane_target = nib.Nifti1Image(np.zeros(spec["shape"], dtype=np.float32), spec["affine"])
+            save_unmasked_static_inr(psf_values, plane_target, output / f"psf_plane_{axis}.nii.gz")
+            center_plane = np.take(values, fixed_index, axis=axis_index); psf_plane = np.squeeze(psf_values, axis=axis_index); support_plane = np.take(support_values, fixed_index, axis=axis_index); formal_plane = np.take(masked, fixed_index, axis=axis_index)
+            shared_window = fixed_window(np.concatenate((psf_plane.reshape(-1), formal_plane.reshape(-1))), robust=True)
+            figure_name = f"inr_psf_plane_{axis}.png"; figure_policy = render_independent_images(output / figure_name, [center_plane, psf_plane, support_plane, formal_plane], ["PSF-free INR center", f"PSF plane ({axis})", "support mask", "formal static"], [fixed_window(center_plane, robust=True), shared_window, (0., 1.), shared_window])
+            figures[figure_name] = {"policy": "aligned_center_psf_support_formal", "fixed_voxel_index": spec["voxel_index"], "world_coordinate_mm_ras": spec["world_coordinate"], "psf_formal_shared_window": shared_window, "mask_window": (0., 1.), **figure_policy}
+            plane_metadata.append({"axis": axis, "fixed_voxel_index": spec["voxel_index"], "world_coordinate_mm_ras": spec["world_coordinate"], "shape": list(spec["shape"]), "nifti": f"psf_plane_{axis}.nii.gz", "display_window": {"center": fixed_window(center_plane, robust=True), "psf_formal_shared": shared_window, "support": (0., 1.)}, "value_summary": volume_summary(psf_values)})
+        agreement = support_point_agreement(model, masked, support_mask, target.affine, device=torch.device(device), psf_resolution=psf_resolution, n_samples=n_samples, seed=diagnostic_seed, max_points=max_support_points, point_batch_size=psf_point_batch_size)
+        summary = {"center_unmasked_full_volume": volume_summary(values), "formal_static_full_volume": volume_summary(masked), "psf_representative_planes": plane_metadata, "support_point_psf_agreement": agreement, "encoding_backend": backend, "quantity": {"center": "psf_free_inr_center_value", "psf": "same_sampling_semantics_independent_deterministic_diagnostic_realization"}, "output_resolution": output_resolution, "psf_factor": psf_factor, "psf_resolution": psf_resolution, "n_samples": n_samples, "diagnostic_rng_seed": diagnostic_seed, "center_point_batch_size": center_point_batch_size, "psf_point_batch_size": psf_point_batch_size, "max_support_points": max_support_points}
+        (output / "intensity_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         return stage_status("rendered", figures=figures, **summary)
 
     def _v7_reprojection(self, experiment_root: Path, output: Path, device: str) -> dict[str, Any]:

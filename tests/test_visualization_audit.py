@@ -214,6 +214,60 @@ def test_psf_free_and_psf_sampled_lattice_helpers_are_distinct_and_deterministic
     np.testing.assert_array_equal(sampled_a, sampled_b)
 
 
+def test_representative_plane_specs_preserve_fixed_axis_coordinates() -> None:
+    from cardioresp4d.visualization.image_utils import representative_plane_specs
+
+    target = nib.Nifti1Image(np.zeros((4, 5, 6), dtype=np.float32), np.diag([2., 3., 4., 1.]))
+    planes = representative_plane_specs(target)
+    assert [plane["axis"] for plane in planes] == ["sagittal", "coronal", "axial"]
+    assert planes[0]["shape"] == (1, 5, 6) and planes[0]["voxel_index"] == (2, None, None)
+    assert planes[1]["shape"] == (4, 1, 6) and planes[1]["voxel_index"] == (None, 2, None)
+    assert planes[2]["shape"] == (4, 5, 1) and planes[2]["voxel_index"] == (None, None, 3)
+    np.testing.assert_allclose(planes[2]["affine"][:3, 3], [0., 0., 12.])
+
+
+def test_support_selection_is_capped_deterministic_and_spans_support() -> None:
+    from cardioresp4d.visualization.image_utils import select_support_voxel_indices
+
+    mask = np.zeros((20, 1, 1), dtype=bool); mask[:2] = True; mask[-2:] = True
+    first, total = select_support_voxel_indices(mask, max_points=3, chunk_size=2)
+    second, total_again = select_support_voxel_indices(mask, max_points=3, chunk_size=2)
+    assert total == total_again == 4 and len(first) == 3
+    np.testing.assert_array_equal(first, second)
+    assert first[:, 0].min() == 0 and first[:, 0].max() == 19
+
+
+def test_psf_plane_and_support_agreement_use_bounded_explicit_batches() -> None:
+    from cardioresp4d.visualization.image_utils import (evaluate_inr_psf_plane, evaluate_inr_psf_points,
+                                                        representative_plane_specs, support_point_agreement)
+
+    class Model(torch.nn.Module):
+        def forward(self, points): return points[..., 0]
+        def sample_batch(self, points, transformation, sigma, n_samples): return points[:, None, :].expand(-1, n_samples, -1)
+    model = Model(); points = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    values = evaluate_inr_psf_points(model, points, device=torch.device("cpu"), psf_resolution=1., n_samples=128, seed=4, point_batch_size=2)
+    assert values.shape == (4,)
+    target = nib.Nifti1Image(np.zeros((3, 4, 5), dtype=np.float32), np.diag([2., 3., 4., 1.])); spec = representative_plane_specs(target)[0]
+    plane_a = evaluate_inr_psf_plane(model, target, spec, device=torch.device("cpu"), psf_resolution=1., n_samples=2, seed=4, point_batch_size=3)
+    plane_b = evaluate_inr_psf_plane(model, target, spec, device=torch.device("cpu"), psf_resolution=1., n_samples=2, seed=4, point_batch_size=3)
+    np.testing.assert_array_equal(plane_a, plane_b)
+    np.testing.assert_allclose(plane_a, 2. * spec["fixed_index"])
+    coordinates = np.indices((3, 3, 3), dtype=np.float32); formal = (2. * coordinates[0]).astype(np.float32); mask = np.ones_like(formal, dtype=bool)
+    agreement = support_point_agreement(model, formal, mask, np.diag([2., 1., 1., 1.]), device=torch.device("cpu"), psf_resolution=1., n_samples=2, seed=4, max_points=5, point_batch_size=2)
+    assert agreement["sample_count"] == 5 and agreement["total_support_count"] == 27
+    assert agreement["sampling_policy"] == "uniform_index_space_ranks_over_sorted_support"
+    assert agreement["mae"] == pytest.approx(0.) and agreement["rmse"] == pytest.approx(0.) and agreement["correlation"] == pytest.approx(1.)
+
+
+def test_v6_metadata_does_not_claim_full_volume_psf_derivative() -> None:
+    import inspect
+    from cardioresp4d.visualization.adapters.exp1_reference import Exp1ReferenceAdapter
+
+    source = inspect.getsource(Exp1ReferenceAdapter._v6_inr)
+    assert "static_inr_psf_unmasked" not in source
+    assert "evaluate_inr_psf_on_nifti_lattice" not in source
+
+
 def test_support_export_preserves_values_and_unmasked_lattice(tmp_path: Path) -> None:
     from cardioresp4d.visualization.image_utils import export_support_mask, save_unmasked_static_inr
 

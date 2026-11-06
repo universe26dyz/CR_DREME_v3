@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 import nibabel as nib
 import numpy as np
@@ -48,15 +48,44 @@ def save_unmasked_static_inr(values: np.ndarray, target: nib.spatialimages.Spati
 
 
 def evaluate_inr_on_nifti_lattice(model: torch.nn.Module, target: nib.spatialimages.SpatialImage, *, device: torch.device, chunk_size: int = 65536) -> np.ndarray:
-    shape = tuple(int(value) for value in target.shape[:3])
-    voxel = np.indices(shape, dtype=np.float32).reshape(3, -1).T
-    points = nib.affines.apply_affine(target.affine, voxel).astype(np.float32)
-    outputs: list[np.ndarray] = []; model.eval()
+    shape = tuple(int(value) for value in target.shape[:3]); result = np.empty(shape, dtype=np.float32); model.eval()
     with torch.no_grad():
-        for start in range(0, len(points), chunk_size):
-            result = model(torch.from_numpy(points[start:start + chunk_size]).to(device))
-            outputs.append(torch.as_tensor(result).reshape(-1).detach().cpu().numpy())
-    return np.concatenate(outputs).reshape(shape).astype(np.float32, copy=False)
+        for flat_start, flat_end, points in _iter_lattice_world_points(target, chunk_size):
+            values = torch.as_tensor(model(torch.from_numpy(points).to(device))).reshape(-1).detach().cpu().numpy()
+            result.reshape(-1)[flat_start:flat_end] = values
+    return result
+
+
+def representative_plane_specs(target: nib.spatialimages.SpatialImage) -> list[dict[str, Any]]:
+    shape = tuple(int(value) for value in target.shape[:3]); centers = (shape[0] // 2, shape[1] // 2, shape[2] // 2); specs = []
+    for axis, name in ((0, "sagittal"), (1, "coronal"), (2, "axial")):
+        fixed = centers[axis]; plane_shape = list(shape); plane_shape[axis] = 1; voxel_index = [None, None, None]; voxel_index[axis] = fixed; affine = np.asarray(target.affine, dtype=float).copy(); affine[:3, 3] = nib.affines.apply_affine(target.affine, [fixed if axis == 0 else 0, fixed if axis == 1 else 0, fixed if axis == 2 else 0])
+        specs.append({"axis": name, "axis_index": axis, "fixed_index": fixed, "voxel_index": tuple(voxel_index), "shape": tuple(plane_shape), "affine": affine, "world_coordinate": affine[:3, 3].tolist()})
+    return specs
+
+
+def _iter_lattice_world_points(target: nib.spatialimages.SpatialImage, batch_size: int, *, spec: dict[str, Any] | None = None) -> Iterator[tuple[int, int, np.ndarray]]:
+    if batch_size <= 0: raise ValueError("batch_size must be positive")
+    shape = tuple(int(value) for value in target.shape[:3]) if spec is None else tuple(spec["shape"])
+    total = int(np.prod(shape)); axis = None if spec is None else int(spec["axis_index"]); fixed = None if spec is None else int(spec["fixed_index"])
+    for start in range(0, total, batch_size):
+        end = min(total, start + batch_size); flat = np.arange(start, end, dtype=np.int64); coordinates = np.column_stack(np.unravel_index(flat, shape)).astype(np.float32)
+        if spec is not None: coordinates[:, axis] = fixed
+        world = nib.affines.apply_affine(target.affine, coordinates).astype(np.float32); yield start, end, world
+
+
+def evaluate_inr_psf_points(model: torch.nn.Module, points_world_mm: np.ndarray | torch.Tensor, *, device: torch.device, psf_resolution: float, n_samples: int, seed: int, point_batch_size: int = 4096) -> np.ndarray:
+    if psf_resolution <= 0 or n_samples <= 0 or point_batch_size <= 0: raise ValueError("positive PSF resolution, sample count, and point batch size are required")
+    from nesvor.utils import resolution2sigma
+    points = torch.as_tensor(points_world_mm, dtype=torch.float32)
+    if points.numel() == 0: return np.empty(0, dtype=np.float32)
+    sigma = resolution2sigma(psf_resolution, isotropic=True); values: list[np.ndarray] = []; model.eval()
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        with torch.no_grad():
+            for start in range(0, len(points), point_batch_size):
+                batch = points[start:start + point_batch_size].to(device); sampled = model.sample_batch(batch, None, sigma, n_samples); values.append(torch.as_tensor(model(sampled)).mean(-1).detach().cpu().numpy())
+    return np.concatenate(values).astype(np.float32, copy=False)
 
 
 def support_metrics(mask: np.ndarray, affine: np.ndarray) -> dict[str, Any]:
@@ -79,19 +108,31 @@ def support_metrics(mask: np.ndarray, affine: np.ndarray) -> dict[str, Any]:
 
 
 def evaluate_inr_psf_on_nifti_lattice(model: torch.nn.Module, target: nib.spatialimages.SpatialImage, *, device: torch.device, psf_resolution: float, n_samples: int, seed: int, chunk_size: int = 65536) -> np.ndarray:
-    """Evaluate NeSVoR's isotropic Monte-Carlo PSF semantics at every output voxel."""
-    if psf_resolution <= 0 or n_samples <= 0:
-        raise ValueError("PSF resolution and sample count must be positive")
-    from nesvor.utils import resolution2sigma
-    shape = tuple(int(value) for value in target.shape[:3]); voxel = np.indices(shape, dtype=np.float32).reshape(3, -1).T
-    points = torch.from_numpy(nib.affines.apply_affine(target.affine, voxel).astype(np.float32)).to(device)
-    sigma = resolution2sigma(psf_resolution, isotropic=True)
-    values: list[np.ndarray] = []; model.eval()
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(seed)
-        with torch.no_grad():
-            for start in range(0, len(points), chunk_size):
-                batch = points[start:start + chunk_size]
-                sampled = model.sample_batch(batch, None, sigma, n_samples)
-                values.append(model(sampled).mean(-1).detach().cpu().numpy())
-    return np.concatenate(values).reshape(shape).astype(np.float32, copy=False)
+    """Legacy full-volume PSF helper retained for callers; V6 does not use it."""
+    shape = tuple(int(value) for value in target.shape[:3]); result = np.empty(shape, dtype=np.float32)
+    for start, end, points in _iter_lattice_world_points(target, chunk_size): result.reshape(-1)[start:end] = evaluate_inr_psf_points(model, points, device=device, psf_resolution=psf_resolution, n_samples=n_samples, seed=seed + start, point_batch_size=chunk_size)
+    return result
+
+
+def evaluate_inr_psf_plane(model: torch.nn.Module, target: nib.spatialimages.SpatialImage, spec: dict[str, Any], *, device: torch.device, psf_resolution: float, n_samples: int, seed: int, point_batch_size: int = 4096) -> np.ndarray:
+    shape = tuple(spec["shape"]); point_batches = [points for _, _, points in _iter_lattice_world_points(target, point_batch_size, spec=spec)]
+    points = np.concatenate(point_batches, axis=0) if point_batches else np.empty((0, 3), dtype=np.float32)
+    return evaluate_inr_psf_points(model, points, device=device, psf_resolution=psf_resolution, n_samples=n_samples, seed=seed, point_batch_size=point_batch_size).reshape(shape)
+
+
+def select_support_voxel_indices(mask: np.ndarray, *, max_points: int = 100000, chunk_size: int = 1000000) -> tuple[np.ndarray, int]:
+    values = np.asarray(mask, dtype=bool); total = int(np.count_nonzero(values)); sample_count = min(total, int(max_points));
+    if sample_count <= 0: return np.empty((0, 3), dtype=np.int64), total
+    ranks = np.unique(np.rint(np.linspace(0, total - 1, sample_count)).astype(np.int64)); selected: list[int] = []; flat = values.reshape(-1); seen = 0
+    for start in range(0, flat.size, chunk_size):
+        local = np.flatnonzero(flat[start:start + chunk_size]); ordinals = seen + np.arange(len(local), dtype=np.int64); positions = np.searchsorted(ranks, ordinals)
+        hits = np.zeros(len(local), dtype=bool)
+        valid = positions < len(ranks)
+        hits[valid] = ranks[positions[valid]] == ordinals[valid]
+        selected.extend((start + local[hits]).tolist()); seen += len(local)
+    return np.asarray(np.unravel_index(np.asarray(selected, dtype=np.int64), values.shape)).T, total
+
+
+def support_point_agreement(model: torch.nn.Module, formal_values: np.ndarray, support_mask: np.ndarray, affine: np.ndarray, *, device: torch.device, psf_resolution: float, n_samples: int, seed: int, max_points: int = 100000, point_batch_size: int = 4096) -> dict[str, Any]:
+    coordinates, total = select_support_voxel_indices(support_mask, max_points=max_points); world = nib.affines.apply_affine(affine, coordinates); predicted = evaluate_inr_psf_points(model, world, device=device, psf_resolution=psf_resolution, n_samples=n_samples, seed=seed, point_batch_size=point_batch_size); observed = np.asarray(formal_values)[tuple(coordinates.T)].astype(np.float32); difference = predicted - observed; correlation = float(np.corrcoef(predicted, observed)[0, 1]) if len(predicted) > 1 and np.std(predicted) > 0 and np.std(observed) > 0 else None
+    return {"sample_count": int(len(coordinates)), "total_support_count": total, "sampling_policy": "uniform_index_space_ranks_over_sorted_support", "seed": seed, "psf_resolution": psf_resolution, "n_samples": n_samples, "mae": float(np.mean(np.abs(difference))) if len(difference) else None, "rmse": float(np.sqrt(np.mean(difference ** 2))) if len(difference) else None, "correlation": correlation}
