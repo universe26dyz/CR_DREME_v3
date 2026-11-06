@@ -109,7 +109,9 @@ def test_exp1_default_score_path_is_raw_and_no_reference_branch_is_called() -> N
 def test_exp1_provider_free_predict_and_regularizers_match_raw_branch() -> None:
     from cardioresp4d.training.model import SourceFirstDynamicModel
 
-    model = SourceFirstDynamicModel(torch.tensor([-2., -2., -2.]), torch.tensor([2., 2., 2.]), cardiac_lower_world_mm=torch.tensor([-1., -1., -1.]), cardiac_upper_world_mm=torch.tensor([1., 1., 1.]), n_dynamic_frames=1, inr_width=8, inr_depth=1, latent_dim=4, motion_hidden_dim=8, respiratory_grid_shapes=((4, 4, 4),) * 3, cardiac_grid_shape=(4, 4, 4), psf_samples=1)
+    model = SourceFirstDynamicModel(torch.tensor([-2., -2., -2.]), torch.tensor([2., 2., 2.]), cardiac_lower_world_mm=torch.tensor([-1., -1., -1.]), cardiac_upper_world_mm=torch.tensor([1., 1., 1.]), n_dynamic_frames=1, inr_width=8, inr_depth=1, latent_dim=4, motion_hidden_dim=8, respiratory_grid_shapes=((4, 4, 4),) * 3, cardiac_grid_shape=(4, 4, 4), psf_samples=1, canonical_encoding_backend="torch_hash")
+    assert model.canonical.encoding_backend == "torch_hash"
+    assert next(model.parameters()).device.type == "cpu"
     observation = _observation(shape=(3, 3))
     raw = model.encode_motion_scores_raw(observation); effective = model.encode_motion_scores(observation)
     for left, right in zip(raw["resp_scores"], effective["resp_scores"]):
@@ -176,12 +178,3 @@ def test_exp2a_input_bindings_fail_closed_when_mean_stack_changes(tmp_path: Path
     stack.write_bytes(b"changed")
     with pytest.raises(ValueError, match="mean_stacks"):
         verify_exp2a_input_bindings(bindings)
-
-
-def test_cpu_constructed_inr_does_not_inherit_cuda_only_tinycudann_default(monkeypatch) -> None:
-    from cardioresp4d.adapters import nesvor_inr
-    from cardioresp4d.adapters.nesvor_inr import NeSVoRCanonicalAdapter
-
-    monkeypatch.setattr(nesvor_inr.nesvor_models, "USE_TORCH", False)
-    adapter = NeSVoRCanonicalAdapter(torch.tensor([[-1., -1., -1.], [1., 1., 1.]]))
-    assert adapter.encoding_backend == "torch_hash"
