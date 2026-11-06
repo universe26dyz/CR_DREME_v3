@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import torch
 
@@ -13,6 +13,7 @@ from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField
 from cardioresp4d.training.build_model import build_source_first_model
 from cardioresp4d.diagnostics.change5c import diagnostic_rng, stable_diagnostic_seed
 from cardioresp4d.training.stage_contract import stage_contract
+from cardioresp4d.training.respiratory_staged_vnext import respiratory_dvf_rms_metrics, respiratory_score_rms_metrics
 from .dynamics import world_grid
 
 
@@ -35,8 +36,21 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def discover_boundary_checkpoints(root: str | Path) -> list[CheckpointBoundary]:
+def resolve_dynamic_checkpoint_root(root: str | Path) -> Path | None:
+    """Resolve either an experiment root or its direct ``04_training`` root."""
     root = Path(root)
+    if (root / "checkpoint_L1_warm_end.pt").is_file():
+        return root
+    training = root / "04_training"
+    if (training / "checkpoint_L1_warm_end.pt").is_file():
+        return training
+    return None
+
+
+def discover_boundary_checkpoints(root: str | Path) -> list[CheckpointBoundary]:
+    root = resolve_dynamic_checkpoint_root(root)
+    if root is None:
+        return []
     result = []
     for label, stage in _BOUNDARIES:
         path = root / f"checkpoint_{label}_end.pt"
@@ -46,6 +60,21 @@ def discover_boundary_checkpoints(root: str | Path) -> list[CheckpointBoundary]:
     if last.is_file() and (not result or _sha256(last) != _sha256(result[-1].path)):
         result.append(CheckpointBoundary("last", result[-1].stage if result else "stage2c", result[-1].active_levels if result else 3, last))
     return result
+
+
+def location_local_rms_metrics(values_by_location: Iterable[torch.Tensor], *, kind: str = "score") -> dict[str, float]:
+    values = tuple(values_by_location)
+    if kind == "dvf":
+        raw = respiratory_dvf_rms_metrics(values)
+        total, static, dynamic = raw["respiratory_dvf_total_rms_mm"], raw["respiratory_dvf_static_rms_mm"], raw["respiratory_dvf_dynamic_rms_mm"]
+        return {"static_rms_mm": static, "dynamic_rms_mm": dynamic, "total_rms_mm": total, "static_dynamic_ratio": static / max(dynamic, torch.finfo(torch.float32).eps)}
+    raw = respiratory_score_rms_metrics(values)
+    total, static, dynamic = raw["respiratory_score_total_rms"], raw["respiratory_score_static_rms"], raw["respiratory_score_dynamic_rms"]
+    return {"static_rms": static, "dynamic_rms": dynamic, "total_rms": total, "static_dynamic_ratio": static / max(dynamic, torch.finfo(torch.float32).eps)}
+
+
+def pool_location_metrics_by_view(values_by_view: Mapping[str, Iterable[torch.Tensor]], *, kind: str = "score") -> dict[str, dict[str, float]]:
+    return {view: location_local_rms_metrics(values, kind=kind) for view, values in values_by_view.items()}
 
 
 def select_fixed_location_frames(observations: Iterable[Any], *, frames_per_location: int = 3) -> dict[tuple[str, str], list[Any]]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -20,8 +21,9 @@ from train_source_first import observations_from_manifest
 from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import apply_corrected_static_poses, load_corrected_pose_map
 from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField
 from cardioresp4d.visualization.dynamic_audit import (discover_boundary_checkpoints, fixed_physical_grid,
+                                                     location_local_rms_metrics,
                                                      posthoc_center_scores, reconstruct_exp1_checkpoint,
-                                                     select_fixed_location_frames, static_dynamic_rms)
+                                                     resolve_dynamic_checkpoint_root, select_fixed_location_frames, static_dynamic_rms)
 from cardioresp4d.visualization.reference_gauge import ReferenceImageProvider
 
 
@@ -29,6 +31,10 @@ def _metrics(sequence: torch.Tensor) -> dict[str, float]:
     result = static_dynamic_rms(sequence)
     result.update({"temporal_mean": float(sequence.mean()), "temporal_mean_components": [float(value) for value in sequence.mean(dim=0)], "score_rms": float(sequence.square().mean().sqrt()), "temporal_std": float(sequence.std(unbiased=False)), "per_component_static_rms": [float(value) for value in sequence.mean(dim=0).square().sqrt()], "per_component_dynamic_rms": [float(value) for value in (sequence - sequence.mean(dim=0)).square().mean(dim=0).sqrt()]})
     return result
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _plot_location(output: Path, location: tuple[str, str], frames: list, raw: torch.Tensor, reference: torch.Tensor, effective: torch.Tensor, raw_dvf: torch.Tensor, gauge_dvf: torch.Tensor) -> None:
@@ -56,6 +62,14 @@ def _plot_location(output: Path, location: tuple[str, str], frames: list, raw: t
     figure.tight_layout(); figure.savefig(output, dpi=140); plt.close(figure)
 
 
+def _all_location_frames(observations: list) -> dict[tuple[str, str], list]:
+    grouped: dict[tuple[str, str], list] = {}
+    for observation in observations:
+        if observation.qc_valid:
+            grouped.setdefault((observation.view.upper(), observation.slice_id), []).append(observation)
+    return {key: sorted(frames, key=lambda item: (float(item.timestamp_s), int(item.dynamic_frame_id))) for key, frames in grouped.items()}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment-root", type=Path, required=True)
@@ -69,6 +83,7 @@ def main() -> None:
     device = torch.device(args.device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     domain = json.loads(args.canonical_domain.read_text())
+    checkpoint_root = resolve_dynamic_checkpoint_root(args.experiment_root)
     boundaries = discover_boundary_checkpoints(args.experiment_root)
     if not boundaries:
         raise FileNotFoundError(f"no Exp1 boundary checkpoints under {args.experiment_root}")
@@ -79,6 +94,7 @@ def main() -> None:
     provider_cache = {}
     grid = None
     records = []
+    pooled = {}
     for boundary in boundaries:
         checkpoint = torch.load(boundary.path, map_location="cpu", weights_only=False)
         config = checkpoint["effective_config"]
@@ -90,7 +106,7 @@ def main() -> None:
             observations_cache[cache_key] = apply_corrected_static_poses(observations, pose_map)
             selected_cache[cache_key] = select_fixed_location_frames(observations_cache[cache_key], frames_per_location=3)
             provider_cache[cache_key] = ReferenceImageProvider.from_mean_artifacts(args.mean_manifest, observations=observations_cache[cache_key])
-        observations = observations_cache[cache_key]; selected = selected_cache[cache_key]
+        observations = observations_cache[cache_key]; selected = selected_cache[cache_key]; all_locations = _all_location_frames(observations)
         model = reconstruct_exp1_checkpoint(checkpoint, domain, observations, device)
         model.set_reference_score_provider(provider_cache[cache_key])
         current_grid, _ = fixed_physical_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, (16, 16, 16))
@@ -100,7 +116,9 @@ def main() -> None:
             raise ValueError("Exp1 gauge audit grid changed across checkpoints")
         checkpoint_dir = args.output_dir / f"checkpoint_{boundary.label}" / "reference_gauge"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        for location, frames in selected.items():
+        pooled_values = {"raw_score": [], "reference_score": [], "effective_score": [], "raw_dvf": [], "gauge_dvf": []}
+        pooled_by_view = {view: {key: [] for key in pooled_values} for view in ("SAX", "2CH", "4CH")}
+        for location, frames in all_locations.items():
             raw_values, reference_values, effective_values, raw_dvfs, gauge_dvfs = [], [], [], [], []
             with torch.no_grad():
                 for frame in frames:
@@ -114,16 +132,15 @@ def main() -> None:
             raw_dvf, gauge_dvf = torch.stack(raw_dvfs), torch.stack(gauge_dvfs)
             item = {"checkpoint": boundary.label, "stage": boundary.stage, "active_levels": boundary.active_levels, "view": location[0], "slice_id": location[1], "frames": len(frames), "raw_score": _metrics(raw), "reference_score": _metrics(reference), "effective_gauge_score": _metrics(effective), "raw_dvf": {**_metrics(raw_dvf), "units": "mm"}, "gauge_dvf": {**_metrics(gauge_dvf), "units": "mm"}}
             records.append(item)
-            _plot_location(checkpoint_dir / f"{location[0]}_{location[1]}.png", location, frames, raw, reference, effective, raw_dvf, gauge_dvf)
-    pooled = {}
-    for checkpoint in sorted({item["checkpoint"] for item in records}):
-        subset = [item for item in records if item["checkpoint"] == checkpoint]
-        def aggregate(items):
-            return {key: float(np.mean([item[key] for item in items])) for key in ("static_rms", "dynamic_rms", "static_dynamic_ratio", "score_rms", "temporal_std")}
-        def aggregate_dvf(items):
-            return {key: float(np.mean([item[key] for item in items])) for key in ("static_rms", "dynamic_rms", "static_dynamic_ratio")}
-        pooled[checkpoint] = {"locations": len(subset), "raw_score": aggregate([item["raw_score"] for item in subset]), "gauge_score": aggregate([item["effective_gauge_score"] for item in subset]), "raw_dvf": aggregate_dvf([item["raw_dvf"] for item in subset]), "gauge_dvf": aggregate_dvf([item["gauge_dvf"] for item in subset]), "by_view": {view: {"locations": sum(item["view"] == view for item in subset), "raw_score": aggregate([item["raw_score"] for item in subset if item["view"] == view]), "gauge_score": aggregate([item["effective_gauge_score"] for item in subset if item["view"] == view]), "raw_dvf": aggregate_dvf([item["raw_dvf"] for item in subset if item["view"] == view]), "gauge_dvf": aggregate_dvf([item["gauge_dvf"] for item in subset if item["view"] == view])} for view in ("SAX", "2CH", "4CH") if any(item["view"] == view for item in subset)}}
-    payload = {"scientific_interpretation": "pending", "reference_policy": "authoritative mean_stack[..., stack_index].T; same current encoder, no detached/precomputed scores", "cohort_policy": "one physical middle location per view; early/middle/late QC-valid frames from that fixed location", "fixed_grid_shape": [16, 16, 16], "checkpoints": [item.label for item in boundaries], "pooled": pooled, "locations": records}
+            for key, values in (("raw_score", raw), ("reference_score", reference), ("effective_score", effective), ("raw_dvf", raw_dvf), ("gauge_dvf", gauge_dvf)):
+                pooled_values[key].append(values); pooled_by_view[location[0]][key].append(values)
+            if location in selected:
+                chosen_ids = {frame.dynamic_frame_id for frame in selected[location]}; indices = [index for index, frame in enumerate(frames) if frame.dynamic_frame_id in chosen_ids]
+                _plot_location(checkpoint_dir / f"{location[0]}_{location[1]}.png", location, selected[location], raw[indices], reference[indices], effective[indices], raw_dvf[indices], gauge_dvf[indices])
+        pooled[boundary.label] = {"all_locations": {"raw_score": location_local_rms_metrics(pooled_values["raw_score"]), "reference_score": location_local_rms_metrics(pooled_values["reference_score"]), "effective_score": location_local_rms_metrics(pooled_values["effective_score"]), "raw_dvf": location_local_rms_metrics(pooled_values["raw_dvf"], kind="dvf"), "gauge_dvf": location_local_rms_metrics(pooled_values["gauge_dvf"], kind="dvf")}, "by_view": {view: {"raw_score": location_local_rms_metrics(values["raw_score"]), "reference_score": location_local_rms_metrics(values["reference_score"]), "effective_score": location_local_rms_metrics(values["effective_score"]), "raw_dvf": location_local_rms_metrics(values["raw_dvf"], kind="dvf"), "gauge_dvf": location_local_rms_metrics(values["gauge_dvf"], kind="dvf")} for view, values in pooled_by_view.items() if values["raw_score"]}, "location_count": len(all_locations), "frame_count": sum(len(frames) for frames in all_locations.values())}
+    artifact_names = [f"checkpoint_{label}_end.pt" for label in ("L1_warm", "L1_joint", "L2_warm", "L2_joint", "L3_warm", "L3_joint")] + ["checkpoint_last.pt", "boundary_diagnostics.json", "training_report.json"]
+    checkpoint_artifacts = {name: {"path": str(checkpoint_root / name), "sha256": _sha256(checkpoint_root / name)} for name in artifact_names if (checkpoint_root / name).is_file()}
+    payload = {"scientific_interpretation": "pending", "reference_policy": "authoritative mean_stack[..., stack_index].T; same current encoder, no detached/precomputed scores", "scientific_metric_cohort": "every QC-valid real (view, slice_id), all QC-valid temporal frames; location-local temporal means before pooling", "visualization_cohort": "one deterministic physical middle location per view; early/middle/late QC-valid frames from that fixed location", "fixed_grid_shape": [16, 16, 16], "checkpoint_root": str(checkpoint_root), "checkpoint_artifacts": checkpoint_artifacts, "checkpoints": [item.label for item in boundaries], "pooled": pooled, "locations": records}
     (args.output_dir / "reference_gauge_audit.json").write_text(json.dumps(payload, indent=2) + "\n")
     with (args.output_dir / "reference_gauge_audit.csv").open("w", newline="", encoding="utf-8") as handle:
         fields = ["checkpoint", "stage", "view", "slice_id", "raw_score_dynamic_rms", "effective_score_dynamic_rms", "raw_dvf_dynamic_rms_mm", "gauge_dvf_dynamic_rms_mm"]

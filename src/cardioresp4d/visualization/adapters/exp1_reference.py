@@ -24,11 +24,22 @@ from ..image_utils import (aggregate_clip_fractions, evaluate_inr_on_nifti_latti
                            volume_summary)
 from ..report import json_safe
 from ..renderers import fixed_window, render_independent_images, render_montage, render_paired_images
-from ..dynamic_audit import (CheckpointBoundary, discover_boundary_checkpoints,
+from ..dynamic_audit import (CheckpointBoundary, discover_boundary_checkpoints, resolve_dynamic_checkpoint_root,
                              dvf_from_scores, fixed_physical_grid,
                              posthoc_center_scores, predict_observation_slice,
                              reconstruct_exp1_checkpoint,
                              select_fixed_location_frames, static_dynamic_rms)
+
+
+def _render_vector_field_planes(directory: Path, prefix: str, field: torch.Tensor, *, label: str, shape: tuple[int, int, int] = (16, 16, 16)) -> None:
+    """Render central-z magnitude and signed component planes for [N,3] fields."""
+    vector = field.detach().cpu().reshape(*shape, 3)
+    plane = vector[:, :, shape[2] // 2, :]
+    magnitude = np.linalg.norm(plane.numpy(), axis=-1)
+    render_independent_images(directory / f"{prefix}_magnitude.png", [magnitude], [f"{label} — |field|"], [(0., max(float(magnitude.max()), 1e-6))])
+    bound = max(float(np.abs(plane.numpy()).max()), 1e-6)
+    for index, component in enumerate(("dx", "dy", "dz")):
+        render_independent_images(directory / f"{prefix}_{component}.png", [plane.numpy()[..., index]], [f"{label} — {component}"], [(-bound, bound)])
 
 
 class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
@@ -45,6 +56,10 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
                  "static_reference_manifest": static / "static_reference_manifest.json", "nesvor_static_command": static / "nesvor_static_command.json", "nesvor_effective_args": static / "nesvor_effective_args.json", "static_reference": static / "static_reference.nii.gz",
                  "static_model": static / "model.pt", "corrected_pose_manifest": static / "corrected_pose_manifest.json",
                  "corrected_slices_directory": static / "slices"}
+        training = resolve_dynamic_checkpoint_root(experiment_root)
+        if training is not None:
+            for name in ("checkpoint_L1_warm_end.pt", "checkpoint_L1_joint_end.pt", "checkpoint_L2_warm_end.pt", "checkpoint_L2_joint_end.pt", "checkpoint_L3_warm_end.pt", "checkpoint_L3_joint_end.pt", "checkpoint_last.pt", "boundary_diagnostics.json", "training_report.json"):
+                paths[f"training_{name}"] = training / name
         return {name: path for name, path in paths.items() if path.exists()}
 
     def render(self, *, experiment_root: Path, manifest: Path, qc_table: Path, canonical_domain: Path, output_dir: Path, device: str) -> dict[str, dict[str, Any]]:
@@ -283,13 +298,13 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
         output.mkdir(parents=True, exist_ok=True); domain, boundaries, observations_by_config = self._dynamic_context(experiment_root, manifest, qc_table, canonical_domain, device)
         if not boundaries:
             return stage_status("partial", "no Exp1 boundary checkpoints found")
-        summary: dict[str, Any] = {"checkpoints": [], "metrics": [], "policy": "stage1 canonical-only zero-motion prediction"}
+        summary: dict[str, Any] = {"checkpoints": [], "metrics": [], "checkpoint_root": str(boundaries[0].path.parent), "policy": "stage1 canonical-only zero-motion prediction", "metric_cohort": "representative fixed physical middle location per view; early/middle/late QC-valid frames"}
         for boundary in boundaries:
             checkpoint = torch.load(boundary.path, map_location="cpu", weights_only=False); config = checkpoint["effective_config"]; key = (str(config.get("training", {}).get("normalization", {}).get("mode", "per_series")), bool(config.get("model", {}).get("film", {}).get("implementation") in {"s2v_style_single_frame", "s2vdreme_reference_8layer"})); observations = observations_by_config[key]; model = reconstruct_exp1_checkpoint(checkpoint, domain, observations, torch.device(device)); selected = select_fixed_location_frames(observations, frames_per_location=3); checkpoint_dir = output / f"checkpoint_{boundary.label}"; checkpoint_dir.mkdir(parents=True, exist_ok=True); rows = []; figures = {}
             for (view, slice_id), frames in selected.items():
                 for frame in frames:
                     acquired = frame.image[0].detach().cpu(); prediction = predict_observation_slice(model, frame, "stage1", seed=20260823); residual = (acquired - prediction.cpu()).abs(); intensity_window = fixed_window(np.concatenate((acquired.numpy().ravel(), prediction.cpu().numpy().ravel())), robust=True); residual_window = (0., max(float(residual.max()), 1e-6)); name = f"{view}_{location_token(view, slice_id)}_frame_{frame.dynamic_frame_id:05d}.png"; figures[name] = render_independent_images(checkpoint_dir / name, [acquired.numpy(), prediction.cpu().numpy(), residual.numpy()], ["observed dynamic frame", "canonical-only zero-motion prediction", "absolute residual"], [intensity_window, intensity_window, residual_window]); rows.append({"view": view, "slice_id": slice_id, "dynamic_frame_id": int(frame.dynamic_frame_id), "timestamp_s": float(frame.timestamp_s), "mse": float(residual.square().mean())})
-            by_view = {view: float(np.mean([row["mse"] for row in rows if row["view"] == view])) for view in ("SAX", "2CH", "4CH") if any(row["view"] == view for row in rows)}; summary["checkpoints"].append(boundary.label); summary["metrics"].append({"checkpoint": boundary.label, "stage": boundary.stage, "per_view_pooled_mse": by_view, "full_pooled_mse": float(np.mean([row["mse"] for row in rows])), "frames": rows, "figures": figures})
+            by_view = {view: float(np.mean([row["mse"] for row in rows if row["view"] == view])) for view in ("SAX", "2CH", "4CH") if any(row["view"] == view for row in rows)}; summary["checkpoints"].append(boundary.label); summary["metrics"].append({"checkpoint": boundary.label, "stage": boundary.stage, "representative_reprojection_mse_by_view": by_view, "representative_reprojection_mse": float(np.mean([row["mse"] for row in rows])), "metric_cohort": summary["metric_cohort"], "frames": rows, "figures": figures})
         (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n"); return stage_status("rendered", checkpoint_count=len(boundaries), summary_file="summary.json", policy=summary["policy"])
 
     def render_v9_dynamic_boundaries(self, *, experiment_root: Path, manifest: Path, qc_table: Path, canonical_domain: Path, output: Path, device: str) -> dict[str, Any]:
@@ -305,15 +320,22 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
             observations = observations_by_config[key]
             model = reconstruct_exp1_checkpoint(checkpoint, domain, observations, torch.device(device))
             selected = select_fixed_location_frames(observations, frames_per_location=3)
+            all_frames_by_location: dict[tuple[str, str], list[Any]] = defaultdict(list)
+            for observation in observations:
+                if observation.qc_valid:
+                    all_frames_by_location[(observation.view.upper(), observation.slice_id)].append(observation)
+            for frames_all in all_frames_by_location.values():
+                frames_all.sort(key=lambda item: (float(item.timestamp_s), int(item.dynamic_frame_id)))
             checkpoint_dir = output / f"checkpoint_{boundary.label}"
             for name in ("scores", "dvf", "mbc", "reprojection"):
                 (checkpoint_dir / name).mkdir(parents=True, exist_ok=True)
             grid, _ = fixed_physical_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, (16, 16, 16))
             location_rows = []
             for key_location, frames in selected.items():
-                raw_scores = torch.cat([model.encode_motion_scores_raw(frame)["resp_scores"][:, :boundary.active_levels] for frame in frames], dim=0)
+                full_frames = all_frames_by_location[key_location]
+                raw_scores = torch.cat([model.encode_motion_scores_raw(frame)["resp_scores"][:, :boundary.active_levels] for frame in full_frames], dim=0)
                 centered = posthoc_center_scores(raw_scores)
-                dvfs = torch.cat([dvf_from_scores(model, grid, model.encode_motion_scores_raw(frame)["resp_scores"], boundary.active_levels) for frame in frames], dim=0)
+                dvfs = torch.cat([dvf_from_scores(model, grid, model.encode_motion_scores_raw(frame)["resp_scores"], boundary.active_levels) for frame in full_frames], dim=0)
                 raw_mbc = model.respiratory_mbc.raw_active(grid, active_levels=boundary.active_levels).detach()
                 per_level_rms = raw_mbc.square().mean(dim=(0, 2, 3)).sqrt()
                 per_level_max = raw_mbc.abs().amax(dim=(0, 2, 3))
@@ -321,12 +343,16 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
                 np.savez_compressed(checkpoint_dir / "dvf" / f"{key_location[0]}_{token}.npz", world_grid_mm=grid.detach().cpu().numpy(), dvf_mm=dvfs.detach().cpu().numpy(), dvf_mean_mm=dvfs.mean(0).detach().cpu().numpy(), dvf_dynamic_mm=(dvfs - dvfs.mean(0)).detach().cpu().numpy())
                 np.savez_compressed(checkpoint_dir / "mbc" / f"{key_location[0]}_{token}.npz", raw_mbc_basis_mm=raw_mbc.cpu().numpy(), per_level_rms_mm=per_level_rms.cpu().numpy(), per_level_max_mm=per_level_max.cpu().numpy(), label="raw MBC basis field", score_weighted_label="score-weighted DVF")
                 import matplotlib.pyplot as plt
+                _render_vector_field_planes(checkpoint_dir / "dvf", f"{key_location[0]}_{token}_frame_middle", dvfs[len(dvfs) // 2], label="score-weighted DVF")
+                for level in range(boundary.active_levels):
+                    _render_vector_field_planes(checkpoint_dir / "mbc", f"{key_location[0]}_{token}_L{level + 1}", raw_mbc[0, level], label="RAW MBC BASIS FIELD — not score-weighted DVF")
                 figure, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-                flat = raw_scores.detach().cpu().numpy().reshape(len(frames), -1); flat_centered = centered.detach().cpu().numpy().reshape(len(frames), -1)
+                flat = raw_scores.detach().cpu().numpy().reshape(len(full_frames), -1); flat_centered = centered.detach().cpu().numpy().reshape(len(full_frames), -1)
                 for index in range(flat.shape[1]):
-                    axes[0].plot([frame.timestamp_s for frame in frames], flat[:, index], marker="o", label=f"L{index // 3 + 1}.c{index % 3}")
-                    axes[1].plot([frame.timestamp_s for frame in frames], flat_centered[:, index], marker="o")
+                    axes[0].plot([frame.timestamp_s for frame in full_frames], flat[:, index], marker="o", label=f"L{index // 3 + 1}.c{index % 3}")
+                    axes[1].plot([frame.timestamp_s for frame in full_frames], flat_centered[:, index], marker="o")
                 axes[0].set_title(f"raw score — {key_location[0]}/{key_location[1]}"); axes[1].set_title("POST-HOC DIAGNOSTIC: raw score - temporal mean (not used in Exp1 training)"); axes[1].set_xlabel("timestamp (s)"); axes[0].legend(ncol=3, fontsize=7); figure.tight_layout(); figure.savefig(checkpoint_dir / "scores" / f"{key_location[0]}_{token}.png", dpi=140); plt.close(figure)
+                figure, axis = plt.subplots(figsize=(8, 4)); times = [frame.timestamp_s for frame in full_frames]; dvf_rms = dvfs.square().mean(dim=(-1, -2)).sqrt().detach().cpu().numpy(); dvf_max = dvfs.square().sum(dim=-1).sqrt().amax(dim=-1).detach().cpu().numpy(); axis.plot(times, dvf_rms, marker="o", label="DVF RMS (mm)"); axis.plot(times, dvf_max, marker="o", label="DVF max magnitude (mm)"); axis.set(xlabel="timestamp (s)", title=f"DVF magnitude vs time — {key_location[0]}/{key_location[1]}"); axis.legend(); axis.grid(alpha=.25); figure.tight_layout(); figure.savefig(checkpoint_dir / "dvf" / f"{key_location[0]}_{token}_vs_time.png", dpi=140); plt.close(figure)
                 prediction_mse = []
                 for frame in frames:
                     prediction = predict_observation_slice(model, frame, boundary.stage, seed=20260823)
@@ -335,14 +361,14 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
                 score_metrics = static_dynamic_rms(raw_scores); dvf_metrics = static_dynamic_rms(dvfs)
                 location_rows.append({"view": key_location[0], "slice_id": key_location[1], "mse": float(np.mean(prediction_mse)), **{f"raw_score_{name}": value for name, value in score_metrics.items()}, "dvf_static_rms_mm": dvf_metrics["static_rms"], "dvf_dynamic_rms_mm": dvf_metrics["dynamic_rms"], "dvf_static_dynamic_ratio": dvf_metrics["static_dynamic_ratio"], "mbc_rms_mm": float(per_level_rms.mean()), "mbc_max_mm": float(per_level_max.max())})
             per_view = {view: float(np.mean([item["mse"] for item in location_rows if item["view"] == view])) for view in ("SAX", "2CH", "4CH") if any(item["view"] == view for item in location_rows)}
-            row = {"checkpoint": boundary.label, "stage": boundary.stage, "active_levels": boundary.active_levels, "reconstruction_mse_full": float(np.mean([item["mse"] for item in location_rows])), **{f"reconstruction_mse_{view}": value for view, value in per_view.items()}}
+            row = {"checkpoint": boundary.label, "stage": boundary.stage, "active_levels": boundary.active_levels, "representative_reprojection_mse": float(np.mean([item["mse"] for item in location_rows])), **{f"representative_reprojection_mse_{view}": value for view, value in per_view.items()}, "metric_cohort": "representative fixed physical middle location per view; early/middle/late frames"}
             for metric in ("raw_score_static_rms", "raw_score_dynamic_rms", "raw_score_static_dynamic_ratio", "dvf_static_rms_mm", "dvf_dynamic_rms_mm", "dvf_static_dynamic_ratio", "mbc_rms_mm", "mbc_max_mm"):
                 row[metric] = float(np.mean([item[metric] for item in location_rows]))
             rows.append(row)
         fields = sorted({key for row in rows for key in row});
         with (output / "boundary_summary.csv").open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader(); writer.writerows(rows)
-        (output / "boundary_summary.json").write_text(json.dumps(rows, indent=2) + "\n"); return stage_status("rendered", checkpoint_count=len(boundaries), boundary_summary="boundary_summary.json", cohort_policy="one physical middle location per view; early/middle/late frames from that location", posthoc_centering="diagnostic only")
+        (output / "boundary_summary.json").write_text(json.dumps(rows, indent=2) + "\n"); return stage_status("rendered", checkpoint_count=len(boundaries), checkpoint_root=str(boundaries[0].path.parent), boundary_summary="boundary_summary.json", cohort_policy="one physical middle location per view; full temporal sequence for score/DVF curves; early/middle/late frames for reprojection", posthoc_centering="diagnostic only")
 
     def _v6_inr(self, experiment_root: Path, output: Path, device: str) -> dict[str, Any]:
         target = nib.load(str(experiment_root / "02_static_nesvor" / "static_reference.nii.gz")); payload, model, backend = self._load_static_model(experiment_root, device)

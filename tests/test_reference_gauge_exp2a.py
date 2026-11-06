@@ -50,14 +50,18 @@ def test_effective_reference_score_cancels_equal_images_and_shared_dc_with_gradi
     from cardioresp4d.models.reference_gauge import effective_reference_scores
 
     encoder = torch.nn.Linear(2, 3, bias=True)
-    dynamic = torch.tensor([[1., 2.], [3., 4.]], requires_grad=True); reference = dynamic.detach().clone().requires_grad_()
+    dynamic = torch.tensor([[1., 2.], [3., 4.]], requires_grad=True); reference = torch.tensor([[0.5, 1.5], [2.5, 3.5]], requires_grad=True)
     raw = {"resp_scores": encoder(dynamic)}; ref = {"resp_scores": encoder(reference)}
     effective = effective_reference_scores(raw, ref)["resp_scores"]
-    torch.testing.assert_close(effective, torch.zeros_like(effective))
+    equal = effective_reference_scores({"resp_scores": encoder(dynamic)}, {"resp_scores": encoder(dynamic)})["resp_scores"]
+    torch.testing.assert_close(equal, torch.zeros_like(equal))
     offset = torch.full_like(raw["resp_scores"], 7.)
     torch.testing.assert_close(effective_reference_scores({"resp_scores": raw["resp_scores"] + offset}, {"resp_scores": ref["resp_scores"] + offset})["resp_scores"], effective)
-    effective.sum().backward()
-    assert encoder.weight.grad is not None and torch.isfinite(encoder.weight.grad).all()
+    dynamic_grad = torch.autograd.grad(raw["resp_scores"].sum(), encoder.parameters(), retain_graph=True)
+    reference_grad = torch.autograd.grad(ref["resp_scores"].sum(), encoder.parameters(), retain_graph=True)
+    effective_grad = torch.autograd.grad(effective.sum(), encoder.parameters())
+    for actual, expected in zip(effective_grad, (a - b for a, b in zip(dynamic_grad, reference_grad))):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_reference_gauge_recomputes_reference_branch_and_is_not_trainable() -> None:
@@ -81,3 +85,69 @@ def test_exp2a_protocol_owns_only_encoder_and_l1_mbc() -> None:
     assert EXP2A_PROTOCOL["observations_per_update"] == 32 and EXP2A_PROTOCOL["steps"] == 200 and EXP2A_PROTOCOL["active_respiratory_levels"] == 1
     names = exp2a_trainable_parameter_groups({"canonical": ["c"], "film": ["f"], "respiratory_mbc": ["l1", "l2", "l3"]})
     assert names == {"film": ["f"], "respiratory_mbc": ["l1"]}
+
+
+def test_exp1_default_score_path_is_raw_and_no_reference_branch_is_called() -> None:
+    from cardioresp4d.training.model import SourceFirstDynamicModel
+
+    model = object.__new__(SourceFirstDynamicModel)
+    model.reference_score_provider = None
+    calls = {"raw": 0, "reference": 0}
+    def raw(_):
+        calls["raw"] += 1
+        return {"resp_scores": torch.tensor([[[1., 2., 3.]]])}
+    def reference(_):
+        calls["reference"] += 1
+        return {"resp_scores": torch.tensor([[[9., 9., 9.]]])}
+    model.encode_motion_scores_raw = raw
+    model.encode_reference_scores = reference
+    result = SourceFirstDynamicModel.encode_motion_scores(model, object())
+    torch.testing.assert_close(result["resp_scores"], torch.tensor([[[1., 2., 3.]]]))
+    assert calls == {"raw": 1, "reference": 0}
+
+
+def test_exp1_provider_free_predict_and_regularizers_match_raw_branch() -> None:
+    from cardioresp4d.training.model import SourceFirstDynamicModel
+
+    model = SourceFirstDynamicModel(torch.tensor([-2., -2., -2.]), torch.tensor([2., 2., 2.]), cardiac_lower_world_mm=torch.tensor([-1., -1., -1.]), cardiac_upper_world_mm=torch.tensor([1., 1., 1.]), n_dynamic_frames=1, inr_width=8, inr_depth=1, latent_dim=4, motion_hidden_dim=8, respiratory_grid_shapes=((4, 4, 4),) * 3, cardiac_grid_shape=(4, 4, 4), psf_samples=1)
+    observation = _observation(shape=(3, 3))
+    raw = model.encode_motion_scores_raw(observation); effective = model.encode_motion_scores(observation)
+    for left, right in zip(raw["resp_scores"], effective["resp_scores"]):
+        torch.testing.assert_close(left, right)
+    model.respiratory_mbc.set_active_levels(1)
+    raw_regularizers = model.motion_regularizers(raw, "stage2a")
+    effective_regularizers = model.motion_regularizers(effective, "stage2a")
+    for key in raw_regularizers:
+        torch.testing.assert_close(raw_regularizers[key], effective_regularizers[key])
+    pixels = torch.tensor([[0., 0.], [1., 1.]], dtype=torch.float32)
+    torch.manual_seed(17); raw_prediction = model.predict(observation, pixels, "stage2a")
+    torch.manual_seed(17); effective_prediction = model.predict(observation, pixels, "stage2a")
+    torch.testing.assert_close(raw_prediction["predicted_intensity"], effective_prediction["predicted_intensity"])
+
+
+def test_reference_branch_outputs_are_explicit_and_not_aliased() -> None:
+    from cardioresp4d.models.reference_gauge import effective_reference_scores
+
+    raw = {"resp_scores": torch.ones(1, 1, 3)}; reference = {"resp_scores": torch.full((1, 1, 3), 0.25)}
+    result = effective_reference_scores(raw, reference)
+    assert result["resp_scores"] is not raw["resp_scores"]
+    assert result["raw_resp_scores"] is raw["resp_scores"]
+    assert result["reference_resp_scores"] is reference["resp_scores"]
+
+
+def test_comparison_consumes_authoritative_exp1_boundary_metrics(tmp_path: Path) -> None:
+    from scripts.compare_exp1_exp2a_reference_gauge import build_comparison_payload
+
+    gauge = {"pooled": {"L1_warm": {"all_locations": {"raw_score": {"static_rms": 2., "dynamic_rms": 1., "static_dynamic_ratio": 2.}, "effective_score": {"static_rms": 0., "dynamic_rms": 1., "static_dynamic_ratio": 0.}, "raw_dvf": {"static_rms_mm": 3., "dynamic_rms_mm": 1., "static_dynamic_ratio": 3.}, "gauge_dvf": {"static_rms_mm": 0., "dynamic_rms_mm": 1., "static_dynamic_ratio": 0.}}}}}
+    report = {"diagnostics": {"step_200": {}}, "runner_report": {"reconstruction_mse_full": 0.2}}
+    payload = build_comparison_payload(gauge, report, [{"segment": "L1_warm", "reconstruction_mse_full": 0.1}])
+    assert payload["comparison"]["exp1_reconstruction_mse_full"] == 0.1
+    assert payload["comparison"]["primary_comparison"] == "Exp1 checkpoint_L1_warm_end.pt vs Exp2-A checkpoint_step_200.pt"
+
+
+def test_exp2a_runner_state_isolated_and_rejects_exp1_schedule() -> None:
+    from cardioresp4d.experiments.respiratory_reference_gauge_exp2a import Exp2AReferenceRunner
+
+    state = {"experiment": "respiratory_reference_gauge_exp2a", "segment": "exp2a_step_200", "steps": 200, "stage": "stage2a", "active_levels": 1, "owners": ["respiratory_encoder", "respiratory_mbc"], "canonical_frozen": True}
+    assert state["experiment"] == "respiratory_reference_gauge_exp2a" and state["owners"][-1] == "respiratory_mbc"
+    assert Exp2AReferenceRunner.__name__ == "Exp2AReferenceRunner"

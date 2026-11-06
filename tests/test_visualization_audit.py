@@ -28,6 +28,13 @@ def test_adapter_selection_and_exp1_scientific_status() -> None:
         adapter_for("other")
 
 
+def test_exp2a_reference_gauge_adapter_is_registered() -> None:
+    from cardioresp4d.visualization import adapter_for
+
+    adapter = adapter_for("exp2a_reference_gauge")
+    assert adapter.name == "exp2a_reference_gauge"
+
+
 def test_output_directory_must_not_overlap_authoritative_artifacts(tmp_path: Path) -> None:
     from cardioresp4d.visualization.contract import ensure_safe_output_dir
 
