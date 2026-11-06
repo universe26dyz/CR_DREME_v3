@@ -1,0 +1,15 @@
+# Isolated Exp2-A: hard reference-score gauge, no static rerun and no L2/L3.
+extends: respiratory_s2vdreme_reference_v1.yaml
+experiment: respiratory_reference_gauge_exp2a
+training:
+  seed: 20260823
+  observations_per_update: 32
+  normalization: {mode: per_series}
+  optimizer: {canonical_lr: null, respiratory_encoder_lr: 5.0e-4, respiratory_mbc_lr: 5.0e-4}
+  schedule: [{level: 1, warm_steps: 200, joint_steps: 0}]
+exp2a:
+  steps: 200
+  pixel_samples: 256
+  active_respiratory_levels: 1
+  score_policy: raw_minus_same_encoder_reference_mean
+  canonical_frozen: true

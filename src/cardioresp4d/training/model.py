@@ -1,6 +1,9 @@
 """Source-first dynamic model: NeSVoR canonical INR plus SINR DREME motion."""
 from __future__ import annotations
 
+from dataclasses import replace
+from typing import Callable, Any
+
 import torch
 from torch import nn
 from cardioresp4d.losses.motion_loss import dreme_mbc_normalization
@@ -51,6 +54,11 @@ class SourceFirstDynamicModel(nn.Module):
         self.cardiac_smoothness_shape = tuple(int(value) for value in cardiac_smoothness_shape)
         self.image_regularization_mode = image_regularization_mode
         self.image_regularization_delta = float(image_regularization_delta)
+        self.reference_score_provider: Callable[[DynamicObservation], torch.Tensor] | None = None
+
+    def set_reference_score_provider(self, provider: Callable[[DynamicObservation], torch.Tensor] | None) -> None:
+        """Enable an optional immutable reference-image score gauge for Exp2-A."""
+        self.reference_score_provider = provider
 
     def predict(self, observation: DynamicObservation, pixel_uv: torch.Tensor, stage: str) -> dict[str, torch.Tensor]:
         contract = stage_contract(stage)
@@ -79,7 +87,7 @@ class SourceFirstDynamicModel(nn.Module):
             render["uncertainty"] = self.uncertainty(render["latent_samples"], torch.tensor([observation.dynamic_frame_id], device=device, dtype=torch.long))
         return render
 
-    def encode_motion_scores(self, observation: DynamicObservation) -> dict[str, torch.Tensor]:
+    def encode_motion_scores_raw(self, observation: DynamicObservation) -> dict[str, torch.Tensor]:
         """Dispatch immutable observation metadata to the selected score encoder."""
         image = observation.image.unsqueeze(0)
         device, dtype = image.device, image.dtype
@@ -92,6 +100,25 @@ class SourceFirstDynamicModel(nn.Module):
         position = image.new_tensor([[observation.normalized_slice_position]])
         view_id = torch.tensor([view_id_for(observation.view)], device=device, dtype=torch.long)
         return self.film_encoder(image, normalized_slice_position=position, view_id=view_id)
+
+    def encode_reference_scores(self, observation: DynamicObservation) -> dict[str, torch.Tensor]:
+        if self.reference_score_provider is None:
+            raise RuntimeError("reference score provider is not configured")
+        reference_image = self.reference_score_provider(observation)
+        if reference_image.shape != observation.image.shape or not torch.isfinite(reference_image).all():
+            raise ValueError("reference image must be finite and match the dynamic observation shape")
+        return self.encode_motion_scores_raw(replace(observation, image=reference_image.to(observation.image)))
+
+    def encode_motion_scores(self, observation: DynamicObservation) -> dict[str, torch.Tensor]:
+        raw = self.encode_motion_scores_raw(observation)
+        if self.reference_score_provider is None:
+            return raw
+        reference = self.encode_reference_scores(observation)
+        result = dict(raw)
+        result["resp_scores"] = raw["resp_scores"] - reference["resp_scores"]
+        result["raw_resp_scores"] = raw["resp_scores"]
+        result["reference_resp_scores"] = reference["resp_scores"]
+        return result
 
     @staticmethod
     def _pixel_world(observation: DynamicObservation, pixel_uv: torch.Tensor) -> torch.Tensor:

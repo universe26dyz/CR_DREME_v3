@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -23,6 +24,11 @@ from ..image_utils import (aggregate_clip_fractions, evaluate_inr_on_nifti_latti
                            volume_summary)
 from ..report import json_safe
 from ..renderers import fixed_window, render_independent_images, render_montage, render_paired_images
+from ..dynamic_audit import (CheckpointBoundary, discover_boundary_checkpoints,
+                             dvf_from_scores, fixed_physical_grid,
+                             posthoc_center_scores, predict_observation_slice,
+                             reconstruct_exp1_checkpoint,
+                             select_fixed_location_frames, static_dynamic_rms)
 
 
 class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
@@ -30,7 +36,7 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
 
     @property
     def scientific_status(self) -> Mapping[str, str]:
-        return {"experiment_scientific_status": "INVALID_PENDING_STATIC_PIPELINE_REPAIR", "reason": "formal static NeSVoR output visually invalid"}
+        return {"experiment_scientific_status": "STATIC_REFERENCE_VERIFIED_DYNAMIC_IDENTIFIABILITY_FAILURE_OBSERVED", "reason": "Stage 0/static NeSVoR was verified by geometry, support, center/PSF INR agreement and reprojection; the active scientific issue is temporal motion identifiability/collapse in Exp1."}
 
     def source_artifacts(self, experiment_root: Path, manifest: Path, qc_table: Path, canonical_domain: Path) -> dict[str, Path]:
         static = experiment_root / "02_static_nesvor"; mean = experiment_root / "01_temporal_mean"
@@ -59,8 +65,14 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
                 state[name] = worker()
             except Exception as error:  # Individual audit stages must explain rather than silently disappear.
                 state[name] = stage_status("failed", f"{type(error).__name__}: {error}")
-        state["V8_dynamic_zero_motion"] = self.render_v8_dynamic_zero_motion()
-        state["V9_dynamic_boundaries"] = self.render_v9_dynamic_boundaries()
+        try:
+            state["V8_dynamic_zero_motion"] = self.render_v8_dynamic_zero_motion(experiment_root=experiment_root, manifest=manifest, qc_table=qc_table, canonical_domain=canonical_domain, output=output_dir / "V8_dynamic_zero_motion", device=device)
+        except Exception as error:
+            state["V8_dynamic_zero_motion"] = stage_status("failed", f"{type(error).__name__}: {error}")
+        try:
+            state["V9_dynamic_boundaries"] = self.render_v9_dynamic_boundaries(experiment_root=experiment_root, manifest=manifest, qc_table=qc_table, canonical_domain=canonical_domain, output=output_dir / "V9_dynamic_boundaries", device=device)
+        except Exception as error:
+            state["V9_dynamic_boundaries"] = stage_status("failed", f"{type(error).__name__}: {error}")
         return state
 
     @staticmethod
@@ -252,6 +264,85 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
         render_montage(output / "support_projections.png", [data.max(axis=0), data.max(axis=1), data.max(axis=2), data.mean(axis=0), data.mean(axis=1), data.mean(axis=2)], ["max x", "max y", "max z", "mean x", "mean y", "mean z"], columns=3, window=(0., 1.))
         metrics = support_metrics(data, affine); (output / "support_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
         return stage_status("rendered", figures={"support_orthogonal.png": {"window": (0., 1.), "axis_convention": "sagittal=X fixed, coronal=Y fixed, axial=Z fixed"}, "support_projections.png": {"window": (0., 1.)}}, **metrics)
+
+    @staticmethod
+    def _dynamic_context(experiment_root: Path, manifest: Path, qc_table: Path, canonical_domain: Path, device: str):
+        from scripts.train_source_first import observations_from_manifest
+        from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import apply_corrected_static_poses, load_corrected_pose_map
+        from cardioresp4d.training.build_model import uses_s2v_style_film
+        domain = json.loads(canonical_domain.read_text()); static = experiment_root / "02_static_nesvor"; pose_map = load_corrected_pose_map(static / "corrected_pose_manifest.json")
+        checkpoint_paths = discover_boundary_checkpoints(experiment_root); observations_by_config = {}
+        for boundary in checkpoint_paths:
+            checkpoint = torch.load(boundary.path, map_location="cpu", weights_only=False); config = checkpoint.get("effective_config", {})
+            key = (str(config.get("training", {}).get("normalization", {}).get("mode", "per_series")), uses_s2v_style_film(config))
+            if key not in observations_by_config:
+                observations, _, _ = observations_from_manifest(manifest, qc_table, torch.device(device), normalization_mode=key[0], assign_slice_positions=key[1]); observations_by_config[key] = apply_corrected_static_poses(observations, pose_map)
+        return domain, checkpoint_paths, observations_by_config
+
+    def render_v8_dynamic_zero_motion(self, *, experiment_root: Path, manifest: Path, qc_table: Path, canonical_domain: Path, output: Path, device: str) -> dict[str, Any]:
+        output.mkdir(parents=True, exist_ok=True); domain, boundaries, observations_by_config = self._dynamic_context(experiment_root, manifest, qc_table, canonical_domain, device)
+        if not boundaries:
+            return stage_status("partial", "no Exp1 boundary checkpoints found")
+        summary: dict[str, Any] = {"checkpoints": [], "metrics": [], "policy": "stage1 canonical-only zero-motion prediction"}
+        for boundary in boundaries:
+            checkpoint = torch.load(boundary.path, map_location="cpu", weights_only=False); config = checkpoint["effective_config"]; key = (str(config.get("training", {}).get("normalization", {}).get("mode", "per_series")), bool(config.get("model", {}).get("film", {}).get("implementation") in {"s2v_style_single_frame", "s2vdreme_reference_8layer"})); observations = observations_by_config[key]; model = reconstruct_exp1_checkpoint(checkpoint, domain, observations, torch.device(device)); selected = select_fixed_location_frames(observations, frames_per_location=3); checkpoint_dir = output / f"checkpoint_{boundary.label}"; checkpoint_dir.mkdir(parents=True, exist_ok=True); rows = []; figures = {}
+            for (view, slice_id), frames in selected.items():
+                for frame in frames:
+                    acquired = frame.image[0].detach().cpu(); prediction = predict_observation_slice(model, frame, "stage1", seed=20260823); residual = (acquired - prediction.cpu()).abs(); intensity_window = fixed_window(np.concatenate((acquired.numpy().ravel(), prediction.cpu().numpy().ravel())), robust=True); residual_window = (0., max(float(residual.max()), 1e-6)); name = f"{view}_{location_token(view, slice_id)}_frame_{frame.dynamic_frame_id:05d}.png"; figures[name] = render_independent_images(checkpoint_dir / name, [acquired.numpy(), prediction.cpu().numpy(), residual.numpy()], ["observed dynamic frame", "canonical-only zero-motion prediction", "absolute residual"], [intensity_window, intensity_window, residual_window]); rows.append({"view": view, "slice_id": slice_id, "dynamic_frame_id": int(frame.dynamic_frame_id), "timestamp_s": float(frame.timestamp_s), "mse": float(residual.square().mean())})
+            by_view = {view: float(np.mean([row["mse"] for row in rows if row["view"] == view])) for view in ("SAX", "2CH", "4CH") if any(row["view"] == view for row in rows)}; summary["checkpoints"].append(boundary.label); summary["metrics"].append({"checkpoint": boundary.label, "stage": boundary.stage, "per_view_pooled_mse": by_view, "full_pooled_mse": float(np.mean([row["mse"] for row in rows])), "frames": rows, "figures": figures})
+        (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n"); return stage_status("rendered", checkpoint_count=len(boundaries), summary_file="summary.json", policy=summary["policy"])
+
+    def render_v9_dynamic_boundaries(self, *, experiment_root: Path, manifest: Path, qc_table: Path, canonical_domain: Path, output: Path, device: str) -> dict[str, Any]:
+        output.mkdir(parents=True, exist_ok=True)
+        domain, boundaries, observations_by_config = self._dynamic_context(experiment_root, manifest, qc_table, canonical_domain, device)
+        if not boundaries:
+            return stage_status("partial", "no Exp1 boundary checkpoints found")
+        rows: list[dict[str, Any]] = []
+        for boundary in boundaries:
+            checkpoint = torch.load(boundary.path, map_location="cpu", weights_only=False)
+            config = checkpoint["effective_config"]
+            key = (str(config.get("training", {}).get("normalization", {}).get("mode", "per_series")), bool(config.get("model", {}).get("film", {}).get("implementation") in {"s2v_style_single_frame", "s2vdreme_reference_8layer"}))
+            observations = observations_by_config[key]
+            model = reconstruct_exp1_checkpoint(checkpoint, domain, observations, torch.device(device))
+            selected = select_fixed_location_frames(observations, frames_per_location=3)
+            checkpoint_dir = output / f"checkpoint_{boundary.label}"
+            for name in ("scores", "dvf", "mbc", "reprojection"):
+                (checkpoint_dir / name).mkdir(parents=True, exist_ok=True)
+            grid, _ = fixed_physical_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, (16, 16, 16))
+            location_rows = []
+            for key_location, frames in selected.items():
+                raw_scores = torch.cat([model.encode_motion_scores_raw(frame)["resp_scores"][:, :boundary.active_levels] for frame in frames], dim=0)
+                centered = posthoc_center_scores(raw_scores)
+                dvfs = torch.cat([dvf_from_scores(model, grid, model.encode_motion_scores_raw(frame)["resp_scores"], boundary.active_levels) for frame in frames], dim=0)
+                raw_mbc = model.respiratory_mbc.raw_active(grid, active_levels=boundary.active_levels).detach()
+                per_level_rms = raw_mbc.square().mean(dim=(0, 2, 3)).sqrt()
+                per_level_max = raw_mbc.abs().amax(dim=(0, 2, 3))
+                token = location_token(*key_location)
+                np.savez_compressed(checkpoint_dir / "dvf" / f"{key_location[0]}_{token}.npz", world_grid_mm=grid.detach().cpu().numpy(), dvf_mm=dvfs.detach().cpu().numpy(), dvf_mean_mm=dvfs.mean(0).detach().cpu().numpy(), dvf_dynamic_mm=(dvfs - dvfs.mean(0)).detach().cpu().numpy())
+                np.savez_compressed(checkpoint_dir / "mbc" / f"{key_location[0]}_{token}.npz", raw_mbc_basis_mm=raw_mbc.cpu().numpy(), per_level_rms_mm=per_level_rms.cpu().numpy(), per_level_max_mm=per_level_max.cpu().numpy(), label="raw MBC basis field", score_weighted_label="score-weighted DVF")
+                import matplotlib.pyplot as plt
+                figure, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+                flat = raw_scores.detach().cpu().numpy().reshape(len(frames), -1); flat_centered = centered.detach().cpu().numpy().reshape(len(frames), -1)
+                for index in range(flat.shape[1]):
+                    axes[0].plot([frame.timestamp_s for frame in frames], flat[:, index], marker="o", label=f"L{index // 3 + 1}.c{index % 3}")
+                    axes[1].plot([frame.timestamp_s for frame in frames], flat_centered[:, index], marker="o")
+                axes[0].set_title(f"raw score — {key_location[0]}/{key_location[1]}"); axes[1].set_title("POST-HOC DIAGNOSTIC: raw score - temporal mean (not used in Exp1 training)"); axes[1].set_xlabel("timestamp (s)"); axes[0].legend(ncol=3, fontsize=7); figure.tight_layout(); figure.savefig(checkpoint_dir / "scores" / f"{key_location[0]}_{token}.png", dpi=140); plt.close(figure)
+                prediction_mse = []
+                for frame in frames:
+                    prediction = predict_observation_slice(model, frame, boundary.stage, seed=20260823)
+                    observed = frame.image[0].detach().cpu().numpy(); predicted = prediction.detach().cpu().numpy(); residual = np.abs(observed - predicted); shared_window = fixed_window(np.concatenate((observed.ravel(), predicted.ravel())), robust=True); residual_window = (0., max(float(residual.max()), 1e-6))
+                    render_independent_images(checkpoint_dir / "reprojection" / f"{key_location[0]}_{token}_{frame.dynamic_frame_id:05d}.png", [observed, predicted, residual], ["observed", f"full motion prediction ({boundary.stage})", "absolute residual"], [shared_window, shared_window, residual_window]); prediction_mse.append(float(np.mean((predicted - observed) ** 2)))
+                score_metrics = static_dynamic_rms(raw_scores); dvf_metrics = static_dynamic_rms(dvfs)
+                location_rows.append({"view": key_location[0], "slice_id": key_location[1], "mse": float(np.mean(prediction_mse)), **{f"raw_score_{name}": value for name, value in score_metrics.items()}, "dvf_static_rms_mm": dvf_metrics["static_rms"], "dvf_dynamic_rms_mm": dvf_metrics["dynamic_rms"], "dvf_static_dynamic_ratio": dvf_metrics["static_dynamic_ratio"], "mbc_rms_mm": float(per_level_rms.mean()), "mbc_max_mm": float(per_level_max.max())})
+            per_view = {view: float(np.mean([item["mse"] for item in location_rows if item["view"] == view])) for view in ("SAX", "2CH", "4CH") if any(item["view"] == view for item in location_rows)}
+            row = {"checkpoint": boundary.label, "stage": boundary.stage, "active_levels": boundary.active_levels, "reconstruction_mse_full": float(np.mean([item["mse"] for item in location_rows])), **{f"reconstruction_mse_{view}": value for view, value in per_view.items()}}
+            for metric in ("raw_score_static_rms", "raw_score_dynamic_rms", "raw_score_static_dynamic_ratio", "dvf_static_rms_mm", "dvf_dynamic_rms_mm", "dvf_static_dynamic_ratio", "mbc_rms_mm", "mbc_max_mm"):
+                row[metric] = float(np.mean([item[metric] for item in location_rows]))
+            rows.append(row)
+        fields = sorted({key for row in rows for key in row});
+        with (output / "boundary_summary.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader(); writer.writerows(rows)
+        (output / "boundary_summary.json").write_text(json.dumps(rows, indent=2) + "\n"); return stage_status("rendered", checkpoint_count=len(boundaries), boundary_summary="boundary_summary.json", cohort_policy="one physical middle location per view; early/middle/late frames from that location", posthoc_centering="diagnostic only")
 
     def _v6_inr(self, experiment_root: Path, output: Path, device: str) -> dict[str, Any]:
         target = nib.load(str(experiment_root / "02_static_nesvor" / "static_reference.nii.gz")); payload, model, backend = self._load_static_model(experiment_root, device)

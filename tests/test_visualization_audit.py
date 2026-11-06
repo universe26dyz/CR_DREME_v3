@@ -23,7 +23,7 @@ def test_adapter_selection_and_exp1_scientific_status() -> None:
 
     adapter = adapter_for("exp1_reference")
     assert adapter.name == "exp1_reference"
-    assert adapter.scientific_status["experiment_scientific_status"] == "INVALID_PENDING_STATIC_PIPELINE_REPAIR"
+    assert adapter.scientific_status["experiment_scientific_status"] == "STATIC_REFERENCE_VERIFIED_DYNAMIC_IDENTIFIABILITY_FAILURE_OBSERVED"
     with pytest.raises(ValueError, match="unknown experiment"):
         adapter_for("other")
 
