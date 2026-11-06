@@ -176,3 +176,12 @@ def test_exp2a_input_bindings_fail_closed_when_mean_stack_changes(tmp_path: Path
     stack.write_bytes(b"changed")
     with pytest.raises(ValueError, match="mean_stacks"):
         verify_exp2a_input_bindings(bindings)
+
+
+def test_cpu_constructed_inr_does_not_inherit_cuda_only_tinycudann_default(monkeypatch) -> None:
+    from cardioresp4d.adapters import nesvor_inr
+    from cardioresp4d.adapters.nesvor_inr import NeSVoRCanonicalAdapter
+
+    monkeypatch.setattr(nesvor_inr.nesvor_models, "USE_TORCH", False)
+    adapter = NeSVoRCanonicalAdapter(torch.tensor([[-1., -1., -1.], [1., 1., 1.]]))
+    assert adapter.encoding_backend == "torch_hash"

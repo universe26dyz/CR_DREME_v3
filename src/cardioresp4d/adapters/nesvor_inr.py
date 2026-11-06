@@ -65,7 +65,12 @@ class NeSVoRCanonicalAdapter(nn.Module):
         # binds it explicitly through protocol provenance instead.
         self.register_buffer("input_world_to_internal", transform, persistent=False)
         self.args = Namespace(coarsest_resolution=coarsest_resolution, finest_resolution=finest_resolution, level_scale=level_scale, n_features_per_level=n_features_per_level, log2_hashmap_size=log2_hashmap_size, n_features_z=n_features_z, width=width, depth=depth, dtype=torch.float32, img_reg_autodiff=False)
-        self.encoding_backend = ("torch_hash" if nesvor_models.USE_TORCH else "tinycudann") if encoding_backend is None else encoding_backend
+        # A CPU-constructed model must never inherit a CUDA-only tinycudann
+        # default merely because the host has the extension installed.  CUDA
+        # training/checkpoint reconstruction still selects the host default or
+        # an explicit checkpoint backend; this branch only makes bare CPU unit
+        # models deterministic and device-consistent.
+        self.encoding_backend = ("torch_hash" if bounds_world_mm.device.type == "cpu" else ("torch_hash" if nesvor_models.USE_TORCH else "tinycudann")) if encoding_backend is None else encoding_backend
         # Source-first resume needs the checkpoint's exact upstream encoding
         # layout; this changes construction selection only, never INR maths.
         with _upstream_encoding_backend(self.encoding_backend):
