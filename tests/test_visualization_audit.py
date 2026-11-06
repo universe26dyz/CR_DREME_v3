@@ -151,6 +151,48 @@ def test_support_bbox_uses_all_eight_corners_and_reports_lps() -> None:
     assert "world_bbox_lps_mm" in result
 
 
+def test_v3_stack_geometry_json_normalizes_nibabel_numpy_scalars(tmp_path: Path) -> None:
+    from cardioresp4d.visualization.adapters.exp1_reference import Exp1ReferenceAdapter
+
+    experiment = tmp_path / "experiment"; mean = experiment / "01_temporal_mean"; output = tmp_path / "V3_stack_geometry"; mean.mkdir(parents=True); output.mkdir()
+    image = nib.Nifti1Image(np.zeros((4, 3, 1), dtype=np.float32), np.diag([-1., -1., 1., 1.])); nib.save(image, str(mean / "mean_stack_SAX.nii.gz"))
+    geometry = _geometry(0.); manifest = {"locations": [{"view": "SAX", "slice_id": "only", "stack_file": "mean_stack_SAX.nii.gz", "stack_index": 0, "geometry": geometry}], "stack_lattices": {"SAX": {"lattice_size": 1}}}
+    (mean / "mean_slice_manifest.json").write_text(json.dumps(manifest)); canonical = tmp_path / "canonical.json"; canonical.write_text(json.dumps({}))
+    Exp1ReferenceAdapter()._v3_geometry(experiment, canonical, output)
+    payload = json.loads((output / "stack_geometry.json").read_text())
+    stack = payload["mean_stack_SAX.nii.gz"]
+    assert stack["voxel_sizes"] == [1.0, 1.0, 1.0]
+    assert len(stack["affine"]) == len(stack["qform"]) == len(stack["sform"]) == 4
+    assert isinstance(stack["affine_determinant"], float)
+
+
+def test_v7_device_local_volume_copy_and_sampling_contract() -> None:
+    import cardioresp4d.adapters.nesvor_inr  # registers vendored NeSVoR
+    from cardioresp4d.visualization.image_utils import nesvor_volume_to_device, validate_nesvor_device_contract
+    from nesvor.image import Slice, Volume
+    from nesvor.inr.sample import sample_slices
+    from nesvor.transform import RigidTransform
+
+    image = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4); mask = (image.remainder(3) == 0); transform = RigidTransform(torch.tensor([[[0., -1., 0., 2.], [1., 0., 0., -3.], [0., 0., 1., 4.]]]))
+    original = Volume(image=image, mask=mask, transformation=transform, resolution_x=1.25, resolution_y=2.5, resolution_z=3.75)
+    copied = nesvor_volume_to_device(original, torch.device("cpu"))
+    assert copied is not original and copied.image.data_ptr() != original.image.data_ptr()
+    np.testing.assert_array_equal(copied.image, original.image); np.testing.assert_array_equal(copied.mask, original.mask); np.testing.assert_allclose(copied.transformation.matrix(), original.transformation.matrix())
+    assert (copied.resolution_x, copied.resolution_y, copied.resolution_z) == (1.25, 2.5, 3.75)
+    observed = [Slice(image=torch.ones((1, 3, 4)), mask=torch.ones((1, 3, 4), dtype=torch.bool), transformation=RigidTransform(torch.eye(3, 4).unsqueeze(0)), resolution_x=1., resolution_y=1., resolution_z=1.)]
+    class TinyINR(torch.nn.Module):
+        def __init__(self):
+            super().__init__(); self.anchor = torch.nn.Parameter(torch.zeros(()))
+        def forward(self, points): return points[..., 0] + self.anchor
+        def sample_batch(self, points, transformation, sigma, n_samples): return points[:, None, :].expand(-1, n_samples, -1)
+    model = TinyINR()
+    contract = validate_nesvor_device_contract(model, observed, copied, torch.device("cpu"))
+    assert contract["requested_device"] == contract["model_device"] == "cpu" and contract["observed_slice_count"] == 1
+    assert len(sample_slices(model, observed, copied, output_psf_factor=1., n_samples=2)) == 1
+    with pytest.raises(RuntimeError, match="V7 NeSVoR reprojection device contract violated"):
+        validate_nesvor_device_contract(model, observed, copied, torch.device("cuda:0"))
+
+
 def test_pose_delta_uses_full_so3_rotation_when_row_is_unchanged() -> None:
     from cardioresp4d.visualization.geometry_utils import pose_delta
 

@@ -6,7 +6,24 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
+
 from .contract import directory_manifest, sha256
+
+
+def json_safe(value: Any) -> Any:
+    """Convert audit metadata to values accepted by the standard JSON encoder."""
+    if isinstance(value, np.generic):
+        return json_safe(value.item())
+    if isinstance(value, np.ndarray):
+        return [json_safe(item) for item in value.tolist()]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [json_safe(item) for item in value]
+    return value
 
 
 def write_audit_manifest(output: str | Path, *, adapter: str, sources: Mapping[str, Path], stages: Mapping[str, Mapping[str, Any]], display_policies: Mapping[str, Any], render_configuration: Mapping[str, Any] | None = None) -> Path:
@@ -16,7 +33,7 @@ def write_audit_manifest(output: str | Path, *, adapter: str, sources: Mapping[s
         elif path.is_dir():
             entries, tree_hash = directory_manifest(path); artifacts[name] = {"source_token": name, "artifact_name": path.name, "content_manifest": entries, "tree_sha256": tree_hash}
     payload = {"schema_version": 1, "experiment_adapter": adapter, "source_artifacts": artifacts, "render_configuration": dict(render_configuration or {}), "display_window_policies": dict(display_policies), "stage_status": {name: dict(value) for name, value in stages.items()}}
-    path = Path(output); path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"); return path
+    path = Path(output); path.write_text(json.dumps(json_safe(payload), indent=2, sort_keys=True) + "\n", encoding="utf-8"); return path
 
 
 def write_html_report(output: str | Path, manifest: Mapping[str, Any], stages: Mapping[str, Mapping[str, Any]]) -> Path:
@@ -30,7 +47,7 @@ def write_html_report(output: str | Path, manifest: Mapping[str, Any], stages: M
             relative = asset.relative_to(root).as_posix(); link = f"<a href='{html.escape(relative)}'>{html.escape(relative)}</a>"
             items.append(f"<figure><img src='{html.escape(relative)}' loading='lazy' style='max-width:260px'><figcaption>{link}</figcaption></figure>" if asset.suffix == ".png" else f"<li>{link}</li>")
         return "<div class='assets'>" + "".join(items) + "</div>" if items else ""
-    sections = "".join(f"<section><h2>{html.escape(name)}</h2><pre>{html.escape(json.dumps(value, indent=2, sort_keys=True))}</pre>{assets(name)}</section>" for name, value in stages.items())
+    sections = "".join(f"<section><h2>{html.escape(name)}</h2><pre>{html.escape(json.dumps(json_safe(value), indent=2, sort_keys=True))}</pre>{assets(name)}</section>" for name, value in stages.items())
     scientific = manifest.get("scientific_status", {})
-    content = f"<!doctype html><html><head><meta charset='utf-8'><title>Experiment audit</title><style>body{{font-family:sans-serif;margin:2rem;max-width:1100px}}pre{{white-space:pre-wrap;background:#f5f5f5;padding:1rem}}section{{border-top:1px solid #ccc}}</style></head><body><h1>Read-only experiment audit</h1><pre>{html.escape(json.dumps(scientific, indent=2))}</pre>{sections}</body></html>"
+    content = f"<!doctype html><html><head><meta charset='utf-8'><title>Experiment audit</title><style>body{{font-family:sans-serif;margin:2rem;max-width:1100px}}pre{{white-space:pre-wrap;background:#f5f5f5;padding:1rem}}section{{border-top:1px solid #ccc}}</style></head><body><h1>Read-only experiment audit</h1><pre>{html.escape(json.dumps(json_safe(scientific), indent=2))}</pre>{sections}</body></html>"
     path.write_text(content, encoding="utf-8"); return path

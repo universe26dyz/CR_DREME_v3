@@ -47,6 +47,44 @@ def save_unmasked_static_inr(values: np.ndarray, target: nib.spatialimages.Spati
     return path
 
 
+def nesvor_volume_to_device(volume: Any, device: torch.device | str) -> Any:
+    """Make a detached device-local copy of a vendored NeSVoR ``Volume``."""
+    from nesvor.image import Volume
+    from nesvor.transform import RigidTransform
+
+    target = torch.device(device)
+    transformation = RigidTransform(volume.transformation.matrix(trans_first=True).detach().to(target).clone(), trans_first=True)
+    def move_resolution(value: Any) -> Any:
+        return value.detach().to(target).clone() if isinstance(value, torch.Tensor) else value
+    return Volume(image=volume.image.detach().to(target).clone(), mask=volume.mask.detach().to(target).clone(), transformation=transformation, resolution_x=move_resolution(volume.resolution_x), resolution_y=move_resolution(volume.resolution_y), resolution_z=move_resolution(volume.resolution_z))
+
+
+def _canonical_device(device: torch.device | str) -> torch.device:
+    target = torch.device(device)
+    if target.type == "cuda" and target.index is None:
+        target = torch.device("cuda", torch.cuda.current_device())
+    return target
+
+
+def validate_nesvor_device_contract(model: torch.nn.Module, observed_slices: Iterable[Any], support_volume: Any, device: torch.device | str) -> dict[str, Any]:
+    """Validate all tensors participating in V7 sampling are on one device."""
+    expected = _canonical_device(device); observed_slices = list(observed_slices); locations: dict[str, torch.device | None] = {}
+    parameter = next(model.parameters(), None); buffer = next(model.buffers(), None)
+    locations["model"] = parameter.device if parameter is not None else (buffer.device if buffer is not None else None)
+    for index, slice_value in enumerate(observed_slices):
+        locations[f"observed[{index}].image"] = slice_value.image.device
+        locations[f"observed[{index}].mask"] = slice_value.mask.device
+        locations[f"observed[{index}].transformation"] = slice_value.transformation.device
+    locations["support.image"] = support_volume.image.device
+    locations["support.mask"] = support_volume.mask.device
+    locations["support.transformation"] = support_volume.transformation.device
+    mismatches = {name: str(value) for name, value in locations.items() if value != expected}
+    if mismatches:
+        details = ", ".join(f"{name}={value}" for name, value in mismatches.items())
+        raise RuntimeError(f"V7 NeSVoR reprojection device contract violated: expected {expected}; {details}")
+    return {"requested_device": str(expected), "model_device": str(locations["model"]), "observed_slice_count": len(observed_slices), "support_image_device": str(locations["support.image"])}
+
+
 def evaluate_inr_on_nifti_lattice(model: torch.nn.Module, target: nib.spatialimages.SpatialImage, *, device: torch.device, chunk_size: int = 65536) -> np.ndarray:
     shape = tuple(int(value) for value in target.shape[:3]); result = np.empty(shape, dtype=np.float32); model.eval()
     with torch.no_grad():

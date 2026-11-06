@@ -18,7 +18,10 @@ from ..geometry_utils import (LPS_RAS, compare_plane_corners_lps, location_token
 from ..image_utils import (aggregate_clip_fractions, evaluate_inr_on_nifti_lattice,
                            evaluate_inr_psf_plane, export_support_mask,
                            representative_plane_specs, save_unmasked_static_inr,
-                           support_metrics, support_point_agreement, volume_summary)
+                           nesvor_volume_to_device, support_metrics,
+                           support_point_agreement, validate_nesvor_device_contract,
+                           volume_summary)
+from ..report import json_safe
 from ..renderers import fixed_window, render_independent_images, render_montage, render_paired_images
 
 
@@ -169,8 +172,8 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
             rows = []
             for record in records:
                 result = compare_plane_corners_lps(plane_corners_lps(record["geometry"]), image.affine, image.shape, int(record["stack_index"])); errors.append((result["max_error_mm"], location_token(record["view"], record["slice_id"]), stack)); rows.append({"opaque_slice_id": location_token(record["view"], record["slice_id"]), "stack_index": record["stack_index"], **result})
-            geometry[stack] = {"shape": list(image.shape), "voxel_sizes": list(header.get_zooms()), "qform": image.get_qform().tolist(), "sform": image.get_sform().tolist(), "affine": image.affine.tolist(), "orientation_codes": list(nib.aff2axcodes(image.affine)), "affine_determinant": float(np.linalg.det(image.affine[:3, :3])), "corner_round_trip": rows}
-        (output / "stack_geometry.json").write_text(json.dumps(geometry, indent=2) + "\n")
+            geometry[stack] = {"shape": list(image.shape), "voxel_sizes": [float(value) for value in header.get_zooms()], "qform": image.get_qform().tolist(), "sform": image.get_sform().tolist(), "affine": image.affine.tolist(), "orientation_codes": list(nib.aff2axcodes(image.affine)), "affine_determinant": float(np.linalg.det(image.affine[:3, :3])), "corner_round_trip": rows}
+        (output / "stack_geometry.json").write_text(json.dumps(json_safe(geometry), indent=2) + "\n")
         import matplotlib.pyplot as plt
         figure = plt.figure(figsize=(8, 7)); axis = figure.add_subplot(projection="3d")
         all_corners = []
@@ -287,8 +290,9 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
         from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import load_corrected_pose_map
         poses = load_corrected_pose_map(pose_path); selected_keys = self._representative_pose_keys(poses); selected_names = {Path(poses[key].corrected_slice_file).name for key in selected_keys}; chosen = [path for path in files if path.name in selected_names]
         if not chosen: return stage_status("partial", "no numeric corrected slices available")
-        all_observed = load_slices(str(corrected_dir), torch.device(device)); by_index = {int(path.name.split(".", 1)[0]): item for path, item in zip(files, all_observed)}; observed = [by_index[int(path.name.split(".", 1)[0])] for path in chosen]; simulated = sample_slices(model, observed, payload["mask"], float(getattr(payload["args"], "output_psf_factor", 1.0)), int(getattr(payload["args"], "n_inference_samples", 128)))
+        all_observed = load_slices(str(corrected_dir), torch.device(device)); by_index = {int(path.name.split(".", 1)[0]): item for path, item in zip(files, all_observed)}; observed = [by_index[int(path.name.split(".", 1)[0])] for path in chosen]
+        mask_device = nesvor_volume_to_device(payload["mask"], torch.device(device)); device_contract = validate_nesvor_device_contract(model, observed, mask_device, torch.device(device)); simulated = sample_slices(model, observed, mask_device, float(getattr(payload["args"], "output_psf_factor", 1.0)), int(getattr(payload["args"], "n_inference_samples", 128)))
         figures: dict[str, Any] = {}
         for index, (source, predicted) in enumerate(zip(observed, simulated)):
             raw, estimate = source.image.squeeze().detach().cpu().numpy(), predicted.image.squeeze().detach().cpu().numpy(); residual = np.abs(raw - estimate); intensity_window = fixed_window(np.concatenate((raw.ravel(), estimate.ravel())), robust=True); residual_window = (0., max(float(residual.max()), 1e-6)); key = next((candidate for candidate in selected_keys if Path(poses[candidate].corrected_slice_file).name == chosen[index].name), None); label = f"{key[0]}_{location_token(key[0], key[1])}" if key else f"slice_{index:03d}"; name = f"reprojection_{label}.png"; figures[name] = render_independent_images(output / name, [raw, estimate, residual], ["corrected observed", "NeSVoR PSF reprojection", "absolute residual"], [intensity_window, intensity_window, residual_window]); figures[name]["observed_predicted_window"] = intensity_window; figures[name]["residual_window"] = residual_window; figures[name]["policy"] = "shared observed/predicted; separate nonnegative residual"
-        return stage_status("rendered", slice_count=len(chosen), simulation_path="nesvor.inr.sample.sample_slices(directory, device)", figures=figures)
+        return stage_status("rendered", slice_count=len(chosen), simulation_path="nesvor.inr.sample.sample_slices(directory, device)", effective_device=device_contract["requested_device"], device_contract=device_contract, figures=figures)
