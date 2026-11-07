@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import nibabel as nib
@@ -248,6 +251,30 @@ def test_cli_fails_closed_when_mandatory_stage_failed(monkeypatch, tmp_path: Pat
     monkeypatch.setattr(cli, "write_audit_manifest", lambda path, **kwargs: (path.write_text("{}"), path)[1])
     monkeypatch.setattr(cli, "write_html_report", lambda *args: None)
     monkeypatch.setattr(cli.sys, "argv", ["render", "--experiment", "fake", "--experiment-root", str(tmp_path), "--manifest", str(tmp_path / "m"), "--qc-table", str(tmp_path / "q"), "--canonical-domain", str(tmp_path / "d"), "--output-dir", str(tmp_path / "out")])
+    assert cli.main() == 2
+
+
+def test_direct_render_script_bootstraps_repository_root_for_scripts_import(tmp_path: Path) -> None:
+    script = Path(__file__).parents[1] / "scripts" / "render_experiment_audit.py"
+    probe = "import runpy; runpy.run_path(%r, run_name='bootstrap'); from scripts.train_source_first import observations_from_manifest; print('bootstrap-ok')" % str(script)
+    environment = dict(os.environ); environment.pop("PYTHONPATH", None)
+    result = subprocess.run([sys.executable, "-c", probe], cwd=tmp_path, env=environment, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert "bootstrap-ok" in result.stdout
+
+
+def test_cli_explicit_requested_stage_failure_returns_two(monkeypatch, tmp_path: Path) -> None:
+    import scripts.render_experiment_audit as cli
+
+    class FakeAdapter:
+        name = "fake"; scientific_status = {}
+        def source_artifacts(self, *args): return {}
+        def render(self, **kwargs): return {"V8_dynamic_zero_motion": {"render_status": "failed", "reason": "bootstrap missing"}, "V9_dynamic_boundaries": {"render_status": "rendered"}}
+    monkeypatch.setattr(cli, "adapter_for", lambda _: FakeAdapter())
+    monkeypatch.setattr(cli, "write_audit_manifest", lambda path, **kwargs: (path.write_text("{}"), path)[1])
+    monkeypatch.setattr(cli, "write_html_report", lambda *args: None)
+    monkeypatch.setattr(cli, "ensure_safe_output_dir", lambda path, _: path.mkdir(parents=True, exist_ok=True) or path)
+    monkeypatch.setattr(cli.sys, "argv", ["render", "--experiment", "fake", "--experiment-root", str(tmp_path), "--manifest", str(tmp_path / "m"), "--qc-table", str(tmp_path / "q"), "--canonical-domain", str(tmp_path / "d"), "--output-dir", str(tmp_path / "out"), "--stages", "V8_dynamic_zero_motion,V9_dynamic_boundaries"])
     assert cli.main() == 2
 
 

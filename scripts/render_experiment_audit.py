@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from cardioresp4d.visualization import adapter_for
@@ -45,6 +46,11 @@ def main() -> int:
     mandatory = {f"V{index}_{name}" for index, name in enumerate(("raw_acquisition", "normalization", "temporal_mean", "stack_geometry", "registration", "static_support", "static_inr", "static_reprojection"))}
     mandatory_requested = mandatory if requested_stages is None else mandatory.intersection(requested_stages)
     failed = {name: value.get("reason", "unknown failure") for name, value in stages.items() if name in mandatory_requested and value.get("render_status") == "failed"}
+    if requested_stages is not None:
+        failed = {name: value.get("reason", "unknown failure") for name, value in stages.items() if name in requested_stages and value.get("render_status") == "failed"}
+        if failed:
+            print(json.dumps({"requested_stage_failures": failed, "report": str(output / "report.html")}, indent=2), file=sys.stderr)
+            return 2
     if failed:
         print(json.dumps({"mandatory_stage_failures": failed, "report": str(output / "report.html")}, indent=2), file=sys.stderr)
         return 2
