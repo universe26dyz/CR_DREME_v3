@@ -1,0 +1,10 @@
+# Isolated Exp2-B: fixed effective-score gain ablation, no static rerun and no L2/L3.
+extends: respiratory_reference_gauge_exp2a.yaml
+experiment: respiratory_reference_gauge_exp2b
+exp2b:
+  steps: 200
+  pixel_samples: 256
+  active_respiratory_levels: 1
+  score_policy: gain_times_raw_minus_reference
+  allowed_score_gains: [10.0, 100.0]
+  canonical_frozen: true

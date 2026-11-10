@@ -16,6 +16,7 @@ from cardioresp4d.models.cardioresp_motion import ScoreWeightedMBCField, Sequent
 from cardioresp4d.models.film_motion_encoder import GeometryFiLMMotionEncoder
 from cardioresp4d.models.s2v_style_motion_encoder import S2VStyleSingleFrameFiLMEncoder
 from cardioresp4d.models.s2vdreme_reference_encoder import S2VDREMEReferenceSingleFrameFiLMEncoder
+from cardioresp4d.models.reference_gauge import effective_reference_scores
 from .sampler import DynamicObservation
 from .stage_contract import stage_contract
 
@@ -55,10 +56,18 @@ class SourceFirstDynamicModel(nn.Module):
         self.image_regularization_mode = image_regularization_mode
         self.image_regularization_delta = float(image_regularization_delta)
         self.reference_score_provider: Callable[[DynamicObservation], torch.Tensor] | None = None
+        self.reference_score_gain = 1.0
 
     def set_reference_score_provider(self, provider: Callable[[DynamicObservation], torch.Tensor] | None) -> None:
         """Enable an optional immutable reference-image score gauge for Exp2-A."""
         self.reference_score_provider = provider
+
+    def set_reference_score_gain(self, gain: float) -> None:
+        """Set a fixed, non-trainable gain for reference-gauge scores."""
+        gain = float(gain)
+        if not torch.isfinite(torch.tensor(gain)) or gain <= 0:
+            raise ValueError("reference score gain must be a finite positive scalar")
+        self.reference_score_gain = gain
 
     def predict(self, observation: DynamicObservation, pixel_uv: torch.Tensor, stage: str) -> dict[str, torch.Tensor]:
         contract = stage_contract(stage)
@@ -114,11 +123,7 @@ class SourceFirstDynamicModel(nn.Module):
         if self.reference_score_provider is None:
             return raw
         reference = self.encode_reference_scores(observation)
-        result = dict(raw)
-        result["resp_scores"] = raw["resp_scores"] - reference["resp_scores"]
-        result["raw_resp_scores"] = raw["resp_scores"]
-        result["reference_resp_scores"] = reference["resp_scores"]
-        return result
+        return effective_reference_scores(raw, reference, score_gain=self.reference_score_gain)
 
     @staticmethod
     def _pixel_world(observation: DynamicObservation, pixel_uv: torch.Tensor) -> torch.Tensor:
