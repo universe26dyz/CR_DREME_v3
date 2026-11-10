@@ -21,7 +21,7 @@ from train_source_first import observations_from_manifest
 from cardioresp4d.adapters.nesvor_inr import detect_checkpoint_encoding_backend, lps_to_ras_world_matrix
 from cardioresp4d.adapters.source_lock import verify_vendored_source_lock
 from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import (
-    REFERENCE_CHECKPOINT_BOUNDARIES, S2VDREMEReferenceRunner, canonical_init_provenance, joint_stage_audits,
+    S2VDREMEReferenceRunner, canonical_init_provenance, joint_stage_audits,
     reference_schedule, strict_canonical_state_from_static_checkpoint, validate_reference_config,
     static_volume_samples, warm_start_canonical_from_static_volume, apply_corrected_static_poses, load_corrected_pose_map, static_reference_diagnostics, corrected_pose_containment_audit, corrected_pose_internal_inr_containment_audit, derive_effective_external_domain,
 )
@@ -71,6 +71,28 @@ def resume_next_segment_index(checkpoint: Mapping[str, Any], segments, provenanc
     return len(completed)
 
 
+def select_reference_segments(segments, stop_after: str | None):
+    """Select the legal schedule prefix requested by ``--stop-after``."""
+    segments = tuple(segments)
+    if stop_after is None:
+        return segments
+    names = tuple(segment.name for segment in segments)
+    if stop_after not in names:
+        raise ValueError(f"--stop-after must name a reference segment boundary; got {stop_after!r}. Expected one of: {', '.join(names)}")
+    return segments[: names.index(stop_after) + 1]
+
+
+def reference_segments_for_run(segments, *, start_index: int, stop_after: str | None):
+    """Return uncompleted segments without allowing a resume to move backward."""
+    segments = tuple(segments)
+    if start_index < 0 or start_index > len(segments):
+        raise ValueError(f"invalid resume segment index: {start_index}")
+    selected = select_reference_segments(segments, stop_after)
+    if start_index > len(selected):
+        raise ValueError(f"--stop-after {stop_after!r} is earlier than the completed resume boundary")
+    return tuple(selected[start_index:])
+
+
 def _checkpoint(*, model, runner, config, provenance, static_init) -> dict[str, Any]:
     return {"checkpoint_schema": CHECKPOINT_SCHEMA, "model": model.state_dict(), "runner_state": runner.state_dict(), "rng_state": capture_rng_state(), "effective_config": config, "provenance": provenance, "static_initialization": static_init}
 
@@ -82,9 +104,12 @@ def main() -> None:
     parser.add_argument("--static-manifest", required=True, type=Path, help="authoritative static_reference_manifest.json")
     parser.add_argument("--static-volume", type=Path, help="Verified static NeSVoR NIfTI override for explicit MSE fallback")
     parser.add_argument("--output-dir", required=True, type=Path); parser.add_argument("--device", default="cuda"); parser.add_argument("--pixel-samples", type=int, default=256); parser.add_argument("--resume", type=Path); parser.add_argument("--preflight-only", action="store_true", help="Validate formal static admission and diagnostics without training.")
+    parser.add_argument("--stop-after", help="stop successfully after a completed reference boundary, e.g. L1_warm")
     args = parser.parse_args(); device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available(): parser.error("CUDA requested but unavailable")
     config = _load_config(args.experiment_config); validate_reference_config(config)
+    segments = reference_schedule()
+    selected_segments = select_reference_segments(segments, args.stop_after)
     source_lock = verify_vendored_source_lock(ROOT)
     static_manifest = json.loads(args.static_manifest.read_text())
     if static_manifest.get("source_manifest_sha256") != _sha256(args.manifest) or static_manifest.get("qc_table_sha256") != _sha256(args.qc_table):
@@ -163,10 +188,11 @@ def main() -> None:
         static_init = {**canonical_init_provenance(static_model, mode="direct_exact_state_with_coordinate_bridge"), "direct_state_admission": {"accepted": True, "reason": None, "static_bbox": static_state["bounding_box"].detach().cpu().tolist(), "internal_inr_bbox": static_internal_bounds.tolist(), "source_phase1_external_lps_bbox": effective_external_domain["source_phase1_domain"], "effective_dynamic_external_lps_bbox": effective_external_domain["model_float32_effective_domain"], "bbox_tolerance_mm": 1e-5, "architecture_match": True, "encoding_backend_match": True, "state_key_match": True, "state_shape_match": True, "strict_load": True, "coordinate_bridge_match": True}}
     sampler = ViewLocationBalancedSampler(observations, seed=int(config["training"]["seed"]))
     runner = S2VDREMEReferenceRunner(model, sampler, pixel_samples=args.pixel_samples, observations_per_update=int(config["training"]["observations_per_update"]), optimizer_config=config["training"]["optimizer"])
-    segments = reference_schedule(); start = 0
+    start = 0
     if checkpoint is not None:
         start = resume_next_segment_index(checkpoint, segments, provenance)
         model.load_state_dict(checkpoint["model"]); runner.load_boundary_state(checkpoint["runner_state"]); restore_rng_state(checkpoint["rng_state"])
+    run_segments = reference_segments_for_run(segments, start_index=start, stop_after=args.stop_after)
     effective = {"requested": config, "constructed": {**effective_model_config(model), "optimizer": config["training"]["optimizer"], "schedule": [{**segment.__dict__, "owners": sorted(segment.owners)} for segment in reference_schedule()], "observations_per_update": runner.observations_per_update, "loss_weights": config["training"]["loss_weights"]}, "source_lock": source_lock, "effective_external_domain": effective_external_domain}
     (args.output_dir / "effective_config.json").write_text(json.dumps(effective, indent=2) + "\n")
     static_diagnostics = static_reference_diagnostics(model, sampler)
@@ -175,15 +201,22 @@ def main() -> None:
         report = {"status": "PASS", "git_sha": _git_head(), "static_initialization_mode": static_init["mode"], "encoding_backend": static_backend, "effective_external_domain": effective_external_domain, "effective_domain_containment": containment, "external_lps_domain_containment": containment, "static_inr_bbox_diagnostic": static_inr_bbox_diagnostic, "canonical_coordinate_frames": coordinate_frames, "static_reference_reconstruction": static_diagnostics, "formal_training_started": False}
         (args.output_dir / "preflight_report.json").write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report, indent=2)); return
-    for segment in segments[start:]:
+    for segment in run_segments:
         runner.run_segment(segment)
         payload = _checkpoint(model=model, runner=runner, config=config, provenance=provenance, static_init=static_init)
         torch.save(payload, args.output_dir / f"checkpoint_{segment.name}_end.pt")
         torch.save(payload, args.output_dir / "checkpoint_last.pt")
         (args.output_dir / "boundary_diagnostics.json").write_text(json.dumps(runner.completed, indent=2) + "\n")
+    if not run_segments and checkpoint is not None and args.stop_after is not None:
+        payload = _checkpoint(model=model, runner=runner, config=config, provenance=provenance, static_init=static_init)
+        torch.save(payload, args.output_dir / f"checkpoint_{args.stop_after}_end.pt")
+        torch.save(payload, args.output_dir / "checkpoint_last.pt")
+    (args.output_dir / "boundary_diagnostics.json").write_text(json.dumps(runner.completed, indent=2) + "\n")
     audits = joint_stage_audits(runner.completed)
     (args.output_dir / "joint_stage_audits.json").write_text(json.dumps(audits, indent=2) + "\n")
-    report = {"experiment": "respiratory_s2vdreme_reference_v1", "checkpoints": list(REFERENCE_CHECKPOINT_BOUNDARIES) + ["checkpoint_last.pt"], "segments": runner.completed, "joint_stage_audits": audits, "static_initialization": static_init, "provenance": provenance, "normalization_parameters": normalization, "normalization_groups": normalization_groups, "reproducibility": reproducibility, "device": str(device), "resumed_from": None if args.resume is None else str(args.resume)}
+    completed_boundaries = [item["segment"] for item in runner.completed]
+    schedule_completed_fully = completed_boundaries == [segment.name for segment in segments]
+    report = {"experiment": "respiratory_s2vdreme_reference_v1", "checkpoints": [f"checkpoint_{name}_end.pt" for name in completed_boundaries] + ["checkpoint_last.pt"], "segments": runner.completed, "joint_stage_audits": audits, "static_initialization": static_init, "provenance": provenance, "normalization_parameters": normalization, "normalization_groups": normalization_groups, "reproducibility": reproducibility, "device": str(device), "resumed_from": None if args.resume is None else str(args.resume), "requested_stop_boundary": args.stop_after, "schedule_prefix": [segment.name for segment in selected_segments], "completed_boundaries": completed_boundaries, "schedule_completed_fully": schedule_completed_fully, "intentional_early_stop": args.stop_after is not None and not schedule_completed_fully}
     (args.output_dir / "training_report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
 

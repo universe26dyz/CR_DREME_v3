@@ -501,6 +501,26 @@ def test_effective_domain_provenance_binds_resume_admission() -> None:
         launcher.resume_next_segment_index(checkpoint, reference_schedule(), changed)
 
 
+def test_reference_launcher_stop_after_selects_schedule_prefix_and_default_full() -> None:
+    launcher = _load_script("train_respiratory_s2vdreme_reference_v1")
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import reference_schedule
+    segments = reference_schedule()
+    assert [item.name for item in launcher.select_reference_segments(segments, None)] == [item.name for item in segments]
+    assert [item.name for item in launcher.select_reference_segments(segments, "L1_warm")] == ["L1_warm"]
+    with pytest.raises(ValueError, match="stop-after"):
+        launcher.select_reference_segments(segments, "not_a_boundary")
+
+
+def test_reference_launcher_stop_after_resume_slice_handles_forward_equal_and_backward() -> None:
+    launcher = _load_script("train_respiratory_s2vdreme_reference_v1")
+    from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import reference_schedule
+    segments = reference_schedule()
+    assert [item.name for item in launcher.reference_segments_for_run(segments, start_index=1, stop_after="L1_joint")] == ["L1_joint"]
+    assert launcher.reference_segments_for_run(segments, start_index=1, stop_after="L1_warm") == ()
+    with pytest.raises(ValueError, match="earlier"):
+        launcher.reference_segments_for_run(segments, start_index=3, stop_after="L1_joint")
+
+
 def test_reference_runner_clears_training_gradients_before_boundary_diagnostic(monkeypatch) -> None:
     import cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 as reference
 
