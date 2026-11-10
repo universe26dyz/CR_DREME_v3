@@ -53,6 +53,49 @@ def test_dynamic_audit_active_levels_centering_grid_and_field_labels() -> None:
     assert dynamic_field_labels() == {"raw_mbc": "raw MBC basis field", "weighted_dvf": "score-weighted DVF"}
 
 
+def test_mbc_points_from_world_grid_flattens_without_changing_order() -> None:
+    from cardioresp4d.visualization.dynamic_audit import mbc_points_from_world_grid
+
+    grid = torch.arange(4 * 5 * 6 * 3, dtype=torch.float32).reshape(4, 5, 6, 3)
+    result = mbc_points_from_world_grid(grid)
+    assert result.shape == (1, 120, 3)
+    torch.testing.assert_close(result[0], grid.reshape(-1, 3))
+    with pytest.raises(ValueError, match="shape"):
+        mbc_points_from_world_grid(torch.zeros(4, 5, 6, 2))
+    with pytest.raises(ValueError, match="finite"):
+        mbc_points_from_world_grid(torch.tensor([[[float("nan"), 0.0, 0.0]]]))
+
+
+def test_dvf_from_scores_adapts_structured_grid_before_mbc() -> None:
+    from cardioresp4d.visualization.dynamic_audit import dvf_from_scores
+
+    seen = {}
+
+    class FakeMBC:
+        def raw_active(self, points, *, active_levels):
+            seen["points"] = points
+            return torch.zeros(1, active_levels, points.shape[1], 3)
+
+    model = SimpleNamespace(respiratory_mbc=FakeMBC())
+    grid = torch.arange(4 * 5 * 6 * 3, dtype=torch.float32).reshape(4, 5, 6, 3)
+    result = dvf_from_scores(model, grid, torch.ones(1, 2, 3), active_levels=2)
+    assert seen["points"].shape == (1, 120, 3)
+    torch.testing.assert_close(seen["points"][0], grid.reshape(-1, 3))
+    assert result.shape == (1, 120, 3)
+
+
+@pytest.mark.parametrize("active_levels", [1, 2, 3])
+def test_score_structured_and_flattened_views_preserve_level_components(active_levels: int) -> None:
+    from scripts.audit_exp1_reference_score_gauge import structured_score_representations
+    from cardioresp4d.visualization.dynamic_audit import weighted_dvf_from_precomputed_basis
+
+    raw_input = torch.arange(9, dtype=torch.float32).reshape(1, 3, 3)
+    reference_input = torch.full_like(raw_input, 0.5)
+    raw, reference, effective = structured_score_representations(raw_input, reference_input, active_levels)
+    assert raw.shape == reference.shape == effective.shape == (1, active_levels, 3)
+    assert raw.reshape(-1).numel() == 3 * active_levels
+    basis = torch.zeros(1, active_levels, 11, 3)
+    assert weighted_dvf_from_precomputed_basis(basis, raw).shape == (1, 11, 3)
 def test_exp1_checkpoint_bounds_use_model_state_and_current_nested_metadata() -> None:
     from cardioresp4d.visualization.dynamic_audit import canonical_internal_bounds_from_checkpoint
 

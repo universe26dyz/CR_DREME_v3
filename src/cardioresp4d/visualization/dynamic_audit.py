@@ -135,6 +135,17 @@ def fixed_physical_grid(lower: torch.Tensor, upper: torch.Tensor, shape: tuple[i
     return world_grid(lower, upper, shape)
 
 
+def mbc_points_from_world_grid(grid: torch.Tensor) -> torch.Tensor:
+    """Flatten a structured ``[..., 3]`` world grid for the SINR-MBC API."""
+    if not isinstance(grid, torch.Tensor) or grid.ndim == 0 or grid.shape[-1] != 3:
+        raise ValueError("world grid must have shape [..., 3]")
+    if grid.numel() == 0:
+        raise ValueError("world grid must contain at least one point")
+    if not torch.isfinite(grid).all():
+        raise ValueError("world grid must be finite")
+    return grid.reshape(1, -1, 3)
+
+
 def static_dynamic_rms(values: torch.Tensor) -> dict[str, float]:
     if values.ndim < 2 or not torch.isfinite(values).all():
         raise ValueError("values must be finite with a time dimension")
@@ -248,5 +259,5 @@ def predict_observation_slice(model: torch.nn.Module, observation: Any, stage: s
 
 
 def dvf_from_scores(model: Any, grid: torch.Tensor, scores: torch.Tensor, active_levels: int) -> torch.Tensor:
-    basis = model.respiratory_mbc.raw_active(grid, active_levels=active_levels)
+    basis = model.respiratory_mbc.raw_active(mbc_points_from_world_grid(grid), active_levels=active_levels)
     return weighted_dvf_from_precomputed_basis(basis, scores[:, :active_levels])

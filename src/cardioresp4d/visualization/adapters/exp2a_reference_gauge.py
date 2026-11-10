@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from ..contract import ExperimentVisualizationAdapter, STAGES, stage_status
-from ..dynamic_audit import (fixed_physical_grid, location_local_rms_metrics, predict_observation_slice,
+from ..dynamic_audit import (fixed_physical_grid, location_local_rms_metrics, mbc_points_from_world_grid, predict_observation_slice,
                              select_fixed_location_frames, static_dynamic_rms, weighted_dvf_from_precomputed_basis)
 from ..geometry_utils import location_token
 from ..renderers import fixed_window, render_independent_images
@@ -99,7 +99,7 @@ class Exp2AReferenceGaugeAdapter(ExperimentVisualizationAdapter):
                 all_frames[(observation.view.upper(), observation.slice_id)].append(observation)
         for values in all_frames.values():
             values.sort(key=lambda item: (float(item.timestamp_s), int(item.dynamic_frame_id)))
-        grid, _ = fixed_physical_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, (16, 16, 16)); raw_basis = model.respiratory_mbc.raw_active(grid, active_levels=1).detach()
+        grid, _ = fixed_physical_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, (16, 16, 16)); raw_basis = model.respiratory_mbc.raw_active(mbc_points_from_world_grid(grid), active_levels=1).detach()
         mbc_dir, dvf_dir, score_dir, reprojection_dir = (output / name for name in ("mbc", "dvf", "scores", "reprojection"))
         for directory in (mbc_dir, dvf_dir, score_dir, reprojection_dir): directory.mkdir(parents=True, exist_ok=True)
         _render_vector_field_planes(mbc_dir, "L1", raw_basis[0, 0], label="RAW MBC BASIS FIELD")

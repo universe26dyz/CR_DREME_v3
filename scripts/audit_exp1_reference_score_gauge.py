@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from train_source_first import observations_from_manifest
 from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import apply_corrected_static_poses, load_corrected_pose_map
 from cardioresp4d.visualization.dynamic_audit import (discover_boundary_checkpoints, fixed_physical_grid,
+                                                     mbc_points_from_world_grid,
                                                      location_local_rms_metrics,
                                                      posthoc_center_scores, reconstruct_exp1_checkpoint,
                                                      resolve_dynamic_checkpoint_root, select_boundary_subset,
@@ -46,6 +47,17 @@ def dvf_sequence_metrics(sequence: torch.Tensor) -> dict[str, object]:
     magnitude = torch.linalg.vector_norm(sequence, dim=-1)
     result.update({"total_rms_mm": float(sequence.square().mean().sqrt()), "magnitude_mean_mm": float(magnitude.mean()), "magnitude_max_mm": float(magnitude.max()), "temporal_std_mm": float(sequence.std(unbiased=False))})
     return result
+
+
+def structured_score_representations(raw_scores: torch.Tensor, reference_scores: torch.Tensor, active_levels: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Keep ``[B,L,3]`` scores for DVF weighting; callers may flatten for plots."""
+    raw_structured = raw_scores[:, :active_levels]
+    reference_structured = reference_scores[:, :active_levels]
+    if active_levels <= 0 or raw_structured.ndim != 3 or raw_structured.shape[1] != active_levels or raw_structured.shape[-1] != 3:
+        raise ValueError(f"raw scores must have shape [B,{active_levels},3], got {tuple(raw_structured.shape)}")
+    if reference_structured.shape != raw_structured.shape:
+        raise ValueError(f"raw/reference score shape mismatch: {tuple(raw_structured.shape)} vs {tuple(reference_structured.shape)}")
+    return raw_structured, reference_structured, raw_structured - reference_structured
 
 
 def _sha256(path: Path) -> str:
@@ -134,17 +146,16 @@ def main() -> None:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         pooled_values = {"raw_score": [], "reference_score": [], "effective_score": [], "raw_dvf": [], "gauge_dvf": []}
         pooled_by_view = {view: {key: [] for key in pooled_values} for view in ("SAX", "2CH", "4CH")}
-        raw_basis = model.respiratory_mbc.raw_active(current_grid, active_levels=boundary.active_levels).detach()
+        mbc_points = mbc_points_from_world_grid(current_grid)
+        raw_basis = model.respiratory_mbc.raw_active(mbc_points, active_levels=boundary.active_levels).detach()
         for location, frames in all_locations.items():
             raw_values, reference_values, effective_values, raw_dvfs, gauge_dvfs = [], [], [], [], []
             with torch.no_grad():
                 for frame in frames:
-                    raw = model.encode_motion_scores_raw(frame)["resp_scores"][:, :boundary.active_levels].reshape(-1)
-                    reference = model.encode_reference_scores(frame)["resp_scores"][:, :boundary.active_levels].reshape(-1)
-                    effective = raw - reference
-                    raw_values.append(raw); reference_values.append(reference); effective_values.append(effective)
-                    raw_dvfs.append(weighted_dvf_from_precomputed_basis(raw_basis, raw[None])[0])
-                    gauge_dvfs.append(weighted_dvf_from_precomputed_basis(raw_basis, effective[None])[0])
+                    raw_structured, reference_structured, effective_structured = structured_score_representations(model.encode_motion_scores_raw(frame)["resp_scores"], model.encode_reference_scores(frame)["resp_scores"], boundary.active_levels)
+                    raw_values.append(raw_structured.reshape(-1)); reference_values.append(reference_structured.reshape(-1)); effective_values.append(effective_structured.reshape(-1))
+                    raw_dvfs.append(weighted_dvf_from_precomputed_basis(raw_basis, raw_structured)[0])
+                    gauge_dvfs.append(weighted_dvf_from_precomputed_basis(raw_basis, effective_structured)[0])
             raw, reference, effective = torch.stack(raw_values), torch.stack(reference_values), torch.stack(effective_values)
             raw_dvf, gauge_dvf = torch.stack(raw_dvfs), torch.stack(gauge_dvfs)
             item = {"checkpoint": boundary.label, "stage": boundary.stage, "active_levels": boundary.active_levels, "view": location[0], "slice_id": location[1], "frames": len(frames), "raw_score": score_sequence_metrics(raw), "reference_score": score_sequence_metrics(reference), "effective_gauge_score": score_sequence_metrics(effective), "raw_dvf": {**dvf_sequence_metrics(raw_dvf), "units": "mm"}, "gauge_dvf": {**dvf_sequence_metrics(gauge_dvf), "units": "mm"}}

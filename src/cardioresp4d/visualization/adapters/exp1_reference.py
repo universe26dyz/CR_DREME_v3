@@ -25,7 +25,7 @@ from ..image_utils import (aggregate_clip_fractions, evaluate_inr_on_nifti_latti
 from ..report import json_safe
 from ..renderers import fixed_window, render_independent_images, render_montage, render_paired_images
 from ..dynamic_audit import (CheckpointBoundary, discover_boundary_checkpoints, resolve_dynamic_checkpoint_root,
-                             fixed_physical_grid, weighted_dvf_from_precomputed_basis,
+                             fixed_physical_grid, mbc_points_from_world_grid, weighted_dvf_from_precomputed_basis,
                              posthoc_center_scores, predict_observation_slice,
                              reconstruct_exp1_checkpoint,
                              select_fixed_location_frames, static_dynamic_rms)
@@ -337,7 +337,7 @@ class Exp1ReferenceAdapter(ExperimentVisualizationAdapter):
             for name in ("scores", "dvf", "mbc", "reprojection"):
                 (checkpoint_dir / name).mkdir(parents=True, exist_ok=True)
             grid, _ = fixed_physical_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, (16, 16, 16))
-            raw_mbc = model.respiratory_mbc.raw_active(grid, active_levels=boundary.active_levels).detach()
+            raw_mbc = model.respiratory_mbc.raw_active(mbc_points_from_world_grid(grid), active_levels=boundary.active_levels).detach()
             per_level_rms = raw_mbc.square().mean(dim=(0, 2, 3)).sqrt()
             per_level_max = raw_mbc.abs().amax(dim=(0, 2, 3))
             for level in range(boundary.active_levels):

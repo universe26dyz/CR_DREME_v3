@@ -10,7 +10,7 @@ import torch
 
 from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import (ReferenceSegment, S2VDREMEReferenceRunner, boundary_motion_diagnostics,
                                                                         configure_reference_segment, reference_loss)
-from cardioresp4d.visualization.dynamic_audit import fixed_physical_grid, location_local_rms_metrics, weighted_dvf_from_precomputed_basis
+from cardioresp4d.visualization.dynamic_audit import fixed_physical_grid, location_local_rms_metrics, mbc_points_from_world_grid, weighted_dvf_from_precomputed_basis
 
 
 EXP2A_PROTOCOL = {
@@ -159,7 +159,7 @@ def exp2a_gauge_diagnostics(model: Any, sampler: Any, *, grid_shape: tuple[int, 
     if not cohort:
         raise ValueError("Exp2-A gauge diagnostics require a non-empty cohort")
     grid, _ = fixed_physical_grid(model.canonical_lower_world_mm, model.canonical_upper_world_mm, grid_shape)
-    raw_basis = model.respiratory_mbc.raw_active(grid, active_levels=1).detach()
+    raw_basis = model.respiratory_mbc.raw_active(mbc_points_from_world_grid(grid), active_levels=1).detach()
     score_values = {name: [] for name in ("raw", "reference", "effective")}; dvf_values = {name: [] for name in score_values}
     with torch.no_grad():
         for _, _, frames in cohort:
