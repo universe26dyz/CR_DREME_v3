@@ -104,8 +104,11 @@ def exp2b_gauge_diagnostics(model: Any, sampler: Any, *, score_gain: float | Non
             location_scores = {name: [] for name in score_values}
             location_dvfs = {name: [] for name in dvf_values}
             for observation in frames:
-                raw = model.encode_motion_scores_raw(observation)["resp_scores"]
-                reference = model.encode_reference_scores(observation)["resp_scores"]
+                # Exp2-B is the fixed L1-only gauge experiment.  Keep inactive
+                # encoder levels out of every formal score metric, not only the
+                # DVF projection below.
+                raw = model.encode_motion_scores_raw(observation)["resp_scores"][:, :1]
+                reference = model.encode_reference_scores(observation)["resp_scores"][:, :1]
                 unscaled = raw - reference
                 used = gain * unscaled
                 score_error = max(score_error, float((used - gain * unscaled).abs().max()))

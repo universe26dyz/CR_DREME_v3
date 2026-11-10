@@ -17,24 +17,44 @@ def _mean_summary(summary: Mapping[str, Any] | None, key: str) -> float | None:
     return _number(value.get("mean")) if isinstance(value, Mapping) else None
 
 
+def _first_present(*sources: Mapping[str, Any], keys: tuple[str, ...]) -> Any:
+    for source in sources:
+        for key in keys:
+            if key in source and source[key] is not None:
+                return source[key]
+    return None
+
+
 def extract_experiment_metrics(report: Mapping[str, Any], *, default_gain: float | None = None) -> dict[str, Any]:
     diagnostics = report.get("diagnostics", {}).get("step_200", {})
     runner = report.get("runner_report", {})
     gain = report.get("score_gain", report.get("protocol", {}).get("score_gain", default_gain))
     if gain is None:
         raise ValueError("training report lacks score_gain")
-    unscaled_score = diagnostics.get("unscaled_effective_score_dynamic_rms", diagnostics.get("respiratory_score_dynamic_rms"))
-    used_score = diagnostics.get("used_score_dynamic_rms", diagnostics.get("respiratory_score_dynamic_rms"))
-    unscaled_dvf = diagnostics.get("unscaled_effective_dvf_dynamic_rms_mm", diagnostics.get("respiratory_dvf_dynamic_rms_mm"))
-    used_dvf = diagnostics.get("used_dvf_dynamic_rms_mm", diagnostics.get("respiratory_dvf_dynamic_rms_mm"))
+    unscaled_score = _first_present(
+        diagnostics,
+        keys=("unscaled_effective_score_dynamic_rms", "effective_score_dynamic_rms", "respiratory_score_dynamic_rms"),
+    )
+    used_score = _first_present(
+        diagnostics,
+        keys=("used_score_dynamic_rms", "effective_score_dynamic_rms", "respiratory_score_dynamic_rms"),
+    )
+    unscaled_dvf = _first_present(
+        diagnostics,
+        keys=("unscaled_effective_dvf_dynamic_rms_mm", "effective_dvf_dynamic_rms_mm", "respiratory_dvf_dynamic_rms_mm"),
+    )
+    used_dvf = _first_present(
+        diagnostics,
+        keys=("used_dvf_dynamic_rms_mm", "effective_dvf_dynamic_rms_mm", "respiratory_dvf_dynamic_rms_mm"),
+    )
     gradient = runner.get("gradient_summary", {})
     losses = runner.get("loss_components", {})
     result = {
         "gain": float(gain),
-        "reconstruction_mse_full": _number(diagnostics.get("reconstruction_mse_full")),
-        "reconstruction_mse_SAX": _number(diagnostics.get("reconstruction_mse_SAX")),
-        "reconstruction_mse_2CH": _number(diagnostics.get("reconstruction_mse_2CH")),
-        "reconstruction_mse_4CH": _number(diagnostics.get("reconstruction_mse_4CH")),
+        "reconstruction_mse_full": _number(_first_present(diagnostics, runner, keys=("reconstruction_mse_full",))),
+        "reconstruction_mse_SAX": _number(_first_present(diagnostics, runner, keys=("reconstruction_mse_SAX",))),
+        "reconstruction_mse_2CH": _number(_first_present(diagnostics, runner, keys=("reconstruction_mse_2CH",))),
+        "reconstruction_mse_4CH": _number(_first_present(diagnostics, runner, keys=("reconstruction_mse_4CH",))),
         "unscaled_effective_score_dynamic_rms": _number(unscaled_score),
         "used_score_dynamic_rms": _number(used_score),
         "unscaled_effective_dvf_dynamic_rms_mm": _number(unscaled_dvf),

@@ -87,6 +87,46 @@ def test_exp2b_diagnostics_distinguish_unscaled_and_gain_applied_score_and_dvf(m
     assert result["dvf_gain_algebra_max_abs_error"] == pytest.approx(0.0)
 
 
+def test_exp2b_diagnostics_ignore_inactive_l2_l3_scores(monkeypatch) -> None:
+    import cardioresp4d.experiments.respiratory_reference_gauge_exp2b as exp2b
+
+    class FakeMBC:
+        def raw_active(self, points, *, active_levels):
+            return torch.ones(1, active_levels, points.shape[1], 3)
+
+    frame0 = SimpleNamespace(timestamp_s=0.0, value=0.0)
+    frame1 = SimpleNamespace(timestamp_s=1.0, value=1.0)
+    sampler = SimpleNamespace(_grouped={"SAX": {"s0": [frame0, frame1]}})
+
+    def make_model(inactive_scale: float):
+        class FakeModel:
+            reference_score_gain = 10.0
+            canonical_lower_world_mm = torch.tensor([-1.0, -1.0, -1.0])
+            canonical_upper_world_mm = torch.tensor([1.0, 1.0, 1.0])
+            respiratory_mbc = FakeMBC()
+
+            @staticmethod
+            def _physical_grid(lower, upper, shape):
+                return torch.zeros(1, 8, 3), torch.ones(3)
+
+            @staticmethod
+            def encode_motion_scores_raw(observation):
+                value = observation.value
+                return {"resp_scores": torch.tensor([[[1.0 + value, 2.0 + value, 3.0 + value], [100.0 * inactive_scale, 200.0 * inactive_scale, 300.0 * inactive_scale], [400.0 * inactive_scale, 500.0 * inactive_scale, 600.0 * inactive_scale]]])}
+
+            @staticmethod
+            def encode_reference_scores(observation):
+                return {"resp_scores": torch.zeros(1, 3, 3)}
+
+        return FakeModel()
+
+    monkeypatch.setattr(exp2b, "boundary_motion_diagnostics", lambda *_args, **_kwargs: {})
+    baseline = exp2b.exp2b_gauge_diagnostics(make_model(1.0), sampler, score_gain=10.0)
+    changed_inactive = exp2b.exp2b_gauge_diagnostics(make_model(1000.0), sampler, score_gain=10.0)
+    for key in ("raw_score_dynamic_rms", "reference_score_dynamic_rms", "unscaled_effective_score_dynamic_rms", "used_score_dynamic_rms", "unscaled_effective_dvf_dynamic_rms_mm", "used_dvf_dynamic_rms_mm"):
+        assert changed_inactive[key] == pytest.approx(baseline[key])
+
+
 def test_exp2b_runner_rejects_resume_gain_mismatch() -> None:
     from cardioresp4d.experiments.respiratory_reference_gauge_exp2b import Exp2BReferenceRunner
 
@@ -128,6 +168,41 @@ def test_exp2b_comparison_extracts_required_metrics_and_fold_changes() -> None:
     assert result["scientific_interpretation"] == "pending"
     assert result["experiments"]["gain100"]["used_score_dynamic_rms"] == 300.0
     assert result["comparisons"]["gain10_vs_gain1"]["used_score_dynamic_rms_fold_vs_gain1"] == 20.0
+
+
+def test_comparison_reads_real_exp2a_report_schema() -> None:
+    from scripts.compare_exp2a_exp2b_score_gain import build_score_gain_comparison
+
+    exp2a = {
+        "diagnostics": {"step_200": {"effective_score_dynamic_rms": 2.0, "effective_dvf_dynamic_rms_mm": 3.0}},
+        "runner_report": {
+            "reconstruction_mse_full": 0.11,
+            "reconstruction_mse_SAX": 0.12,
+            "reconstruction_mse_2CH": 0.13,
+            "reconstruction_mse_4CH": 0.14,
+            "loss_mean": 0.5,
+        },
+    }
+
+    def exp2b_report(gain: float, used_score: float, used_dvf: float) -> dict:
+        return {
+            "score_gain": gain,
+            "diagnostics": {"step_200": {"unscaled_effective_score_dynamic_rms": 2.0, "used_score_dynamic_rms": used_score, "unscaled_effective_dvf_dynamic_rms_mm": 3.0, "used_dvf_dynamic_rms_mm": used_dvf}},
+            "runner_report": {"loss_mean": 0.5},
+        }
+
+    result = build_score_gain_comparison(exp2a, exp2b_report(10.0, 20.0, 30.0), exp2b_report(100.0, 200.0, 300.0))
+    gain1 = result["experiments"]["gain1"]
+    assert gain1["unscaled_effective_score_dynamic_rms"] == pytest.approx(2.0)
+    assert gain1["used_score_dynamic_rms"] == pytest.approx(2.0)
+    assert gain1["unscaled_effective_dvf_dynamic_rms_mm"] == pytest.approx(3.0)
+    assert gain1["used_dvf_dynamic_rms_mm"] == pytest.approx(3.0)
+    assert gain1["reconstruction_mse_full"] == pytest.approx(0.11)
+    assert gain1["reconstruction_mse_SAX"] == pytest.approx(0.12)
+    assert gain1["reconstruction_mse_2CH"] == pytest.approx(0.13)
+    assert gain1["reconstruction_mse_4CH"] == pytest.approx(0.14)
+    assert result["comparisons"]["gain10_vs_gain1"]["used_score_dynamic_rms_fold_vs_gain1"] == pytest.approx(10.0)
+    assert result["scientific_interpretation"] == "pending"
 
 
 def test_gain10_and_gain100_keep_same_seeded_model_initialization() -> None:
