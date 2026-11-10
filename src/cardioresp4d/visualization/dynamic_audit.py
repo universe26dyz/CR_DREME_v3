@@ -147,6 +147,58 @@ def dynamic_field_labels() -> dict[str, str]:
     return {"raw_mbc": "raw MBC basis field", "weighted_dvf": "score-weighted DVF"}
 
 
+def canonical_internal_bounds_from_checkpoint(checkpoint: Mapping[str, Any], device: torch.device) -> torch.Tensor:
+    """Return the exact canonical INR bounds saved in an Exp1 checkpoint.
+
+    The model state is authoritative because it is the tensor used by the
+    training-time canonical INR.  Metadata is retained as a consistency check
+    for current and legacy checkpoint layouts, never as a substitute for the
+    saved state tensor.
+    """
+    model_state = checkpoint.get("model")
+    if not isinstance(model_state, Mapping) or "canonical.inr.bounding_box" not in model_state:
+        raise ValueError("Exp1 checkpoint model lacks canonical.inr.bounding_box")
+    state_value = model_state["canonical.inr.bounding_box"]
+    if not isinstance(state_value, torch.Tensor):
+        raise ValueError("canonical.inr.bounding_box must be a tensor")
+    state_bounds = state_value.detach().to(device=device, dtype=torch.float32)
+    if tuple(state_bounds.shape) != (2, 3):
+        raise ValueError(f"canonical.inr.bounding_box must have shape (2, 3), got {tuple(state_bounds.shape)}")
+    if not torch.isfinite(state_bounds).all():
+        raise ValueError("canonical.inr.bounding_box must be finite")
+    if torch.any(state_bounds[1] <= state_bounds[0]):
+        raise ValueError("canonical.inr.bounding_box must have upper values greater than lower values")
+
+    initialization = checkpoint.get("static_initialization")
+    metadata_bounds: list[tuple[str, Any]] = []
+    if initialization is not None:
+        if not isinstance(initialization, Mapping):
+            raise ValueError("static_initialization must be a mapping when present")
+        direct_admission = initialization.get("direct_state_admission")
+        if direct_admission is not None:
+            if not isinstance(direct_admission, Mapping):
+                raise ValueError("static_initialization.direct_state_admission must be a mapping when present")
+            if "internal_inr_bbox" in direct_admission:
+                metadata_bounds.append(("static_initialization.direct_state_admission.internal_inr_bbox", direct_admission["internal_inr_bbox"]))
+            elif "static_bbox" in direct_admission:
+                metadata_bounds.append(("static_initialization.direct_state_admission.static_bbox", direct_admission["static_bbox"]))
+        if "internal_inr_bbox" in initialization:
+            metadata_bounds.append(("static_initialization.internal_inr_bbox", initialization["internal_inr_bbox"]))
+        elif "static_bbox" in initialization:
+            metadata_bounds.append(("static_initialization.static_bbox", initialization["static_bbox"]))
+
+    for label, value in metadata_bounds:
+        try:
+            metadata_tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
+        except Exception as error:
+            raise ValueError(f"{label} is not a valid bbox") from error
+        if tuple(metadata_tensor.shape) != (2, 3) or not torch.isfinite(metadata_tensor).all() or torch.any(metadata_tensor[1] <= metadata_tensor[0]):
+            raise ValueError(f"{label} must be a finite valid bbox with shape (2, 3)")
+        if not torch.allclose(state_bounds, metadata_tensor, atol=1e-5, rtol=0.0):
+            raise ValueError(f"canonical.inr.bounding_box conflicts with {label}")
+    return state_bounds
+
+
 def weighted_dvf_from_precomputed_basis(raw_basis: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
     """Apply score weighting to a precomputed ``[B,L,N,3]`` MBC basis.
 
@@ -178,12 +230,10 @@ def reconstruct_exp1_checkpoint(checkpoint: dict[str, Any], domain: dict[str, An
     external = provenance.get("effective_external_domain", {}).get("model_float32_effective_domain")
     if external is not None:
         domain = {**domain, "world_min_mm": external["lower_lps_mm"], "world_max_mm": external["upper_lps_mm"]}
-    initialization = checkpoint.get("static_initialization", {})
-    bounds = initialization.get("internal_inr_bbox", initialization.get("static_bbox"))
-    internal_bounds = None if bounds is None else torch.as_tensor(bounds, dtype=torch.float32, device=device)
+    internal_bounds = canonical_internal_bounds_from_checkpoint(checkpoint, device)
     bridge = lps_to_ras_world_matrix(device=device)
     backend = detect_checkpoint_encoding_backend(checkpoint["model"])
-    model = build_source_first_model(config, domain, n_dynamic_frames=max(item.dynamic_frame_id for item in observations) + 1, device=device, canonical_encoding_backend=backend, canonical_internal_bounds_world_mm=internal_bounds, canonical_world_to_internal_transform=bridge if internal_bounds is not None else None).to(device)
+    model = build_source_first_model(config, domain, n_dynamic_frames=max(item.dynamic_frame_id for item in observations) + 1, device=device, canonical_encoding_backend=backend, canonical_internal_bounds_world_mm=internal_bounds, canonical_world_to_internal_transform=bridge).to(device)
     model.load_state_dict(checkpoint["model"], strict=True); model.eval(); model.canonical.inr.train()
     return model
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -49,6 +51,90 @@ def test_dynamic_audit_active_levels_centering_grid_and_field_labels() -> None:
     grid_a, spacing_a = fixed_physical_grid(torch.zeros(3), torch.ones(3), (4, 4, 4)); grid_b, spacing_b = fixed_physical_grid(torch.zeros(3), torch.ones(3), (4, 4, 4))
     torch.testing.assert_close(grid_a, grid_b); torch.testing.assert_close(spacing_a, spacing_b)
     assert dynamic_field_labels() == {"raw_mbc": "raw MBC basis field", "weighted_dvf": "score-weighted DVF"}
+
+
+def test_exp1_checkpoint_bounds_use_model_state_and_current_nested_metadata() -> None:
+    from cardioresp4d.visualization.dynamic_audit import canonical_internal_bounds_from_checkpoint
+
+    bounds = torch.tensor([[-7.0, -6.0, -5.0], [7.0, 6.0, 5.0]])
+    checkpoint = {
+        "model": {"canonical.inr.bounding_box": bounds.clone()},
+        "static_initialization": {"direct_state_admission": {"internal_inr_bbox": bounds.tolist()}},
+    }
+    actual = canonical_internal_bounds_from_checkpoint(checkpoint, torch.device("cpu"))
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, bounds)
+
+
+def test_exp1_checkpoint_bounds_reject_nested_metadata_conflict() -> None:
+    from cardioresp4d.visualization.dynamic_audit import canonical_internal_bounds_from_checkpoint
+
+    bounds = torch.tensor([[-1.0, -2.0, -3.0], [1.0, 2.0, 3.0]])
+    conflicting = bounds.clone(); conflicting[1, 0] += 0.1
+    checkpoint = {
+        "model": {"canonical.inr.bounding_box": bounds},
+        "static_initialization": {"direct_state_admission": {"internal_inr_bbox": conflicting.tolist()}},
+    }
+    with pytest.raises(ValueError, match="conflicts"):
+        canonical_internal_bounds_from_checkpoint(checkpoint, torch.device("cpu"))
+
+
+def test_exp1_checkpoint_bounds_support_legacy_top_level_metadata() -> None:
+    from cardioresp4d.visualization.dynamic_audit import canonical_internal_bounds_from_checkpoint
+
+    bounds = torch.tensor([[-4.0, -5.0, -6.0], [4.0, 5.0, 6.0]])
+    checkpoint = {"model": {"canonical.inr.bounding_box": bounds}, "static_initialization": {"internal_inr_bbox": bounds.tolist()}}
+    torch.testing.assert_close(canonical_internal_bounds_from_checkpoint(checkpoint, torch.device("cpu")), bounds)
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        torch.zeros(3),
+        torch.tensor([[-1.0, float("nan"), -1.0], [1.0, 1.0, 1.0]]),
+        torch.tensor([[1.0, -1.0, -1.0], [0.0, 1.0, 1.0]]),
+    ],
+)
+def test_exp1_checkpoint_bounds_reject_malformed_model_state(bounds: torch.Tensor) -> None:
+    from cardioresp4d.visualization.dynamic_audit import canonical_internal_bounds_from_checkpoint
+
+    with pytest.raises(ValueError):
+        canonical_internal_bounds_from_checkpoint({"model": {"canonical.inr.bounding_box": bounds}}, torch.device("cpu"))
+
+
+def test_reconstruct_exp1_checkpoint_passes_checkpoint_bounds_to_builder(monkeypatch) -> None:
+    import cardioresp4d.visualization.dynamic_audit as dynamic_audit
+
+    bounds = torch.tensor([[-8.0, -7.0, -6.0], [8.0, 7.0, 6.0]])
+    captured = {}
+
+    class FakeModel:
+        def __init__(self):
+            self.canonical = SimpleNamespace(inr=SimpleNamespace(train=lambda: None))
+
+        def to(self, device):
+            return self
+
+        def load_state_dict(self, state, strict=True):
+            captured["strict"] = strict
+
+        def eval(self):
+            return self
+
+    def fake_builder(*args, **kwargs):
+        captured.update(kwargs)
+        return FakeModel()
+
+    monkeypatch.setattr(dynamic_audit, "build_source_first_model", fake_builder)
+    checkpoint = {
+        "effective_config": {},
+        "model": {"canonical.inr.bounding_box": bounds.clone(), "encoding.box_offsets": torch.zeros(1)},
+        "static_initialization": {"direct_state_admission": {"internal_inr_bbox": bounds.tolist()}},
+    }
+    dynamic_audit.reconstruct_exp1_checkpoint(checkpoint, {"world_min_mm": [-100.0] * 3, "world_max_mm": [100.0] * 3}, [SimpleNamespace(dynamic_frame_id=0)], torch.device("cpu"))
+    torch.testing.assert_close(captured["canonical_internal_bounds_world_mm"], bounds)
+    assert captured["canonical_world_to_internal_transform"].shape == (3, 3)
+    assert captured["strict"] is True
 
 
 def test_boundary_subset_validates_and_preserves_requested_protocol_order(tmp_path: Path) -> None:
