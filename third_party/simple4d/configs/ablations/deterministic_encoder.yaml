@@ -1,0 +1,4 @@
+# Component ablation: deterministic encoder (no VAE posterior / KL term).
+# All other options keep the paper defaults:
+#   python train.py --config configs/ablations/deterministic_encoder.yaml --data scan.npz --out_dir runs/deterministic_encoder
+encoder: deterministic

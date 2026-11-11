@@ -1,0 +1,6 @@
+experiment: {name: simple4d_resp_v1, respiratory_only: true}
+encoder: {source: vendored_simple4d, type: MotionCodeVAE, code_dim: 32, base_channels: 32, position_embedding_dim: 32, view_embedding_dim: 8, dropout: 0.1}
+deformation: {source: vendored_simple4d, type: DeformCodeAdaptive, hidden_dims: [256, 256, 256, 256], omega: 7, residual: false, bidirectional: true, reference_spacing_mm: [1.0, 1.0, 1.0]}
+loss: {photometric: l1, kl_weight: 1.0e-3, jacobian_weight: 1.0e-4, magnitude_weight: 1.0e-2, cycle_weight: 0.1, regularizer_ramp_slope: 0.2, regularizer_ramp_max: 10.0}
+canonical: {source: static_nesvor, r0_frozen: true}
+renderer: {type: existing_nesvor_psf}

@@ -1,0 +1,4 @@
+# Component ablation: concatenation of the motion code with the coordinates.
+# All other options keep the paper defaults:
+#   python train.py --config configs/ablations/concat.yaml --data scan.npz --out_dir runs/concat
+conditioning: concat

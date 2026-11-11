@@ -1,0 +1,14 @@
+{
+  "name": "SIMPLE-4D",
+  "repository": "https://github.com/ttlmh/simple-4d",
+  "commit": "c466b276a438b3e052ad3b44d38f398872d8aeae",
+  "license": "PolyForm Noncommercial License 1.0.0",
+  "vendoring_policy": "ordinary tracked source snapshot; upstream files unmodified",
+  "key_files": {
+    "simple4d/networks.py": "81278403dfb2b765396295fc02c02cb17dab32a5f43bb2cdf7b0c4db45109d52",
+    "simple4d/losses.py": "88203e7d42232c3cd198e9295c9b498ce27b9ff265bc49f6cf5c1f5b7c697b21",
+    "simple4d/model.py": "11f4adb4a5cb524ff7144fa0bcb5c013db9a0bf00b79fc88c8595a1bca97c820",
+    "simple4d/coords.py": "43090ca3aa568bb5f106bb7ac4868d2bb85c9da2cb2cb03c4f8e7d81de834d8c",
+    "LICENSE.md": "bfe412dd64354f2af4c219850396479d45d7352213c09e7048d0626192c68d41"
+  }
+}

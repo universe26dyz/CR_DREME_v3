@@ -1,0 +1,4 @@
+# Component ablation: point supervision at the slice centre instead of the thick-slice model.
+# All other options keep the paper defaults:
+#   python train.py --config configs/ablations/point_slice.yaml --data scan.npz --out_dir runs/point_slice
+thick_slice: false

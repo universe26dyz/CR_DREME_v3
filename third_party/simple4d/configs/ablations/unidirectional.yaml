@@ -1,0 +1,4 @@
+# Component ablation: forward DVF only (no inverse field, no cycle loss).
+# All other options keep the paper defaults:
+#   python train.py --config configs/ablations/unidirectional.yaml --data scan.npz --out_dir runs/unidirectional
+bidirectional: false

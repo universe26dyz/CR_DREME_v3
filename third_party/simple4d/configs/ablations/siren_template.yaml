@@ -1,0 +1,4 @@
+# Component ablation: SIREN canonical anatomy instead of the hash-grid template.
+# All other options keep the paper defaults:
+#   python train.py --config configs/ablations/siren_template.yaml --data scan.npz --out_dir runs/siren_template
+template: siren

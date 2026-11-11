@@ -1,0 +1,24 @@
+# data and results are never committed (volunteer MRI data cannot be shared)
+*.npz
+*.npy
+*.nii
+*.nii.gz
+*.dcm
+*.IMA
+*.ima
+*.pth
+*.pt
+data/
+runs/
+outputs/
+export/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store

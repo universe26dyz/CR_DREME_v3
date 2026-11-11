@@ -1,0 +1,4 @@
+# Component ablation: FiLM conditioning of every layer.
+# All other options keep the paper defaults:
+#   python train.py --config configs/ablations/film.yaml --data scan.npz --out_dir runs/film
+conditioning: film

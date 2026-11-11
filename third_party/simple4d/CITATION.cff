@@ -1,0 +1,47 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the article below."
+title: "SIMPLE-4D"
+type: software
+license-url: "https://polyformproject.org/licenses/noncommercial/1.0.0"
+repository-code: "https://github.com/TBD/SIMPLE-4D"
+authors:
+  - family-names: Li
+    given-names: Muheng
+  - family-names: Wu
+    given-names: Xinyang
+  - family-names: Li
+    given-names: Xia
+  - family-names: Pusterla
+    given-names: Orso
+  - family-names: Cattin
+    given-names: Philippe C.
+  - family-names: Safai
+    given-names: Sairos
+  - family-names: Lomax
+    given-names: Antony J.
+  - family-names: Zhang
+    given-names: Ye
+preferred-citation:
+  type: article
+  title: "Portable surrogate-free 4D MRI from standard fast multi-slice 2D MRI via implicit neural representations"
+  journal: "arXiv"
+  year: 2026
+  doi: "10.48550/arXiv.2607.17906"
+  url: "https://arxiv.org/abs/2607.17906"
+  authors:
+    - family-names: Li
+      given-names: Muheng
+    - family-names: Wu
+      given-names: Xinyang
+    - family-names: Li
+      given-names: Xia
+    - family-names: Pusterla
+      given-names: Orso
+    - family-names: Cattin
+      given-names: Philippe C.
+    - family-names: Safai
+      given-names: Sairos
+    - family-names: Lomax
+      given-names: Antony J.
+    - family-names: Zhang
+      given-names: Ye

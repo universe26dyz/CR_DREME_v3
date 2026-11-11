@@ -1,0 +1,9 @@
+# PyTorch with CUDA: install first following https://pytorch.org (tested with torch 2.10 / CUDA 12.8)
+torch>=2.0
+numpy
+pyyaml
+torchmetrics>=1.0
+pydicom>=2.3        # tools/dicom_to_npz.py
+nibabel             # optional: render.py --nifti
+# tiny-cuda-nn (recommended; a pure-PyTorch hash encoding is used if it is not installed):
+#   pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
