@@ -19,7 +19,8 @@ from cardioresp4d.training.model import SourceFirstDynamicModel
 from cardioresp4d.training.runtime_state import capture_rng_state, restore_rng_state
 
 OWNERS = ('respiratory_encoder', 'forward_deformation', 'inverse_deformation')
-BOUNDARIES = {'r0_smoke': 200, 'r0_diagnostic': 2000}
+BOUNDARIES = {'r0_smoke': 200, 'r0_diagnostic': 2000, 'r0_mid': 5000, 'r0_formal': 10000}
+LEGACY_BOUNDARIES = {'r0_smoke': 200, 'r0_diagnostic': 2000}
 
 
 def sha256(path):
@@ -145,10 +146,47 @@ class R0Runner:
     def checkpoint(self, provenance, **metadata):
         return {'checkpoint_schema':1, 'global_step':self.global_step, 'model':self.model.state_dict(), 'runner_state':self.state_dict(), 'rng_state':capture_rng_state(), 'provenance':provenance, **metadata}
 
-    def restore(self, checkpoint, provenance):
-        if checkpoint.get('checkpoint_schema') != 1 or checkpoint.get('provenance') != provenance or checkpoint.get('global_step') != checkpoint.get('runner_state', {}).get('global_step'):
+    def restore(self, checkpoint, provenance, *, effective_config=None):
+        if checkpoint.get('checkpoint_schema') != 1 or not compatible_resume_provenance(checkpoint, provenance, effective_config) or checkpoint.get('global_step') != checkpoint.get('runner_state', {}).get('global_step'):
             raise ValueError('checkpoint provenance mismatch')
         self.model.load_state_dict(checkpoint['model'], strict=True); self.load_state_dict(checkpoint['runner_state']); restore_rng_state(checkpoint['rng_state'])
+
+
+def compatible_resume_provenance(checkpoint, provenance, effective_config):
+    """Accept the exact earlier protocol only when the two new boundaries are the sole change."""
+    saved = checkpoint.get('provenance')
+    if saved == provenance:
+        return True
+    if effective_config is None or not isinstance(saved, dict):
+        return False
+    legacy = copy.deepcopy(effective_config)
+    legacy['training']['boundaries'] = LEGACY_BOUNDARIES.copy()
+    legacy_hash = hashlib.sha256(json.dumps(legacy, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    expected = {**provenance, 'effective_config_sha256':legacy_hash}
+    return saved == expected and checkpoint.get('effective_config') == legacy
+
+
+def boundary_progression(diagnostics):
+    """Summarize changes between adjacent available boundary diagnostics."""
+    keys = sorted(diagnostics, key=lambda key: int(key.removeprefix('step_')))
+    result = {}
+    for previous, current in zip(keys, keys[1:]):
+        a, b = diagnostics[previous], diagnostics[current]
+        def fold(field):
+            return b[field] / a[field] if a[field] is not None and a[field] != 0 and b[field] is not None else None
+        def change(field):
+            return b[field] - a[field] if a[field] is not None and b[field] is not None else None
+        baseline = b['static_baseline_sampled_mse_full']
+        result[f'{previous}_to_{current}'] = {
+            'latent_dynamic_fold':fold('latent_mu_dynamic_rms'),
+            'dvf_dynamic_fold':fold('respiratory_dvf_dynamic_rms_mm'),
+            'static_dynamic_ratio_change':change('respiratory_dvf_static_dynamic_ratio'),
+            'PC1_change':change('latent_dynamic_pc1_explained_variance_ratio'),
+            'motion_vs_static_mse_improvement_percent':100 * (baseline - b['diagnostic_sampled_reconstruction_mse_full']) / baseline if baseline else None,
+            'cycle_error_change':change('cycle_error_mean_mm'),
+            'jacobian_p01_change':change('jacobian_det_p01'),
+        }
+    return result
 
 
 def decompose(groups, prefix):

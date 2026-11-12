@@ -4,7 +4,7 @@ reproducibility: {model_seed: 6, sampler_seed: 12}
 training:
   observations_per_update: 8
   pixel_samples_per_observation: 10000
-  boundaries: {r0_smoke: 200, r0_diagnostic: 2000}
+  boundaries: {r0_smoke: 200, r0_diagnostic: 2000, r0_mid: 5000, r0_formal: 10000}
   optimizer: {type: adam, encoder_lr: 5.0e-5, forward_deformation_lr: 5.0e-5, inverse_deformation_lr: 5.0e-5}
   scheduler: {type: step, step_size: 5000, gamma: 0.5}
 encoder: {source: vendored_simple4d, type: MotionCodeVAE, code_dim: 32, base_channels: 32, position_embedding_dim: 32, view_embedding_dim: 8, dropout: 0.1}

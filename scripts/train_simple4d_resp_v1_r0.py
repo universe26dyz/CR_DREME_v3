@@ -15,7 +15,7 @@ from train_respiratory_s2vdreme_reference_v1 import _load_config
 from train_respiratory_reference_gauge_exp2a import _build_exact_model
 from train_source_first import observations_from_manifest
 from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import apply_corrected_static_poses, derive_effective_external_domain, load_corrected_pose_map
-from cardioresp4d.experiments.simple4d_resp_v1_r0 import BOUNDARIES, OWNERS, R0Runner, diagnostic_metrics, resolve_static_reference_spacing, sha256, state_digest, summarize_metrics, validate_config
+from cardioresp4d.experiments.simple4d_resp_v1_r0 import BOUNDARIES, OWNERS, R0Runner, boundary_progression, diagnostic_metrics, resolve_static_reference_spacing, sha256, state_digest, summarize_metrics, validate_config
 from cardioresp4d.simple4d.model import Simple4DRespiratoryModel
 from cardioresp4d.training.runtime_state import set_reproducibility
 from cardioresp4d.training.sampler import ViewLocationBalancedSampler
@@ -23,6 +23,21 @@ from cardioresp4d.training.sampler import ViewLocationBalancedSampler
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + '\n')
+
+
+def run_to_boundary(runner, target, diagnostics, compute_diagnostics, save_boundary):
+    if runner.global_step > target:
+        raise ValueError('checkpoint is beyond requested boundary')
+    while runner.global_step < target:
+        runner.update()
+        if runner.global_step in BOUNDARIES.values():
+            diagnostics['step_'+str(runner.global_step)] = compute_diagnostics()
+            save_boundary()
+
+
+def save_checkpoints(output_dir, step, payload):
+    torch.save(payload, output_dir/f'checkpoint_step_{step}.pt')
+    torch.save(payload, output_dir/'checkpoint_last.pt')
 
 
 def main():
@@ -78,7 +93,7 @@ def main():
     diagnostics = {}
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        runner.restore(checkpoint, provenance)
+        runner.restore(checkpoint, provenance, effective_config=config)
         initial = checkpoint['initialization_audit']; diagnostics = checkpoint['diagnostics']
         if runner.global_step > BOUNDARIES[args.stop_after]:
             raise ValueError('checkpoint is beyond requested boundary')
@@ -89,19 +104,16 @@ def main():
     write_json(args.output_dir/'experiment_inputs.json', bindings)
     write_json(args.output_dir/'effective_config.json', config)
     target = BOUNDARIES[args.stop_after]
-    while runner.global_step < target:
-        runner.update()
-        if runner.global_step in BOUNDARIES.values():
-            diagnostics['step_'+str(runner.global_step)] = diagnostic_metrics(model, sampler)
-            gradient_summary, loss_summary = summarize_metrics(runner.metrics)
-            metadata = {'protocol':config, 'effective_config':config, 'initialization_audit':initial, 'diagnostics':diagnostics, 'static_initialization':static_initialization, 'spacing_provenance':spacing, 'input_bindings':bindings, 'normalization_parameters':normalization, 'normalization_groups':groups, 'simple4d_vendor_provenance':model.provenance()}
-            payload = runner.checkpoint(provenance, **metadata)
-            torch.save(payload, args.output_dir/f'checkpoint_step_{runner.global_step}.pt')
-            torch.save(payload, args.output_dir/'checkpoint_last.pt')
-            report = {**metadata, 'provenance':provenance, 'training_summary':{'global_step':runner.global_step, 'owners':list(OWNERS), 'canonical_frozen':True}, 'gradient_summary':gradient_summary, 'loss_component_summary':loss_summary}
-            write_json(args.output_dir/'training_report.json', report)
-            with (args.output_dir/'training_metrics.csv').open('w', newline='') as file:
-                writer = csv.DictWriter(file, fieldnames=list(runner.metrics[0])); writer.writeheader(); writer.writerows(runner.metrics)
+    def save_boundary():
+        gradient_summary, loss_summary = summarize_metrics(runner.metrics)
+        metadata = {'protocol':config, 'effective_config':config, 'initialization_audit':initial, 'diagnostics':diagnostics, 'static_initialization':static_initialization, 'spacing_provenance':spacing, 'input_bindings':bindings, 'normalization_parameters':normalization, 'normalization_groups':groups, 'simple4d_vendor_provenance':model.provenance()}
+        payload = runner.checkpoint(provenance, **metadata)
+        save_checkpoints(args.output_dir, runner.global_step, payload)
+        report = {**metadata, 'provenance':provenance, 'training_summary':{'global_step':runner.global_step, 'owners':list(OWNERS), 'canonical_frozen':True}, 'gradient_summary':gradient_summary, 'loss_component_summary':loss_summary, 'boundary_progression':boundary_progression(diagnostics)}
+        write_json(args.output_dir/'training_report.json', report)
+        with (args.output_dir/'training_metrics.csv').open('w', newline='') as file:
+            writer = csv.DictWriter(file, fieldnames=list(runner.metrics[0])); writer.writeheader(); writer.writerows(runner.metrics)
+    run_to_boundary(runner, target, diagnostics, lambda: diagnostic_metrics(model, sampler), save_boundary)
     print(json.dumps({'global_step':runner.global_step, 'output':str(args.output_dir)}))
 
 
