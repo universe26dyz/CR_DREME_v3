@@ -22,5 +22,7 @@ def respiratory_loss(prediction, target, mu, logvar, points_normalized, forward_
     mag = dvf_magnitude_loss(dvf)
     cycle = F.l1_loss(back, points_normalized)
     error_mm = forward_deformation.coordinates.normalized_deformation_to_world_mm(back - points_normalized).abs().mean()
-    total = photo + 1e-3 * kl + min(0.2 * step, 10) * (1e-4 * jac + 1e-2 * mag) + 0.1 * cycle
-    return {'total': total, 'photo': photo, 'kl': kl, 'jacobian': jac, 'magnitude': mag, 'cycle_loss_normalized': cycle, 'cycle_error_mm': error_mm, 'dvf_rms_mm': forward_deformation.coordinates.normalized_deformation_to_world_mm(dvf).square().mean().sqrt()}
+    ramp = min(0.2 * step, 10.)
+    kl_weighted, jac_weighted, mag_weighted, cycle_weighted = 1e-3 * kl, ramp * 1e-4 * jac, ramp * 1e-2 * mag, 0.1 * cycle
+    total = photo + kl_weighted + jac_weighted + mag_weighted + cycle_weighted
+    return {'total': total, 'photo_raw': photo, 'kl_raw': kl, 'kl_weighted': kl_weighted, 'jacobian_raw': jac, 'jacobian_weighted': jac_weighted, 'magnitude_raw': mag, 'magnitude_weighted': mag_weighted, 'cycle_raw_normalized': cycle, 'cycle_weighted': cycle_weighted, 'cycle_error_mm': error_mm, 'dvf_rms_mm': forward_deformation.coordinates.normalized_deformation_to_world_mm(dvf).square().mean().sqrt(), 'regularizer_ramp': photo.new_tensor(ramp)}

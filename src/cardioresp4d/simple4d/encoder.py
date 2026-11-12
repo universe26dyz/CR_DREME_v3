@@ -13,7 +13,7 @@ class Simple4DViewConditionedMotionCodeVAE(MotionCodeVAE):
         self.view_embedding = nn.Embedding(3, 8)
         self.fc_hidden[0] = nn.Linear(296, 144)
 
-    def forward(self, image, normalized_slice_position, view_id):
+    def encode_distribution(self, image, normalized_slice_position, view_id):
         if image.ndim != 4 or image.shape[1] != 1:
             raise ValueError('image must be [B,1,H,W]')
         b = image.shape[0]
@@ -25,5 +25,19 @@ class Simple4DViewConditionedMotionCodeVAE(MotionCodeVAE):
         features = torch.cat((self.image_encoder(image), self.pos_embedding(position.float()), self.view_embedding(view_id)), dim=-1)
         h = self.fc_hidden(features)
         mu, logvar = self.fc_mu(h), self.fc_logvar(h)
-        code = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar) if self.training else mu
+        return mu, logvar
+
+    def encode_code(self, image, normalized_slice_position, view_id, *, sample):
+        # Disable only encoder dropout for repeatable posterior-mean diagnostics.
+        was_training = self.training
+        if not sample:
+            self.eval()
+        try:
+            mu, logvar = self.encode_distribution(image, normalized_slice_position, view_id)
+        finally:
+            self.train(was_training)
+        code = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar) if sample else mu
         return {'code': code, 'mu': mu, 'logvar': logvar}
+
+    def forward(self, image, normalized_slice_position, view_id):
+        return self.encode_code(image, normalized_slice_position, view_id, sample=self.training)

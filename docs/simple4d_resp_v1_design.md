@@ -13,3 +13,9 @@ An 8-dimensional view embedding joins image and slice-position features. Continu
 ## Explicitly not used
 
 SIMPLE-4D InstantNGP canonical, its slice coordinate generator and thick-slice quadrature, existing SINR-MBC, reference gauge and cardiac branch. No training runner is included.
+
+## R0 training and diagnostics
+
+R0 freezes the canonical and trains MotionCodeVAE and independent forward/inverse DeformCodeAdaptive networks. Training samples one posterior z per observation and reuses it for the existing NeSVoR PSF photometric prediction and motion losses. Jacobian, magnitude and cycle regularization use sampled pixel-center coordinates normalized to the external domain, not random PSF nodes. Each update accumulates eight observation gradients; each observation samples 10,000 pixels with replacement.
+
+Boundary diagnostics use posterior mean μ and a fixed 256 full-FOV sampled pixels per frame; a shared PSF sample set compares motion-on to static reconstruction. Diagnostics have an isolated RNG stream. The static output spacing is resolved from the static command and NIfTI header, crosschecked against the expected configuration. No reference gauge, gain, MBC or cardiac model is used.

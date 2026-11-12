@@ -1,6 +1,15 @@
-experiment: {name: simple4d_resp_v1, respiratory_only: true}
+experiment: {name: simple4d_resp_v1, respiratory_only: true, stage: R0}
+data: {normalization: per_series}
+reproducibility: {model_seed: 6, sampler_seed: 12}
+training:
+  observations_per_update: 8
+  pixel_samples_per_observation: 10000
+  boundaries: {r0_smoke: 200, r0_diagnostic: 2000}
+  optimizer: {type: adam, encoder_lr: 5.0e-5, forward_deformation_lr: 5.0e-5, inverse_deformation_lr: 5.0e-5}
+  scheduler: {type: step, step_size: 5000, gamma: 0.5}
 encoder: {source: vendored_simple4d, type: MotionCodeVAE, code_dim: 32, base_channels: 32, position_embedding_dim: 32, view_embedding_dim: 8, dropout: 0.1}
-deformation: {source: vendored_simple4d, type: DeformCodeAdaptive, hidden_dims: [256, 256, 256, 256], omega: 7, residual: false, bidirectional: true, reference_spacing_mm: [1.0, 1.0, 1.0]}
+deformation: {source: vendored_simple4d, type: DeformCodeAdaptive, hidden_dims: [256, 256, 256, 256], omega: 7, residual: false, bidirectional: true, expected_reference_spacing_mm: [1.0, 1.0, 1.0]}
 loss: {photometric: l1, kl_weight: 1.0e-3, jacobian_weight: 1.0e-4, magnitude_weight: 1.0e-2, cycle_weight: 0.1, regularizer_ramp_slope: 0.2, regularizer_ramp_max: 10.0}
-canonical: {source: static_nesvor, r0_frozen: true}
-renderer: {type: existing_nesvor_psf}
+canonical: {source: static_nesvor, r0_frozen: true, bootstrap_config: respiratory_s2vdreme_reference_v1.yaml}
+renderer: {type: existing_nesvor_psf, psf_samples: 8}
+disabled: [reference_gauge, score_gain, respiratory_mbc, cardiac, uncertainty, groupwise]

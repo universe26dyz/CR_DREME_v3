@@ -30,11 +30,14 @@ class Simple4DRespiratoryModel(nn.Module):
         self.forward_deformation.requires_grad_(True)
         self.inverse_deformation.requires_grad_(True)
 
-    def predict(self, observation, pixel_uv):
+    def encode_observation(self, observation, *, sample):
         if observation.normalized_slice_position is None:
             raise ValueError('normalized slice position is required')
         image = observation.image.unsqueeze(0)
-        encoded = self.respiratory_encoder(image, image.new_tensor([observation.normalized_slice_position]), torch.tensor([view_id_for(observation.view)], device=image.device))
+        return self.respiratory_encoder.encode_code(image, image.new_tensor([observation.normalized_slice_position]), torch.tensor([view_id_for(observation.view)], device=image.device), sample=sample)
+
+    def render_with_encoded(self, observation, pixel_uv, encoded):
+        image = observation.image.unsqueeze(0)
         points = SourceFirstDynamicModel._pixel_world(observation, pixel_uv.to(image))
         count = points.shape[0]
         resolution = image.new_tensor([observation.pixel_spacing_mm[1], observation.pixel_spacing_mm[0], observation.slice_thickness_mm]).expand(count, 3)
@@ -43,6 +46,10 @@ class Simple4DRespiratoryModel(nn.Module):
         render = self.psf(self.canonical, points, resolution, row_direction=observation.row_direction.to(image).expand(count, -1), column_direction=observation.column_direction.to(image).expand(count, -1), normal=observation.normal.to(image).expand(count, -1), motion=motion)
         render.update(encoded)
         return render
+
+    def predict(self, observation, pixel_uv):
+        encoded = self.encode_observation(observation, sample=self.training)
+        return self.render_with_encoded(observation, pixel_uv, encoded)
 
     def provenance(self):
         manifest = json.loads((Path(__file__).resolve().parents[3] / 'third_party/simple4d_VENDOR.json').read_text())
