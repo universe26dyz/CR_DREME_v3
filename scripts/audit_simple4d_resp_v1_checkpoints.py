@@ -22,11 +22,12 @@ from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import apply_cor
 from cardioresp4d.experiments.simple4d_resp_v1_r0 import compatible_resume_provenance, resolve_static_reference_spacing, sha256, state_digest, validate_config
 from cardioresp4d.experiments.simple4d_resp_v1_identity_audit import global_latent_pca
 from cardioresp4d.experiments.simple4d_resp_v1_identity_stages import read_latent, surrogate_stage, coherence_stage
-from cardioresp4d.experiments.simple4d_resp_v1_identity_render import dvf_stage, withheld_stage, compare_sax_fields
+from cardioresp4d.experiments.simple4d_resp_v1_identity_render import dvf_stage, withheld_stage
+from cardioresp4d.experiments.simple4d_resp_v1_anatomy import derive_anatomy_crop, anatomy_overlay_stage, compare_anatomy_sax
 from cardioresp4d.experiments.simple4d_resp_v1_identity_report import comparison_report
 from cardioresp4d.simple4d.model import Simple4DRespiratoryModel
 from cardioresp4d.training.sampler import ViewLocationBalancedSampler
-from cardioresp4d.visualization.simple4d_resp_v1_identity import save_summary_figures, save_latent_figures
+from cardioresp4d.visualization.simple4d_resp_v1_identity import save_summary_figures, save_latent_figures, save_periodicity_figures
 
 
 SUMMARY_FIELDS = ('latent_mu_total_rms','latent_mu_static_rms','latent_mu_dynamic_rms','latent_mu_static_dynamic_ratio','latent_dynamic_pc1_explained_variance_ratio','latent_dynamic_pc2_explained_variance_ratio','latent_dynamic_rank_95pct','posterior_std_mean','kl_mean','respiratory_dvf_total_rms_mm','respiratory_dvf_static_rms_mm','respiratory_dvf_dynamic_rms_mm','respiratory_dvf_static_dynamic_ratio','respiratory_dvf_max_abs_mm','static_baseline_sampled_mse_full','diagnostic_sampled_reconstruction_mse_full','static_baseline_sampled_mae_full','diagnostic_sampled_reconstruction_mae_full','jacobian_det_p01','jacobian_det_min','jacobian_det_nonpositive_fraction','cycle_error_mean_mm','cycle_error_p95_mm','cycle_error_max_mm')
@@ -114,6 +115,7 @@ def main():
     checkpoints={step:args.run_dir/f'checkpoint_step_{step}.pt' for step in sorted(args.checkpoint_steps)}
     for path in checkpoints.values():
         if not path.is_file(): raise FileNotFoundError(path)
+    checkpoint_hashes_before={step:output_sha256(path) for step,path in checkpoints.items()}
     out=args.output_dir/({'summary':'00_summary','latent':'01_latent','surrogate':'02_surrogate','coherence':'03_coherence','dvf':'04_dvf','withheld':'05_withheld'}[args.stage])
     if out.exists() and not args.overwrite_stage: raise FileExistsError(f'{out} exists; pass --overwrite-stage')
     with diagnostic_rng_context():
@@ -134,6 +136,13 @@ def main():
             latent_file=latent_dir/relative
             if latent_manifest.get('output_sha256',{}).get(relative) != sha256(latent_file): raise ValueError('latent scores hash mismatch')
             all_rows[step]=read_latent(latent_file,cohort)
+        crop_data=None
+        if args.stage=='dvf':
+            static=json.loads(args.static_manifest.read_text()); volume=Path(static['outputs']['volume']['path'])
+            if output_sha256(volume) != provenance['hashes']['static_volume']: raise ValueError('static volume changed before anatomy crop')
+            coords=model.forward_deformation.coordinates
+            lower=coords.lower_world_mm.detach().cpu().numpy(); upper=lower+coords.extent_mm.detach().cpu().numpy()
+            crop_data=derive_anatomy_crop(volume,lower,upper,coords.reference_spacing_mm.detach().cpu().numpy(),source_sha256=provenance['hashes']['static_volume'])
         if out.exists(): shutil.rmtree(out)
         out.mkdir(parents=True)
         for step,rows in all_rows.items():
@@ -142,9 +151,12 @@ def main():
                 (surrogate_stage if args.stage=='surrogate' else coherence_stage)(rows,dest)
             else:
                 load_checkpoint(checkpoints[step],step,config,provenance,model)
-                if args.stage=='dvf': dvf_stage(model,rows,dest,step,sha256(checkpoints[step]),args.chunk_size)
+                if args.stage=='dvf':
+                    dvf_stage(model,rows,dest,step,checkpoint_hashes_before[step],args.chunk_size)
+                    anatomy_overlay_stage(model,rows,dest,step,checkpoint_hashes_before[step],args.chunk_size,*crop_data)
                 else: withheld_stage(model,rows,dest,step,args.chunk_size)
-        if args.stage == 'dvf': compare_sax_fields(out, sorted(checkpoints))
+        if args.stage == 'dvf': compare_anatomy_sax(out, sorted(checkpoints))
+        if any(output_sha256(path)!=checkpoint_hashes_before[step] for step,path in checkpoints.items()): raise RuntimeError('checkpoint bytes changed during analysis')
         files=sorted(str(p.relative_to(out)) for p in out.rglob('*') if p.is_file())
         manifest={'stage':args.stage,'timestamp':datetime.now(timezone.utc).isoformat(),'git_sha':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),'checkpoints':{str(step):{'path':str(path.resolve()),'sha256':sha256(path)} for step,path in checkpoints.items()},'input_artifact_sha256':provenance['hashes'],'output_files':files+['stage_manifest.json','stage_report.json'],'output_sha256':{name:output_sha256(out/name) for name in files},'analysis_policy':'posterior mean; image-derived surrogate is not respiratory ground truth; mutual nearest temporal pairs'}
         (out/'stage_manifest.json').write_text(json.dumps(manifest,indent=2)); (out/'stage_report.json').write_text(json.dumps({'stage':args.stage,'policy':manifest['analysis_policy']},indent=2))
@@ -181,6 +193,8 @@ def main():
             np.savez_compressed(dest/'pca_basis.npz',basis=result['basis'],eigenvalues=result['eigenvalues'],explained_variance_ratios=result['explained_variance_ratios'])
             (dest/'pca_summary.json').write_text(json.dumps({'rank95':result['rank95'],'eigenvalues':result['eigenvalues'].tolist(),'explained_variance_ratios':result['explained_variance_ratios'].tolist(),'latent_dynamic_rms':result['latent_dynamic_rms'],'audit_recomputed_minus_checkpoint':diffs},indent=2,allow_nan=False))
             save_latent_figures(rows,result['explained_variance_ratios'],dest)
+            save_periodicity_figures(rows,dest)
+    if any(output_sha256(path)!=checkpoint_hashes_before[step] for step,path in checkpoints.items()): raise RuntimeError('checkpoint bytes changed during analysis')
     files=sorted(str(p.relative_to(out)) for p in out.rglob('*') if p.is_file())
     manifest={'stage':args.stage,'timestamp':datetime.now(timezone.utc).isoformat(),'git_sha':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),'checkpoints':{str(step):{'path':str(path.resolve()),'sha256':sha256(path)} for step,path in checkpoints.items()},'input_artifact_sha256':provenance['hashes'],'output_files':files+['stage_manifest.json','stage_report.json'],'output_sha256':{name:output_sha256(out/name) for name in files},'analysis_policy':'read-only posterior mean; no respiratory ground truth'}
     (out/'stage_manifest.json').write_text(json.dumps(manifest,indent=2)); (out/'stage_report.json').write_text(json.dumps({'stage':args.stage,'checkpoints':list(checkpoints),'policy':manifest['analysis_policy']},indent=2))

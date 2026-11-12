@@ -87,33 +87,10 @@ def dvf_stage(model,rows,dest,step,checkpoint_sha,chunk_size):
             arrays[(view,state)]=field
             selected.append({'checkpoint_step':step,'view':view,'slice_id':row['slice_id'],'state':state,'dynamic_frame_id':row['dynamic_frame_id'],'timestamp_s':row['timestamp_s'],'pc1':row['pc1'],'pc1_percentile_target':{'low':.1,'mid':.5,'high':.9}[state]})
             state_stats.append({'checkpoint_step':step,'view':view,'slice_id':row['slice_id'],'state':state,'timestamp_s':row['timestamp_s'],'pc1':row['pc1'],'mean_dvf_mm':float(magnitude.mean()),'rms_dvf_mm':float(np.sqrt(np.mean(magnitude**2))),'p95_dvf_mm':float(np.quantile(magnitude,.95)),'max_dvf_mm':float(magnitude.max()),'jacobian_mean':float(det.mean()),'jacobian_p01':float(np.quantile(det,.01)),'jacobian_min':float(det.min()),'folding_fraction':float(np.mean(det<=0)),'cycle_mean_mm':float(cycle.mean()),'cycle_p95_mm':float(np.quantile(cycle,.95)),'cycle_max_mm':float(cycle.max())})
-            if view=='SAX':
-                origin,sp,shape=volume_grid(lower,upper,spacing); vol=render_volume(model,code,origin,sp,shape,chunk_size); volumes[state]=vol
-                vdir=dest/'volumes'; vdir.mkdir(exist_ok=True); path=vdir/f'SAX_{state}_pc1.nii.gz'; save_lps_nifti(path,vol,origin,sp)
-                json_write(vdir/f'SAX_{state}_pc1.json',{'checkpoint':step,'checkpoint_sha256':checkpoint_sha,'view':view,'slice_id':row['slice_id'],'dynamic_frame_id':row['dynamic_frame_id'],'timestamp_s':row['timestamp_s'],'pc1':row['pc1'],'world_bounds_lps_mm':[lower.tolist(),upper.tolist()],'spacing_mm':sp.tolist(),'axis_convention':'array xyz in external patient LPS; NIfTI affine maps indices to RAS','rendering_convention':'external observation world -> forward deformation -> frozen canonical'})
     if not selected: raise ValueError('DVF stage requires a location with at least five frames')
     write_csv(dest/'selected_states.csv',selected); write_csv(dest/'dvf_state_summary.csv',state_stats)
     np.savez_compressed(dest/'dvf_plane_data.npz',**{f'{v}_{s}':a for (v,s),a in arrays.items()},lower_lps_mm=lower,upper_lps_mm=upper)
-    vmax=max(float(np.linalg.norm(a,axis=-1).max()) for a in arrays.values()) or 1.
-    for view in ('SAX','2CH','4CH'):
-        if (view,'low') not in arrays: continue
-        fig,axes_plot=plt.subplots(3,3,figsize=(12,11))
-        for i,state in enumerate(('low','mid','high')):
-            a=arrays[(view,state)]; info=next(r for r in state_stats if r['view']==view and r['state']==state)
-            for j,(plane,components) in enumerate(((a[:,:,8,:],(0,1)),(a[:,8,:,:],(0,2)),(a[8,:,:,:],(1,2)))):
-                ax=axes_plot[i,j]; mag=np.linalg.norm(plane,axis=-1); ax.imshow(mag.T,origin='lower',vmin=0,vmax=vmax,cmap='viridis'); q=np.arange(0,16,3); x,y=np.meshgrid(q,q,indexing='ij'); ax.quiver(x,y,plane[x,y,components[0]],plane[x,y,components[1]],color='white',scale=1); ax.set_title(f"{step} {view}/{info['slice_id']} {state} t={info['timestamp_s']:.2f} PC1={info['pc1']:.2f}\nRMS={info['rms_dvf_mm']:.2f} max={info['max_dvf_mm']:.2f} mm")
-        fig.savefig(dest/f'{view}_dvf_states.png',dpi=180,bbox_inches='tight'); plt.close(fig)
-    if len(volumes)==3:
-        fig,panels=plt.subplots(3,3,figsize=(10,10))
-        for i,state in enumerate(('low','mid','high')):
-            vol=volumes[state]; mid=np.array(vol.shape)//2
-            for j,plane in enumerate((vol[:,:,mid[2]],vol[:,mid[1],:],vol[mid[0],:,:])):
-                panels[i,j].imshow(plane.T,origin='lower',cmap='gray',vmin=0,vmax=1); panels[i,j].set_title(f'{state} {("axial","coronal","sagittal")[j]} (LPS axes)')
-        fig.savefig(dest/'01_dynamic_volume_low_mid_high.png',dpi=180,bbox_inches='tight'); plt.close(fig)
-        diff=volumes['high']-volumes['low']; mid=np.array(diff.shape)//2; vmax_diff=float(np.max(np.abs(diff))) or 1.
-        fig,panels=plt.subplots(1,3,figsize=(10,3))
-        for ax,plane in zip(panels,(diff[:,:,mid[2]],diff[:,mid[1],:],diff[mid[0],:,:])): ax.imshow(plane.T,origin='lower',cmap='coolwarm',vmin=-vmax_diff,vmax=vmax_diff)
-        fig.savefig(dest/'02_dynamic_volume_high_minus_low.png',dpi=180,bbox_inches='tight'); plt.close(fig)
+    # The coarse 16³ field is retained for numerical continuity only.
     return state_stats
 
 

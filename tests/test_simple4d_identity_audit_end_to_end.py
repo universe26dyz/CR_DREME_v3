@@ -63,15 +63,41 @@ def test_synthetic_all_stages(tmp_path,monkeypatch):
             cohort.append((view,str(li),tuple(frames))); groups.append(np.stack(group))
     pca=global_latent_pca(groups); diag={k:.2 for k in cli.SUMMARY_FIELDS}
     diag.update({'latent_dynamic_pc1_explained_variance_ratio':float(pca['explained_variance_ratios'][0]),'latent_dynamic_pc2_explained_variance_ratio':float(pca['explained_variance_ratios'][1]),'latent_dynamic_rank_95pct':pca['rank95'],'latent_mu_dynamic_rms':pca['latent_dynamic_rms'],'static_baseline_sampled_mse_full':1.,'diagnostic_sampled_reconstruction_mse_full':.8})
-    monkeypatch.setattr(cli,'load_inputs',lambda args: ({},{'hashes':{'x':'y'}},model,cohort))
+    static_path=tmp_path/'static.nii.gz'
+    nib.save(nib.Nifti1Image(np.ones((3,3,3),dtype=np.float32),np.diag([-2.,-2.,2.,1.])),static_path)
+    static_manifest=tmp_path/'static.json'; static_manifest.write_text(json.dumps({'outputs':{'volume':{'path':str(static_path)}}}))
+    monkeypatch.setattr(cli,'load_inputs',lambda args: ({},{'hashes':{'static_volume':cli.output_sha256(static_path)}},model,cohort))
     monkeypatch.setattr(cli,'load_checkpoint',lambda path,step,config,prov,model: {'diagnostics':{f'step_{step}':diag}})
     run=tmp_path/'run'; run.mkdir(); (run/'checkpoint_step_2000.pt').write_bytes(b'unchanged'); out=tmp_path/'out'
-    monkeypatch.setattr(sys,'argv',['audit','--manifest','m','--qc-table','q','--canonical-domain','d','--static-manifest','s','--run-dir',str(run),'--output-dir',str(out),'--checkpoint-steps','2000','--stage','all','--chunk-size','1024'])
+    monkeypatch.setattr(sys,'argv',['audit','--manifest','m','--qc-table','q','--canonical-domain','d','--static-manifest',str(static_manifest),'--run-dir',str(run),'--output-dir',str(out),'--checkpoint-steps','2000','--stage','all','--chunk-size','1024'])
     cli.main()
     for name in ('00_summary','01_latent','02_surrogate','03_coherence','04_dvf','05_withheld'):
         assert (out/name/'stage_manifest.json').exists()
         assert list((out/name).rglob('*.png'))
+    latent=out/'01_latent/step_2000'
+    for name in ('06_pc1_relative_time_SAX.png','09_pc1_periodogram_SAX.png','12_pc1_autocorrelation_SAX.png','periodicity_by_location.csv','periodicity_summary.json'):
+        assert (latent/name).stat().st_size > 0
+    latent_manifest=json.loads((out/'01_latent/stage_manifest.json').read_text())
+    for name,digest in latent_manifest['output_sha256'].items():
+        if name.endswith(('.csv','.json')): assert cli.output_sha256(out/'01_latent'/name)==digest
     assert (out/'audit_report.md').exists() and (out/'comparison/checkpoint_comparison.json').exists()
     assert json.loads((out/'audit_manifest.json').read_text())['recommended_authority_checkpoint'] is None
     assert (out/'04_dvf/step_2000/volumes/SAX_low_pc1.nii.gz').exists()
+    dvf=out/'04_dvf/step_2000'
+    for view in ('SAX','2CH','4CH'):
+        assert (dvf/f'{view}_dvf_magnitude_overlay.png').stat().st_size > 0
+        assert (dvf/f'{view}_dvf_high_minus_low_overlay.png').stat().st_size > 0
+        for state in ('low','mid','high'):
+            assert (dvf/f'{view}_dvf_components_{state}.png').stat().st_size > 0
+    assert (out/'04_dvf/comparison_SAX_dvf_magnitude_overlay.png').exists()
+    assert (out/'04_dvf/comparison_SAX_high_minus_low.png').exists()
+    manifest=json.loads((out/'04_dvf/stage_manifest.json').read_text())
+    for name,digest in manifest['output_sha256'].items():
+        if name.endswith(('.csv','.json')): assert cli.output_sha256(out/'04_dvf'/name) == digest
+    with np.load(dvf/'SAX_anatomy_overlay_data.npz') as data:
+        low=data['low_field_planes_axial']; high=data['high_field_planes_axial']
+        assert low.shape == high.shape and low.shape[:2] != (16,16)
+        assert low.shape[:2] == data['low_image_planes_axial'].shape == data['low_mask_planes_axial'].shape
+        assert np.allclose(np.linalg.norm(high-low,axis=-1),np.linalg.norm((high-low)[0,0]),atol=1e-7)
+    assert (dvf/'dvf_anatomy_summary.csv').exists() and (dvf/'crop_manifest.json').exists()
     assert (run/'checkpoint_step_2000.pt').read_bytes()==b'unchanged'

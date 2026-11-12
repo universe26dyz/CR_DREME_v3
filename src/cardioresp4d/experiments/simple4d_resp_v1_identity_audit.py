@@ -149,3 +149,39 @@ def coherence_summary(rows, coverage, threshold):
         if len(rows)>=2: result.update(correlation(a,b))
         result.update({'mean_abs_pc1_z_difference':float(np.abs(diff).mean()),'median_abs_pc1_z_difference':float(np.median(np.abs(diff))),'rmse_pc1_z_difference':float(np.sqrt(np.mean(diff**2))),'median_abs_delta_t_s':float(np.median(dt)),'p95_abs_delta_t_s':float(np.quantile(dt,.95))})
     return result
+
+
+# Audit search window only; it is not a physiological ground-truth range.
+PERIODICITY_FREQUENCY_HZ = (0.05, 0.6)
+PERIODICITY_MIN_FRAMES = 6
+
+
+def periodicity_analysis(timestamps, values):
+    """Timestamp-aware Lomb–Scargle and interpolated, visualization-only ACF."""
+    from scipy.signal import lombscargle, find_peaks, correlate
+    t=np.asarray(timestamps,dtype=float)
+    if values is None:
+        values=np.full(len(t),np.nan)
+    y=np.asarray(values,dtype=float)
+    if t.ndim != 1 or y.shape != t.shape or not np.isfinite(t).all():
+        raise ValueError('timestamps and scores must be matching one-dimensional arrays')
+    order=np.argsort(t,kind='stable'); t=t[order]; y=y[order]
+    relative=t-t[0] if len(t) else t
+    result={'frame_count':len(t),'duration_s':float(relative[-1]) if len(t) else 0.,'median_dt_s':float(np.median(np.diff(t))) if len(t)>1 else None,'dominant_frequency_hz':None,'dominant_period_s':None,'dominant_peak_power':None,'autocorrelation_peak_lag_s':None,'excluded':True,'exclusion_reason':None,'detectable_peak':False}
+    empty={'relative_time_s':relative,'frequencies_hz':np.array([]),'power':np.array([]),'acf_lags_s':np.array([]),'acf':np.array([])}
+    if len(t)<PERIODICITY_MIN_FRAMES: result['exclusion_reason']='too_few_frames'; return result,empty
+    if np.any(np.diff(t)<=0): result['exclusion_reason']='non_increasing_timestamps'; return result,empty
+    if not np.isfinite(y).all() or np.std(y)<=1e-12: result['exclusion_reason']='missing_or_low_variance'; return result,empty
+    if relative[-1] < 1/PERIODICITY_FREQUENCY_HZ[1]: result['exclusion_reason']='duration_too_short'; return result,empty
+    frequencies=np.linspace(*PERIODICITY_FREQUENCY_HZ,1024)
+    centered=y-y.mean(); power=lombscargle(relative,centered,2*np.pi*frequencies,precenter=False,normalize=True)
+    if not np.isfinite(power).all(): result['exclusion_reason']='invalid_spectrum'; return result,empty
+    index=int(np.argmax(power)); frequency=float(frequencies[index])
+    result.update({'dominant_frequency_hz':frequency,'dominant_period_s':1/frequency,'dominant_peak_power':float(power[index]),'excluded':False,'detectable_peak':bool(len(find_peaks(power)[0]) > 0 and 0 < index < len(power)-1)})
+    n=min(4096,max(2,int(np.floor(relative[-1]/result['median_dt_s']))+1))
+    uniform=np.linspace(0,relative[-1],n); interp=np.interp(uniform,relative,centered); interp-=interp.mean()
+    acf=correlate(interp,interp,mode='full',method='fft')[n-1:]; acf=acf/acf[0] if acf[0]>1e-20 else np.zeros(n)
+    lags=uniform-uniform[0]; peaks,_=find_peaks(acf)
+    peaks=[p for p in peaks if lags[p]>=1/PERIODICITY_FREQUENCY_HZ[1] and lags[p]<=min(1/PERIODICITY_FREQUENCY_HZ[0],relative[-1]/2) and acf[p]>0]
+    if peaks: result['autocorrelation_peak_lag_s']=float(lags[max(peaks,key=lambda p:acf[p])])
+    return result,{'relative_time_s':relative,'frequencies_hz':frequencies,'power':power,'acf_lags_s':lags,'acf':acf}

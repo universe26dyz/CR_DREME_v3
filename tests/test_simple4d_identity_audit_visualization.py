@@ -36,7 +36,7 @@ def test_summary_and_latent_stage_smoke(tmp_path, monkeypatch):
         dest=out/('00_summary' if stage=='summary' else '01_latent')
         assert (dest/'stage_manifest.json').exists()
         assert all(p.stat().st_size>0 for p in dest.rglob('*.png'))
-        assert len(list(dest.rglob('*.png'))) == 5
+        assert len(list(dest.rglob('*.png'))) == (5 if stage == 'summary' else 14)
         assert json.loads((dest/'stage_manifest.json').read_text())['checkpoints']['2000']['sha256'] == cli.sha256(run/'checkpoint_step_2000.pt')
     assert (run/'checkpoint_step_2000.pt').read_bytes() == b'unchanged'
 

@@ -58,3 +58,49 @@ def save_latent_figures(rows, ratios, output):
     for view,marker in zip(views,('o','s','^')):
         selected=[r for r in rows if r['view']==view]; ax.scatter([r['pc1'] for r in selected],[r['pc2'] for r in selected],s=8,marker=marker,alpha=.5,label=view)
     ax.set(xlabel='Centered latent PC1',ylabel='Centered latent PC2'); ax.legend(); fig.savefig(output/'05_pc1_pc2_scatter.png',dpi=180,bbox_inches='tight'); plt.close(fig)
+
+
+def save_periodicity_figures(rows, output):
+    """Write deterministic location-level temporal audit and figure backing data."""
+    import csv, json
+    from cardioresp4d.experiments.simple4d_resp_v1_identity_audit import periodicity_analysis, PERIODICITY_FREQUENCY_HZ
+    groups={}
+    for row in rows: groups.setdefault((row['view'],row['slice_id']),[]).append(row)
+    details=[]; series={}
+    for (view,location),group in sorted(groups.items()):
+        group=sorted(group,key=lambda r:r['timestamp_s']); t=[r['timestamp_s'] for r in group]
+        z=[float(r['pc1_location_z']) if r['pc1_location_z'] is not None else float('nan') for r in group]
+        result,arrays=periodicity_analysis(t,z)
+        details.append({'view':view,'slice_id':location,'normalized_slice_position':group[0]['normalized_slice_position'],**result})
+        series[(view,location)]=(group,result,arrays)
+    with (output/'periodicity_by_location.csv').open('w',newline='') as f:
+        writer=csv.DictWriter(f,fieldnames=list(details[0])); writer.writeheader(); writer.writerows(details)
+    summaries={}
+    for view in ('SAX','2CH','4CH','ALL'):
+        selected=[r for r in details if view=='ALL' or r['view']==view]; valid=[r for r in selected if not r['excluded']]
+        def stat(key,q):
+            vals=[r[key] for r in valid if r[key] is not None]
+            return float(np.quantile(vals,q)) if vals else None
+        summaries[view]={'location_count':len(selected),'valid_location_count':len(valid),'median_dominant_frequency_hz':stat('dominant_frequency_hz',.5),'frequency_iqr_hz':[stat('dominant_frequency_hz',.25),stat('dominant_frequency_hz',.75)],'median_dominant_period_s':stat('dominant_period_s',.5),'period_iqr_s':[stat('dominant_period_s',.25),stat('dominant_period_s',.75)],'median_peak_strength':stat('dominant_peak_power',.5),'fraction_with_detectable_peak':sum(r['detectable_peak'] for r in valid)/len(valid) if valid else None}
+    (output/'periodicity_summary.json').write_text(json.dumps({'search_frequency_hz':list(PERIODICITY_FREQUENCY_HZ),'interpretation':'periodicity evidence only; not respiratory ground truth','views':summaries},indent=2,allow_nan=False)+'\n')
+    for view_index,view in enumerate(('SAX','2CH','4CH')):
+        choices=representative_locations([(r['slice_id'],r['normalized_slice_position']) for r in details if r['view']==view])
+        for plot_index,kind in enumerate(('relative_time','periodogram','autocorrelation')):
+            fig,axes=plt.subplots(max(1,len(choices)),1,figsize=(9,3*max(1,len(choices))),squeeze=False)
+            for ax,location in zip(axes[:,0],choices):
+                group,info,arrays=series[(view,location)]
+                if kind=='relative_time':
+                    values=[r['pc1_location_z'] if r['pc1_location_z'] is not None else np.nan for r in group]
+                    ax.plot(arrays['relative_time_s'],values,'.-'); ax.set(xlabel='Relative time (s)',ylabel='PC1 location z')
+                elif kind=='periodogram':
+                    ax.plot(arrays['frequencies_hz'],arrays['power']); ax.set(xlabel='Frequency (Hz)',ylabel='Normalized Lomb–Scargle power')
+                    if info['dominant_frequency_hz'] is not None:
+                        ax.axvline(info['dominant_frequency_hz'],color='C3',linestyle='--',label=f"{info['dominant_frequency_hz']:.3f} Hz / {info['dominant_period_s']:.2f} s"); ax.legend()
+                else:
+                    ax.plot(arrays['acf_lags_s'],arrays['acf']); ax.set(xlabel='Lag (s)',ylabel='Normalized ACF')
+                    if info['autocorrelation_peak_lag_s'] is not None: ax.axvline(info['autocorrelation_peak_lag_s'],color='C3',linestyle='--')
+                ax.set_title(f"{view}/{location} position={group[0]['normalized_slice_position']:.3f} N={info['frame_count']} duration={info['duration_s']:.1f}s" + (f" — excluded: {info['exclusion_reason']}" if info['excluded'] else ''))
+                ax.grid(alpha=.2)
+                np.savez_compressed(output/f'periodicity_{view}_{str(location).replace("/","_")}.npz',**arrays)
+            number=6+view_index+3*plot_index
+            fig.savefig(output/f'{number:02d}_pc1_{kind}_{view}.png',dpi=180,bbox_inches='tight'); plt.close(fig)
