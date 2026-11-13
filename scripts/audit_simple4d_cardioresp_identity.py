@@ -137,11 +137,15 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--audit-root',type=Path,required=True); parser.add_argument('--run-dir',type=Path,required=True)
     parser.add_argument('--checkpoint-steps',type=int,nargs='+',default=[2000,5000,10000]); parser.add_argument('--device',default='cpu'); parser.add_argument('--chunk-size',type=int,default=4096)
-    parser.add_argument('--stage',choices=['pure_pc1','motion_decomposition','residual','report','all'],required=True); parser.add_argument('--cardiac-box-config',type=Path)
+    parser.add_argument('--stage',choices=['pure_pc1','motion_decomposition','residual','report','frequency_bands','all'],required=True); parser.add_argument('--cardiac-box-config',type=Path)
     parser.add_argument('--overwrite-stage',action='store_true')
     args=parser.parse_args(); args.device=torch.device(args.device); args.checkpoint_steps=sorted(args.checkpoint_steps)
     if args.chunk_size<=0 or not args.checkpoint_steps or len(set(args.checkpoint_steps))!=len(args.checkpoint_steps) or min(args.checkpoint_steps)<=0: parser.error('invalid chunk size or checkpoint list')
     args.output_root=args.audit_root/'07_cardioresp_identity'
+    if args.stage=='frequency_bands':
+        from cardioresp4d.experiments.simple4d_dual_band_periodicity import frequency_stage
+        frequency_stage(args.audit_root,args.checkpoint_steps,overwrite=args.overwrite_stage)
+        return
     if args.stage=='all':
         original=list(sys.argv)
         try:

@@ -1,0 +1,78 @@
+experiment:
+  name: simple4d_resp_v1
+  respiratory_only: true
+  stage: R1
+  mode: joint_canonical_motion_refinement
+data:
+  normalization: per_series
+reproducibility:
+  model_seed: 6
+  sampler_seed: 12
+training:
+  observations_per_update: 8
+  pixel_samples_per_observation: 10000
+  boundaries:
+    r1_short: 1000
+    r1_diagnostic: 2000
+    r1_mid: 5000
+    r1_formal: 10000
+  optimizer:
+    type: adam
+    encoder_lr: 5.0e-05
+    forward_deformation_lr: 5.0e-05
+    inverse_deformation_lr: 5.0e-05
+    canonical_lr: 2.0e-05
+  scheduler:
+    type: step
+    step_size: 5000
+    gamma: 0.5
+encoder:
+  source: vendored_simple4d
+  type: MotionCodeVAE
+  code_dim: 32
+  base_channels: 32
+  position_embedding_dim: 32
+  view_embedding_dim: 8
+  dropout: 0.1
+deformation:
+  source: vendored_simple4d
+  type: DeformCodeAdaptive
+  hidden_dims:
+  - 256
+  - 256
+  - 256
+  - 256
+  omega: 7
+  residual: false
+  bidirectional: true
+  expected_reference_spacing_mm:
+  - 1.0
+  - 1.0
+  - 1.0
+loss:
+  photometric: l1
+  kl_weight: 0.001
+  jacobian_weight: 0.0001
+  magnitude_weight: 0.01
+  cycle_weight: 0.1
+  regularizer_ramp_slope: 0.2
+  regularizer_ramp_max: 10.0
+canonical:
+  source: r0_checkpoint_nesvor_initialized
+  r1_trainable: true
+  bootstrap_config: respiratory_s2vdreme_reference_v1.yaml
+renderer:
+  type: existing_nesvor_psf
+  psf_samples: 8
+disabled:
+- reference_gauge
+- score_gain
+- respiratory_mbc
+- cardiac
+- uncertainty
+- groupwise
+source_r0:
+  allowed_steps:
+  - 2000
+  - 10000
+  load_model_weights_only: true

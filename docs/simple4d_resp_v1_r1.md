@@ -1,0 +1,11 @@
+# SIMPLE-4D R1 joint refinement
+
+R0 froze the static NeSVoR canonical to isolate whether the existing encoder and deformation model can represent dynamics. R1 initializes exactly from an admitted R0 step 2000 or 10000 model state and unfreezes that same canonical. It retains the encoder, bidirectional deformation, corrected geometry, observation sampling, NeSVoR PSF and losses. R1 does not explicitly disentangle respiratory and cardiac latents.
+
+Both source conditions load model weights only, reset the R1 torch/model seed to 6 after loading and create a fresh sampler seeded 12. Adam has one canonical group at 2e-5 and three motion groups at 5e-5. StepLR uses 5000 R1-local updates and gamma 0.5. R1 starts at joint step zero irrespective of its source step; the existing loss ramp also uses this R1-local step. Metrics record LR before each optimizer/scheduler step.
+
+R1 checkpoints contain the model, optimizer, scheduler, sampler, RNG, local step, source step/hash, effective configuration, source and input provenance, diagnostics and initial canonical parameters for drift computation. Resume validates the source, inputs and configuration before restoring R1 state. The source R0 file is hashed before and after training and is never overwritten. Boundary diagnostics use the existing deterministic cohort and distinguish current R1 canonical no-motion reconstruction from the stored source static NeSVoR baseline. Canonical drift reports initial/current hashes, parameter norm, delta norm and relative delta; no full-volume diagnostic is performed per update.
+
+The CSV-only `frequency_bands` audit reads existing motion-decomposition CSVs. It uses timestamp-aware normalized Lomb–Scargle in respiratory 0.10–0.60 Hz and cardiac-candidate 0.80–2.00 Hz bands. Median-spacing Nyquist is an estimate for irregular acquisitions; unavailable bands are reported rather than assigned a peak. A cardiac-candidate peak does not establish cardiac identity. Per-step and comparison outputs record CSV or summary hashes.
+
+The first real runs should stop at R1-local 1000 from each source (2000 and 10000); review reconstruction, canonical drift, latent, DVF, Jacobian and cycle before resuming to 2000. No real server training is executed by the local tests.
