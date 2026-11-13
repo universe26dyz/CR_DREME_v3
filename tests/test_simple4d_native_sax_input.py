@@ -20,9 +20,56 @@ def test_native_sax_roundtrip(tmp_path):
 
 
 def test_reject_irregular_geometry():
-    items=[obs('SAX','a',0,1,1),obs('SAX','b',2,2,2),obs('SAX','c',5,3,3)]
+    items=[obs('SAX',str(i),z,i,i) for i,z in enumerate((0,2,5,7))]
     with pytest.raises(ValueError,match='uniformly spaced'): build_native_sax_series(items)
     with pytest.raises(ValueError,match='aligned'): build_native_sax_series([items[0],replace(items[1],center_mm=torch.tensor([1.,0.,2.]))])
+    with pytest.raises(ValueError,match='orientation'): build_native_sax_series([items[0],replace(items[1],row_direction=torch.tensor([0.,1.,0.]))])
+
+
+@pytest.mark.parametrize('positions,expected,missing',[
+    ([0,2,4,6],[0,1,2,3],[]),
+    ([0,2,4,8,10],[0,1,2,4,5],[3]),
+    ([0,4,6,10],[0,2,3,5],[1,4]),
+])
+def test_nominal_lattice_roundtrip(tmp_path,positions,expected,missing):
+    from third_party.simple4d.simple4d.coords import make_slice_coords
+    items=[obs('SAX',str(i),z,i,i) for i,z in enumerate(positions)]
+    series,metadata=build_native_sax_series(items)
+    path=tmp_path/'lattice.npz'; save_native_npz(series,path); loaded=SliceSeries.load(path)
+    assert loaded.spacing[0]==pytest.approx(2.) and loaded.num_positions==expected[-1]+1
+    assert loaded.slice_index.tolist()==expected and metadata['missing_slice_indices']==missing
+    assert metadata['observed_slice_indices']==expected and metadata['num_observed_positions']==len(positions)
+    assert len(loaded)==len(positions) and not metadata['interpolation_used'] and not metadata['synthetic_slices_created']
+    coords=make_slice_coords((len(loaded),8,8),torch.from_numpy(loaded.slice_index),8,loaded.num_positions)
+    assert coords.shape==(len(loaded),64,3) and torch.isfinite(coords).all()
+
+
+def test_builder_uses_nominal_geometry_and_binds_corrected_pose(tmp_path,monkeypatch):
+    import hashlib,importlib.util,json,sys
+    from pathlib import Path
+    from cardioresp4d.experiments import respiratory_s2vdreme_reference_v1 as corrected
+    root=Path(__file__).resolve().parents[1]
+    spec=importlib.util.spec_from_file_location('native_sax_builder',root/'scripts/build_simple4d_native_sax_input.py')
+    builder=importlib.util.module_from_spec(spec); spec.loader.exec_module(builder)
+    files={name:tmp_path/name for name in ('manifest','qc','pose')}
+    for name,path in files.items(): path.write_text(name)
+    digest=lambda path:hashlib.sha256(path.read_bytes()).hexdigest()
+    static=tmp_path/'static.json'; static.write_text(json.dumps({'source_manifest_sha256':digest(files['manifest']),'qc_table_sha256':digest(files['qc']),'corrected_pose_manifest':{'path':str(files['pose']),'sha256':digest(files['pose'])}}))
+    items=[obs('SAX',str(i),z,i,i) for i,z in enumerate((0,2,4,8,10))]
+    monkeypatch.setattr(builder,'observations_from_manifest',lambda *args,**kwargs:(items,{},[]))
+    def forbidden(*args,**kwargs): raise AssertionError('corrected poses must not be applied to S0')
+    monkeypatch.setattr(corrected,'load_corrected_pose_map',forbidden)
+    monkeypatch.setattr(corrected,'apply_corrected_static_poses',forbidden)
+    output=tmp_path/'out'
+    monkeypatch.setattr(sys,'argv',['builder','--manifest',str(files['manifest']),'--qc-table',str(files['qc']),'--static-manifest',str(static),'--output-dir',str(output)])
+    builder.main(); manifest=json.loads((output/'input_adapter_manifest.json').read_text())
+    assert manifest['geometry_source']=='nominal_acquisition_geometry' and manifest['corrected_pose_applied'] is False
+    assert manifest['corrected_pose_role']=='provenance_only_not_applied_to_s0_geometry'
+    assert manifest['source_sha256']['corrected_pose_manifest']==digest(files['pose'])
+    assert manifest['missing_slice_indices']==[3] and SliceSeries.load(output/'sax_input.npz').num_positions==6
+    files['pose'].write_text('changed')
+    monkeypatch.setattr(sys,'argv',['builder','--manifest',str(files['manifest']),'--qc-table',str(files['qc']),'--static-manifest',str(static),'--output-dir',str(tmp_path/'bad')])
+    with pytest.raises(ValueError,match='binding mismatch'): builder.main()
 
 
 def test_native_upstream_step_and_resume(tmp_path,monkeypatch):

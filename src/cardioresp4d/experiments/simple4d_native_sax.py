@@ -9,10 +9,9 @@ import numpy as np
 def build_native_sax_series(observations, *, geometry_tolerance_mm=1e-3, direction_tolerance=1e-4):
     """Return an upstream-compatible series and an auditable frame mapping.
 
-    Upstream assumes equally spaced, parallel images on a regular stack. Corrected
-    pose metadata is used to check this assumption; arbitrary LPS planes are not
-    carried into the upstream model. No interpolation or geometric correction is
-    performed here.
+    Observations use nominal acquisition geometry. Upstream assumes a regular,
+    parallel stack; observed positions may be a subset of its lattice. No image
+    interpolation or geometric correction is performed here.
     """
     from third_party.simple4d.simple4d.data import SliceSeries
     frames=[o for o in observations if o.qc_valid and o.view.upper()=='SAX']
@@ -40,30 +39,38 @@ def build_native_sax_series(observations, *, geometry_tolerance_mm=1e-3, directi
             if image.shape!=shape or not np.isfinite(image).all() or np.any((image<0)|(image>1)):
                 raise ValueError('SAX images must share shape and be finite in [0,1]')
             if not np.isfinite(item.timestamp_s) or not np.isfinite(center_i).all() or not np.allclose(center_i,center,atol=geometry_tolerance_mm,rtol=0):
-                raise ValueError('location frames require finite timestamps and identical corrected centers')
+                raise ValueError('location frames require finite timestamps and identical nominal centers')
             if any(not np.allclose(array(getattr(item,key)),ref,atol=direction_tolerance,rtol=0) for key,ref in (('row_direction',row),('column_direction',column),('normal',normal))):
-                raise ValueError('native SAX requires common corrected orientation')
-            if not np.allclose(array(item.pixel_spacing_mm),spacing,atol=geometry_tolerance_mm,rtol=0) or abs(float(item.slice_thickness_mm)-thickness)>geometry_tolerance_mm:
+                raise ValueError('native SAX requires common nominal orientation')
+            if not np.allclose(array(item.pixel_spacing_mm),spacing,atol=geometry_tolerance_mm,rtol=0) or not np.isfinite(float(item.slice_thickness_mm)) or abs(float(item.slice_thickness_mm)-thickness)>geometry_tolerance_mm:
                 raise ValueError('native SAX requires constant in-plane spacing and thickness')
         locations.append((float(center@normal),slice_id,center))
     locations.sort(key=lambda value:(value[0],value[1]))
     positions=np.array([v[0] for v in locations]); gaps=np.diff(positions)
-    if np.any(gaps<=geometry_tolerance_mm) or not np.allclose(gaps,gaps[0],atol=geometry_tolerance_mm,rtol=1e-4):
-        raise ValueError('native SAX requires distinct uniformly spaced locations')
+    if np.any(gaps<=geometry_tolerance_mm):
+        raise ValueError('native SAX requires distinct positions on a uniformly spaced lattice')
+    # Estimate the smallest routinely observed gap without averaging missing gaps.
+    base_spacing=float(np.median(np.sort(gaps)[:max(1,len(gaps)//2)]))
+    lattice_indices=np.rint((positions-positions[0])/base_spacing).astype(np.int64)
+    fit_error=np.abs(positions-(positions[0]+lattice_indices*base_spacing))
+    gap_error=np.abs(gaps-np.diff(lattice_indices)*base_spacing)
+    if np.any(np.diff(lattice_indices)<=0) or np.any(fit_error>geometry_tolerance_mm) or np.any(gap_error>geometry_tolerance_mm):
+        raise ValueError('native SAX requires locations on a uniformly spaced lattice')
+    num_positions=int(lattice_indices[-1])+1
     reference=locations[0][2]
     for _,_,center in locations:
         delta=center-reference
         if np.linalg.norm(delta-(delta@normal)*normal)>geometry_tolerance_mm:
             raise ValueError('native SAX requires aligned in-plane centers')
-    position_for={slice_id:i for i,(_,slice_id,_) in enumerate(locations)}
+    position_for={slice_id:int(index) for (_,slice_id,_),index in zip(locations,lattice_indices)}
     ordered=sorted(frames,key=lambda item:(float(item.timestamp_s),int(item.dynamic_frame_id),str(item.slice_id)))
     ids=[int(item.dynamic_frame_id) for item in ordered]
     if len(set(ids))!=len(ids): raise ValueError('duplicate dynamic frame IDs')
     data=np.stack([array(item.image)[0] for item in ordered]).astype(np.float32)
     indices=np.array([position_for[str(item.slice_id)] for item in ordered],dtype=np.int64)
-    series=SliceSeries(data,indices,(float(gaps[0]),float(spacing[0]),float(spacing[1])),len(locations),(0,0))
+    series=SliceSeries(data,indices,(base_spacing,float(spacing[0]),float(spacing[1])),num_positions,(0,0))
     mapping=[{'upstream_frame':i,'slice_id':str(item.slice_id),'slice_index':int(indices[i]),'dynamic_frame_id':int(item.dynamic_frame_id),'timestamp_s':float(item.timestamp_s)} for i,item in enumerate(ordered)]
-    metadata={'scope':'SAX-only; upstream regular-stack coordinates, not arbitrary LPS slice geometry','slice_thickness_mm':thickness,'spacing_mm':list(series.spacing),'image_shape':list(shape[1:]),'slice_order':[v[1] for v in locations],'geometry_tolerance_mm':geometry_tolerance_mm,'direction_tolerance':direction_tolerance,'frame_mapping':mapping}
+    metadata={'scope':'SAX-only; upstream regular-stack coordinates, not arbitrary LPS slice geometry','geometry_source':'nominal_acquisition_geometry','corrected_pose_applied':False,'corrected_pose_role':'provenance_only_not_applied_to_s0_geometry','base_slice_spacing_mm':base_spacing,'num_nominal_positions':num_positions,'num_observed_positions':len(locations),'observed_slice_indices':lattice_indices.tolist(),'missing_slice_indices':sorted(set(range(num_positions))-set(lattice_indices.tolist())),'interpolation_used':False,'synthetic_slices_created':False,'projected_nominal_positions_mm':positions.tolist(),'lattice_origin_mm':float(positions[0]),'lattice_fit_max_abs_error_mm':float(fit_error.max()),'lattice_fit_median_abs_error_mm':float(np.median(fit_error)),'slice_thickness_mm':thickness,'spacing_mm':list(series.spacing),'image_shape':list(shape[1:]),'slice_order':[v[1] for v in locations],'geometry_tolerance_mm':geometry_tolerance_mm,'direction_tolerance':direction_tolerance,'frame_mapping':mapping}
     return series,metadata
 
 
