@@ -1,0 +1,26 @@
+# Main configuration of the paper (1.5 T interleaved bSSFP, 64 slice positions).
+# These values equal the defaults in simple4d/config.py and are listed for reference.
+n_holdout: 64            # last sweep held out
+iters: 10000
+batch_size: 8
+num_points: 10000
+lr_hash: 0.01
+lr_template: 2.0e-5
+lr_encoder: 5.0e-5
+lr_deform: 5.0e-5
+lr_decay_steps: 5000
+lr_decay_factor: 0.5
+seed: 6
+loader_seed: 12
+template: ngp
+encoder: vae
+code_dim: 32
+kl_weight: 1.0e-3
+conditioning: adaptive
+deform_layers: [256, 256, 256, 256]
+deform_omega: 7
+bidirectional: true
+lambda_cycle: 0.1
+lambda_jac: 1.0e-4
+lambda_mag: 1.0e-2
+thick_slice: true

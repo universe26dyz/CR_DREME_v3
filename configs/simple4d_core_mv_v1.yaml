@@ -1,0 +1,10 @@
+experiment: {name: simple4d_core_mv_v1, scope: SAX_2CH_4CH, initialization: from_scratch}
+reproducibility: {model_seed: 6, sampler_seed: 12}
+data: {normalization: per_series, observations_per_update: 8, pixel_samples_per_observation: 10000}
+canonical: {type: InstantNGPINR, ngp_levels: 16, ngp_features_per_level: 2, ngp_log2_hashmap_size: 19, ngp_base_resolution: 16, ngp_max_resolution: 512, ngp_mlp: [64, 64], required_backend: tcnn}
+encoder: {type: MotionCodeVAE, code_dim: 32, view_embedding: false}
+deformation: {type: DeformCodeAdaptive, hidden_dims: [256, 256, 256, 256], omega: 7, bidirectional: true, expected_reference_spacing_mm: [1.0, 1.0, 1.0]}
+renderer: {type: nesvor_psf, psf_samples: 8}
+optimizer: {hash_lr: 0.01, template_lr: 2.0e-5, encoder_lr: 5.0e-5, forward_lr: 5.0e-5, inverse_lr: 5.0e-5, step_size: 5000, gamma: 0.5}
+loss: {photometric: l1, kl: 1.0e-3, jacobian: 1.0e-4, magnitude: 1.0e-2, cycle: 0.1}
+boundaries: {smoke: 200, diagnostic: 2000, mid: 5000, formal: 10000}
