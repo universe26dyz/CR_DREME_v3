@@ -25,15 +25,20 @@ def test_reject_irregular_geometry():
     with pytest.raises(ValueError,match='aligned'): build_native_sax_series([items[0],replace(items[1],center_mm=torch.tensor([1.,0.,2.]))])
 
 
-def test_native_upstream_step_and_resume(tmp_path):
+def test_native_upstream_step_and_resume(tmp_path,monkeypatch):
     import copy
+    from third_party.simple4d.simple4d import networks
     from third_party.simple4d.simple4d.config import build_parser
     from third_party.simple4d.simple4d.model import SIMPLE4D
     from cardioresp4d.experiments.simple4d_native_sax import NativeSAXRunner
+    # This is a CPU fallback fixture even on hosts with CUDA and tiny-cuda-nn.
+    monkeypatch.setattr(networks,'HAS_TCNN',False)
+    monkeypatch.setattr(torch.cuda,'is_available',lambda: False)
     cfg=build_parser().parse_args([]); cfg.num_points=4; cfg.ngp_levels=2; cfg.ngp_features_per_level=2; cfg.ngp_log2_hashmap_size=5; cfg.ngp_base_resolution=2; cfg.ngp_max_resolution=4; cfg.ngp_mlp=[8]; cfg.encoder_channels=4; cfg.deform_layers=[8]*4; cfg.n_holdout=0
     rng=np.random.default_rng(2); series=SliceSeries(rng.random((4,64,64),dtype=np.float32),np.array([0,1,0,1]),(2.,1.,1.),2,(0,0))
     def make(): return SIMPLE4D(cfg,64,64,2,series.spacing,series.depth_crop)
     first=NativeSAXRunner(make(),series,np.arange(4),batch_size=2,seed=12)
+    assert first.model.device.type=='cpu' and not first.model.feature_net.use_tcnn
     assert first.update()['step']==1
     checkpoint=tmp_path/'checkpoint.pt'; torch.save(first.state_dict(),checkpoint); saved=torch.load(checkpoint,weights_only=False); first.update(); expected={key:copy.deepcopy(net.state_dict()) for key,net in first.model.networks().items()}
     resumed=NativeSAXRunner(make(),series,np.arange(4),batch_size=2,seed=12); resumed.load_state_dict(saved); resumed.update()
