@@ -89,7 +89,10 @@ def assign_normalized_slice_positions(observations: list[DynamicObservation], *,
 
 class ViewLocationBalancedSampler:
     """Choose one valid frame per view after uniformly choosing a location."""
-    def __init__(self, observations: list[DynamicObservation], *, seed: int = 0) -> None:
+    def __init__(self, observations: list[DynamicObservation], *, seed: int = 0, required_views: tuple[str, ...] = _VIEWS) -> None:
+        views = tuple(view.upper() for view in required_views)
+        if not views or len(set(views)) != len(views) or any(view not in _VIEWS for view in views):
+            raise ValueError("required views must be unique supported views")
         grouped: dict[str, dict[str, list[DynamicObservation]]] = defaultdict(lambda: defaultdict(list))
         for observation in observations:
             hard = is_hard_invalid_reason(observation.qc_reason)
@@ -99,18 +102,20 @@ class ViewLocationBalancedSampler:
                 raise ValueError("hard-invalid observation must have qc_valid=false")
             if not observation.qc_valid:
                 continue
+            if observation.view.upper() not in views:
+                raise ValueError("observation outside required views")
             grouped[observation.view.upper()][observation.slice_id].append(observation)
-        missing = [view for view in _VIEWS if not grouped[view]]
+        missing = [view for view in views if not grouped[view]]
         if missing: raise ValueError("view-balanced sampler lacks valid observations for " + ", ".join(missing))
-        self._grouped = grouped; self._rng = random.Random(seed); self._update_index = 0
+        self._grouped = grouped; self._views = views; self._rng = random.Random(seed); self._update_index = 0
 
     def sample_step(self, *, observations_per_update: int = 3) -> list[DynamicObservation]:
-        if observations_per_update < len(_VIEWS):
+        if observations_per_update < len(self._views):
             raise ValueError("observations_per_update must include every required view")
-        base, remainder = divmod(observations_per_update, len(_VIEWS))
-        extras = {_VIEWS[(self._update_index + index) % len(_VIEWS)] for index in range(remainder)}
+        base, remainder = divmod(observations_per_update, len(self._views))
+        extras = {self._views[(self._update_index + index) % len(self._views)] for index in range(remainder)}
         selected: list[DynamicObservation] = []
-        for view in _VIEWS:
+        for view in self._views:
             locations = sorted(self._grouped[view])
             for _ in range(base + int(view in extras)):
                 location = self._rng.choice(locations)

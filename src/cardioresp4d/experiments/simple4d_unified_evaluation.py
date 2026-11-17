@@ -75,6 +75,15 @@ class S05CoreMVThickSliceAdapter(ProjectAdapter):
     def __init__(self,model,checkpoint_path): super().__init__(model,checkpoint_path,'S05')
 
 
+class S05SAXAdapter(S05CoreMVThickSliceAdapter):
+    evaluation_scope='SAX-only physical corrected geometry'
+    def __init__(self,model,checkpoint_path): ProjectAdapter.__init__(self,model,checkpoint_path,'S05SAX')
+    def check_scope(self,obs):
+        if obs.view.upper() != 'SAX': raise ValueError('S05SAX is SAX-only')
+    def supports_target(self,previous,target,following,mode):
+        return all(obs.view.upper() == 'SAX' for obs in ((target,) if mode == 'v1' else (previous,target,following)))
+
+
 class S0NativeAdapter:
     evaluation_scope='SAX-only'
     psf_identity='upstream regular-stack thick-slice quadrature'
@@ -146,6 +155,15 @@ def evaluate_matched(adapters,targets,output,*,mode='v1',pairs=(),duration_ms=15
             adapter=next(a for a in adapters if a.method_id==name)
             metrics.append({'method':name,'checkpoint_sha256':adapter.checkpoint_or_model_sha256,'view':obs.view,'slice_id':str(obs.slice_id),'frame_id':obs.dynamic_frame_id,'timestamp_s':obs.timestamp_s,'mode':mode,'scope':adapter.evaluation_scope,**residual_metrics(observed,prediction)})
     write_csv(output/'frame_metrics.csv',metrics)
+    from cardioresp4d.experiments.simple4d_native_sax_collapse import temporal_stats
+    sequences={}
+    for obs,observed,predictions in results:
+        for name,pred in predictions.items(): sequences.setdefault((name,obs.view,str(obs.slice_id)),[]).append((observed,pred))
+    temporal=[]
+    for (name,view,slice_id),items in sequences.items():
+        if len(items)>=2:
+            temporal.append({'method':name,'view':view,'slice_id':slice_id,'frames':len(items),**temporal_stats(np.stack([x[0] for x in items]),np.stack([x[1] for x in items]))})
+    if temporal: write_csv(output/'temporal_fidelity.csv',temporal)
     summary=[]
     for adapter in adapters:
         for view in ('SAX','2CH','4CH'):

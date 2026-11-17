@@ -17,14 +17,14 @@ from cardioresp4d.training.runtime_state import set_reproducibility
 from cardioresp4d.training.sampler import ViewLocationBalancedSampler
 
 
-def main():
+def main(*, sax_only=False):
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('manifest','qc-table','canonical-domain','static-manifest','output-dir'): p.add_argument('--'+name,type=Path,required=True)
-    p.add_argument('--experiment-config',type=Path,default=ROOT/'configs/simple4d_core_mv_thickslice_v1.yaml'); p.add_argument('--device',default='cuda:0'); p.add_argument('--backend',choices=('tcnn','pytorch_fallback'),default='tcnn'); p.add_argument('--stop-after',choices=('smoke','diagnostic','mid','formal'),required=True); p.add_argument('--resume',type=Path)
+    p.add_argument('--experiment-config',type=Path,default=ROOT/('configs/simple4d_core_sax_thickslice_v1.yaml' if sax_only else 'configs/simple4d_core_mv_thickslice_v1.yaml')); p.add_argument('--device',default='cuda:0'); p.add_argument('--backend',choices=('tcnn','pytorch_fallback'),default='tcnn'); p.add_argument('--stop-after',choices=('smoke','diagnostic','mid','formal'),required=True); p.add_argument('--resume',type=Path)
     a=p.parse_args(); device=torch.device(a.device)
     if device.type=='cuda' and not torch.cuda.is_available(): raise ValueError('CUDA requested but unavailable')
     cfg=yaml.safe_load(a.experiment_config.read_text()); canonical=cfg['canonical']; data=cfg['data']; deform=cfg['deformation']
-    if cfg['experiment']!={'name':'simple4d_core_mv_v1','scope':'SAX_2CH_4CH','initialization':'from_scratch'} or cfg['encoder']!={'type':'MotionCodeVAE','code_dim':32,'view_embedding':False} or cfg['boundaries']!={'smoke':200,'diagnostic':2000,'mid':5000,'formal':10000} or data!={'normalization':'per_series','observations_per_update':8,'pixel_samples_per_observation':10000}: raise ValueError('S1 protocol mismatch')
+    if cfg['experiment']!=({'name':'simple4d_core_sax_thickslice_v1','scope':'SAX','initialization':'from_scratch'} if sax_only else {'name':'simple4d_core_mv_v1','scope':'SAX_2CH_4CH','initialization':'from_scratch'}) or cfg['encoder']!={'type':'MotionCodeVAE','code_dim':32,'view_embedding':False} or cfg['boundaries']!={'smoke':200,'diagnostic':2000,'mid':5000,'formal':10000} or data!={'normalization':'per_series','observations_per_update':8,'pixel_samples_per_observation':10000}: raise ValueError('S1 protocol mismatch')
     if cfg['optimizer']!={'hash_lr':.01,'template_lr':2e-5,'encoder_lr':5e-5,'forward_lr':5e-5,'inverse_lr':5e-5,'step_size':5000,'gamma':.5} or cfg['loss']!={'photometric':'l1','kl':1e-3,'jacobian':1e-4,'magnitude':1e-2,'cycle':.1} or cfg['reproducibility']!={'model_seed':6,'sampler_seed':12}: raise ValueError('S1 optimization protocol mismatch')
     if canonical!={'type':'InstantNGPINR','ngp_levels':16,'ngp_features_per_level':2,'ngp_log2_hashmap_size':19,'ngp_base_resolution':16,'ngp_max_resolution':512,'ngp_mlp':[64,64],'required_backend':'tcnn'} or deform!={'type':'DeformCodeAdaptive','hidden_dims':[256,256,256,256],'omega':7,'bidirectional':True,'expected_reference_spacing_mm':[1.,1.,1.]} or cfg['renderer']!={'type':'upstream_like_physical_thick_slice_5point'}: raise ValueError('S1 architecture protocol mismatch')
     static=json.loads(a.static_manifest.read_text()); pose=Path(static['corrected_pose_manifest']['path']); volume=Path(static['outputs']['volume']['path']); vendor_path=ROOT/'third_party/simple4d_VENDOR.json'; vendor=json.loads(vendor_path.read_text())
@@ -33,10 +33,14 @@ def main():
     spacing=resolve_static_reference_spacing(static,deform['expected_reference_spacing_mm']); poses=load_corrected_pose_map(pose); domain=json.loads(a.canonical_domain.read_text()); effective=derive_effective_external_domain(poses,domain['world_min_mm'],domain['world_max_mm'])['model_float32_effective_domain']
     observations,normalization,groups=observations_from_manifest(a.manifest,a.qc_table,device,normalization_mode='per_series',assign_slice_positions=True); observations=apply_corrected_static_poses(observations,poses)
     if {obs.view.upper() for obs in observations if obs.qc_valid}!={'SAX','2CH','4CH'}: raise ValueError('S1 requires admitted SAX, 2CH and 4CH observations')
+    if sax_only:
+        observations=[obs for obs in observations if obs.qc_valid and obs.view.upper()=='SAX']
+        if not observations: raise ValueError('S05SAX requires admitted SAX observations')
     set_reproducibility(6)
     model=Simple4DCoreMultiViewThickSlice(effective['lower_lps_mm'],effective['upper_lps_mm'],spacing['resolved_reference_spacing_mm'],use_tcnn=a.backend=='tcnn',require_tcnn=a.backend=='tcnn').to(device)
-    sampler=ViewLocationBalancedSampler(observations,seed=12); runner=S1Runner(model,sampler)
+    sampler=ViewLocationBalancedSampler(observations,seed=12,required_views=('SAX',) if sax_only else ('SAX','2CH','4CH')); runner=S1Runner(model,sampler)
     provenance={'manifest':sha256(a.manifest),'qc_table':sha256(a.qc_table),'canonical_domain':sha256(a.canonical_domain),'static_manifest':sha256(a.static_manifest),'static_volume':sha256(volume),'corrected_poses':sha256(pose),'vendor_manifest':sha256(vendor_path),'config':sha256(a.experiment_config),'backend':model.canonical.backend,'spacing':spacing,'effective_domain':effective,'initialization':'from_scratch_no_nesvor_model_weights'}
+    if sax_only: provenance['scope']='SAX-only physical corrected geometry'
     from third_party.simple4d.simple4d.model import GL_NODES, GL_WEIGHTS
     provenance.update({'renderer':'upstream_like_physical_thick_slice_5point','gl_nodes':GL_NODES,'gl_weights':GL_WEIGHTS,'gaussian_sigma':'slice_thickness_mm / 4','vendor_commit':vendor['commit'],'upstream_thick_slice_source_sha256':sha256(ROOT/'third_party/simple4d/simple4d/model.py')})
     if a.resume:

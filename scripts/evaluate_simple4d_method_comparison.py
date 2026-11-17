@@ -14,7 +14,7 @@ sys.path.insert(0,str(ROOT)); sys.path.insert(0,str(ROOT/'src')); sys.path.inser
 from audit_simple4d_resp_v1_checkpoints import load_inputs,load_checkpoint,output_sha256
 from cardioresp4d.experiments.simple4d_resp_v1_identity_audit import representative_locations
 from cardioresp4d.experiments.simple4d_core_mv import Simple4DCoreMultiView,Simple4DCoreMultiViewThickSlice
-from cardioresp4d.experiments.simple4d_unified_evaluation import R0Adapter,R1Adapter,S0NativeAdapter,S1CoreMVAdapter,S05CoreMVThickSliceAdapter,evaluate_matched
+from cardioresp4d.experiments.simple4d_unified_evaluation import R0Adapter,R1Adapter,S0NativeAdapter,S1CoreMVAdapter,S05CoreMVThickSliceAdapter,S05SAXAdapter,evaluate_matched
 from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import diagnostic_rng_context
 from third_party.simple4d.simple4d.data import SliceSeries
 from third_party.simple4d.simple4d.model import SIMPLE4D
@@ -23,14 +23,14 @@ from third_party.simple4d.simple4d.model import SIMPLE4D
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('manifest','qc-table','canonical-domain','static-manifest','output-dir'): p.add_argument('--'+name,type=Path,required=True)
-    for name in ('r0-checkpoint','r1-checkpoint','s1-checkpoint','s05-checkpoint','s0-checkpoint','s0-input-dir','s0-run-dir'): p.add_argument('--'+name,type=Path)
+    for name in ('r0-checkpoint','r1-checkpoint','s1-checkpoint','s05-checkpoint','s05sax-checkpoint','s0-checkpoint','s0-input-dir','s0-run-dir'): p.add_argument('--'+name,type=Path)
     p.add_argument('--dynamic-crop',type=Path); p.add_argument('--chunk-size',type=int,default=4096)
     p.add_argument('--mode',choices=('v1','v2'),default='v2'); p.add_argument('--pair',nargs=2,action='append',default=[]); p.add_argument('--device',default='cuda:0'); p.add_argument('--gif-frame-ms',type=int,default=150)
     a=p.parse_args(); a.device=torch.device(a.device)
-    if not any((a.r0_checkpoint,a.r1_checkpoint,a.s1_checkpoint,a.s05_checkpoint,a.s0_checkpoint)): p.error('select at least one checkpoint')
+    if not any((a.r0_checkpoint,a.r1_checkpoint,a.s1_checkpoint,a.s05_checkpoint,a.s05sax_checkpoint,a.s0_checkpoint)): p.error('select at least one checkpoint')
     if a.device.type=='cuda' and not torch.cuda.is_available(): raise ValueError('CUDA requested but unavailable')
     output=a.output_dir.resolve()
-    checkpoints=[x.resolve() for x in (a.r0_checkpoint,a.r1_checkpoint,a.s1_checkpoint,a.s05_checkpoint,a.s0_checkpoint) if x]
+    checkpoints=[x.resolve() for x in (a.r0_checkpoint,a.r1_checkpoint,a.s1_checkpoint,a.s05_checkpoint,a.s05sax_checkpoint,a.s0_checkpoint) if x]
     inputs=[x.resolve() for x in (a.manifest,a.qc_table,a.canonical_domain,a.static_manifest) if x]
     protected_dirs=[x.resolve() for x in (a.s0_input_dir,a.s0_run_dir) if x]
     if any(output==path.parent or output in path.parents or path.parent in output.parents for path in checkpoints) or any(output==path or output in path.parents for path in inputs) or any(output==directory or directory in output.parents or output in directory.parents for directory in protected_dirs): raise ValueError('evaluation output may not overlap an input directory')
@@ -56,16 +56,17 @@ def main():
         if output==source_r0.parent or output in source_r0.parents or source_r0.parent in output.parents: raise ValueError('evaluation output may not overlap the R1 source directory')
         auxiliary_models[source_r0]=r1prov['source_r0_sha256']
         base_model.load_state_dict(state['model'],strict=True); adapters.append(R1Adapter(base_model,a.r1_checkpoint)); adapters[-1].extra_provenance={'checkpoint_input_provenance':r1prov}; base_model=None
-    for checkpoint,thick_slice in ((a.s1_checkpoint,False),(a.s05_checkpoint,True)):
+    for checkpoint,kind in ((a.s1_checkpoint,'s1'),(a.s05_checkpoint,'s05'),(a.s05sax_checkpoint,'s05sax')):
+        thick_slice=kind!='s1'
         if not checkpoint: continue
         state=torch.load(checkpoint,map_location='cpu',weights_only=False); prov=state.get('provenance',{}); hashes=provenance['hashes']
         if state.get('schema')!='simple4d_s1_v1' or any(prov.get(k)!=hashes[v] for k,v in [('manifest','manifest'),('qc_table','qc_table'),('canonical_domain','canonical_domain'),('static_manifest','static_manifest'),('static_volume','static_volume'),('corrected_poses','corrected_pose_manifest'),('vendor_manifest','simple4d_vendor_manifest')]): raise ValueError('S1 input provenance mismatch')
         box=prov['effective_domain']; spacing=prov['spacing']['resolved_reference_spacing_mm']; backend=prov['backend']
         import yaml
-        config_path=ROOT/('configs/simple4d_core_mv_thickslice_v1.yaml' if thick_slice else 'configs/simple4d_core_mv_v1.yaml')
+        config_path=ROOT/({'s1':'configs/simple4d_core_mv_v1.yaml','s05':'configs/simple4d_core_mv_thickslice_v1.yaml','s05sax':'configs/simple4d_core_sax_thickslice_v1.yaml'}[kind])
         if backend not in ('tcnn','pytorch_fallback') or prov.get('config')!=output_sha256(config_path) or state.get('config')!=yaml.safe_load(config_path.read_text()): raise ValueError('unknown S1 backend or incompatible configuration')
         model=(Simple4DCoreMultiViewThickSlice if thick_slice else Simple4DCoreMultiView)(box['lower_lps_mm'],box['upper_lps_mm'],spacing,use_tcnn=backend=='tcnn',require_tcnn=backend=='tcnn').to(a.device)
-        model.load_state_dict(state['runner']['model'],strict=True); adapters.append((S05CoreMVThickSliceAdapter if thick_slice else S1CoreMVAdapter)(model,checkpoint)); adapters[-1].extra_provenance={'checkpoint_input_provenance':prov}
+        model.load_state_dict(state['runner']['model'],strict=True); adapters.append({'s1':S1CoreMVAdapter,'s05':S05CoreMVThickSliceAdapter,'s05sax':S05SAXAdapter}[kind](model,checkpoint)); adapters[-1].extra_provenance={'checkpoint_input_provenance':prov}
     if a.s0_checkpoint:
         if not a.s0_input_dir or not a.s0_run_dir: p.error('S0 requires --s0-input-dir and --s0-run-dir')
         state=torch.load(a.s0_checkpoint,map_location='cpu',weights_only=False); manifest_path=a.s0_input_dir/'input_adapter_manifest.json'; input_path=a.s0_input_dir/'sax_input.npz'; manifest=json.loads(manifest_path.read_text()); prov=state.get('provenance',{})
@@ -97,7 +98,7 @@ def main():
         from cardioresp4d.experiments.simple4d_resp_v1_dynamic_visualization import save_triplanar,make_gif
         crop=json.loads(a.dynamic_crop.read_text())
         if crop.get('source_sha256')!=provenance['hashes']['static_volume']: raise ValueError('dynamic crop static volume mismatch')
-        physical=[adapter for adapter in adapters if adapter.evaluation_scope!='SAX-only']
+        physical=[adapter for adapter in adapters if not isinstance(adapter,S0NativeAdapter)]
         selected=[item for item in targets if item[1].view.upper()=='SAX']
         if not physical or not selected: raise ValueError('dynamic anatomy needs a physical adapter and SAX targets')
         chosen=selected[0][1].slice_id; selected=[item for item in selected if item[1].slice_id==chosen]
