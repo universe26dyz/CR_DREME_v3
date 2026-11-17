@@ -70,6 +70,11 @@ class S1CoreMVAdapter(ProjectAdapter):
     def __init__(self,model,checkpoint_path): super().__init__(model,checkpoint_path,'S1')
 
 
+class S05CoreMVThickSliceAdapter(ProjectAdapter):
+    psf_identity='upstream-like five-point Gaussian quadrature on corrected LPS planes'
+    def __init__(self,model,checkpoint_path): super().__init__(model,checkpoint_path,'S05')
+
+
 class S0NativeAdapter:
     evaluation_scope='SAX-only'
     psf_identity='upstream regular-stack thick-slice quadrature'
@@ -173,5 +178,5 @@ def evaluate_matched(adapters,targets,output,*,mode='v1',pairs=(),duration_ms=15
             gif=output/'gif'/('_'.join(names)+f'_{view}_{slice_id}_{mode}.gif'); save_gif(paths,gif,duration_ms)
             manifest_comparisons.append({'methods':list(names),'view':view,'slice_id':slice_id,'frames':[x[0].dynamic_frame_id for x in items],'timestamps_s':[x[0].timestamp_s for x in items],'gif':str(gif.relative_to(output)),'gif_frame_ms':duration_ms,'display_window':[0,1],'residual_vmin':0,'residual_vmax':vmax,'method_provenance':[a.method_provenance() for a in adapters if a.method_id in names]})
     for adapter in adapters: adapter.verify_unchanged()
-    (output/'evaluation_manifest.json').write_text(json.dumps({'mode':mode,'methods':[a.method_provenance() for a in adapters],'comparisons':manifest_comparisons,'fairness_note':'S0 is SAX-only with upstream thick slice; R0/R1/S1 use project physical geometry and NeSVoR PSF.'},indent=2,allow_nan=False)+'\n')
+    (output/'evaluation_manifest.json').write_text(json.dumps({'mode':mode,'methods':[a.method_provenance() for a in adapters],'comparisons':manifest_comparisons,'fairness_note':'S0 is SAX-only with upstream thick slice; R0/R1/S1 use physical geometry and NeSVoR PSF; S05 uses physical five-point quadrature.'},indent=2,allow_nan=False)+'\n')
     return metrics

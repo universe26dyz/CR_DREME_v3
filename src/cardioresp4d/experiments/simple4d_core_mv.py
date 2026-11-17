@@ -106,3 +106,11 @@ class S1Runner:
 
 def validate_s1_resume(payload,provenance):
     if payload.get('schema')!='simple4d_s1_v1' or payload.get('provenance')!=provenance or not isinstance(payload.get('runner'),dict): raise ValueError('S1 checkpoint provenance mismatch')
+
+
+class Simple4DCoreMultiViewThickSlice(Simple4DCoreMultiView):
+    """S1 learning core with only the physical observation renderer replaced."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from cardioresp4d.adapters.simple4d_physical_thick_slice import PhysicalUpstreamThickSliceAdapter
+        self.psf = PhysicalUpstreamThickSliceAdapter()
