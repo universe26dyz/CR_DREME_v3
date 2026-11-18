@@ -79,6 +79,10 @@ class S05BMAdapter(S05CoreMVThickSliceAdapter):
     def __init__(self,model,checkpoint_path): ProjectAdapter.__init__(self,model,checkpoint_path,'S05BM')
 
 
+class S05BMEQAdapter(S05CoreMVThickSliceAdapter):
+    def __init__(self,model,checkpoint_path): ProjectAdapter.__init__(self,model,checkpoint_path,'S05BMEQ')
+
+
 class S05SAXAdapter(S05CoreMVThickSliceAdapter):
     evaluation_scope='SAX-only physical corrected geometry'
     def __init__(self,model,checkpoint_path): ProjectAdapter.__init__(self,model,checkpoint_path,'S05SAX')
