@@ -17,11 +17,57 @@ from cardioresp4d.training.runtime_state import set_reproducibility
 from cardioresp4d.training.sampler import ViewLocationBalancedSampler
 
 
-def main():
+def build_parser():
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('manifest','qc-table','canonical-domain','static-manifest','output-dir'): p.add_argument('--'+name,type=Path,required=True)
-    p.add_argument('--experiment-config',type=Path,default=ROOT/'configs/simple4d_core_mv_v1.yaml'); p.add_argument('--device',default='cuda:0'); p.add_argument('--backend',choices=('tcnn','pytorch_fallback'),default='tcnn'); p.add_argument('--stop-after',choices=('smoke','diagnostic','mid','formal'),required=True); p.add_argument('--resume',type=Path)
-    a=p.parse_args(); device=torch.device(a.device)
+    p.add_argument('--experiment-config',type=Path,default=ROOT/'configs/simple4d_core_mv_v1.yaml'); p.add_argument('--device',default='cuda:0'); p.add_argument('--backend',choices=('tcnn','pytorch_fallback'),default='tcnn'); p.add_argument('--resume',type=Path)
+    target=p.add_mutually_exclusive_group(required=True)
+    target.add_argument('--stop-after',choices=('smoke','diagnostic','mid','formal'))
+    target.add_argument('--target-step',type=int,choices=range(1,20001),metavar='1..20000')
+    return p
+
+
+def write_extension_summary(output,diagnostics,metrics,scheduler):
+    """Write boundary diagnostics; LR columns are before and after each update."""
+    fields=['diagnostic_sampled_reconstruction_mse_full','diagnostic_sampled_reconstruction_mae_full','current_canonical_no_motion_sampled_mse_full','latent_mu_dynamic_rms','latent_dynamic_pc1_explained_variance_ratio','latent_dynamic_rank_95pct','respiratory_dvf_dynamic_rms_mm','respiratory_dvf_static_rms_mm','cycle_error_mean_mm','cycle_error_p95_mm','jacobian_det_p01','jacobian_det_nonpositive_fraction']
+    groups=('hash','template','encoder','forward','inverse')
+    metric_by_step={row['global_step']:row for row in metrics}
+    rows=[]
+    for step in (5000,10000,15000,20000):
+        diag=diagnostics.get(f'step_{step}')
+        if diag is None: continue
+        row={'step':step,**{name:diag.get(name) for name in fields}}
+        metric=metric_by_step.get(step,{})
+        for group in groups:
+            value=metric.get('lr_'+group)
+            row['lr_'+group+'_before_update']=value
+            row['lr_'+group+'_after_scheduler']=value*scheduler.gamma if value is not None and step%scheduler.step_size==0 else value
+        rows.append(row)
+    if rows:
+        with (output/'s1_extension_summary.csv').open('w',newline='') as f:
+            writer=csv.DictWriter(f,fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
+
+
+def train_to_target(runner,model,sampler,target,save_steps,diagnostics,output,provenance,cfg,normalization,groups):
+    if runner.global_step>target: raise ValueError('checkpoint step exceeds target')
+    while runner.global_step<target:
+        runner.update()
+        if runner.global_step in save_steps:
+            diag=diagnostic_metrics(model,sampler)
+            for key in list(diag):
+                if key.startswith('static_baseline_'): diag['current_canonical_no_motion_'+key[len('static_baseline_'):]]=diag.pop(key)
+            diagnostics[f'step_{runner.global_step}']=diag
+            cp={'schema':'simple4d_s1_v1','provenance':provenance,'runner':runner.state_dict(),'diagnostics':diagnostics,'config':cfg,'normalization_parameters':normalization,'normalization_groups':groups}
+            torch.save(cp,output/f'checkpoint_step_{runner.global_step}.pt'); torch.save(cp,output/'checkpoint_last.pt')
+            (output/'training_report.json').write_text(json.dumps({'global_step':runner.global_step,'provenance':provenance,'diagnostics':diagnostics},indent=2,allow_nan=False)+'\n')
+            with (output/'training_metrics.csv').open('w',newline='') as f:
+                writer=csv.DictWriter(f,fieldnames=list(runner.metrics[0])); writer.writeheader(); writer.writerows(runner.metrics)
+            write_extension_summary(output,diagnostics,runner.metrics,runner.scheduler)
+    write_extension_summary(output,diagnostics,runner.metrics,runner.scheduler)
+
+
+def main():
+    a=build_parser().parse_args(); device=torch.device(a.device)
     if device.type=='cuda' and not torch.cuda.is_available(): raise ValueError('CUDA requested but unavailable')
     cfg=yaml.safe_load(a.experiment_config.read_text()); canonical=cfg['canonical']; data=cfg['data']; deform=cfg['deformation']
     if cfg['experiment']!={'name':'simple4d_core_mv_v1','scope':'SAX_2CH_4CH','initialization':'from_scratch'} or cfg['encoder']!={'type':'MotionCodeVAE','code_dim':32,'view_embedding':False} or cfg['boundaries']!={'smoke':200,'diagnostic':2000,'mid':5000,'formal':10000} or data!={'normalization':'per_series','observations_per_update':8,'pixel_samples_per_observation':10000}: raise ValueError('S1 protocol mismatch')
@@ -47,23 +93,13 @@ def main():
     else:
         if a.output_dir.exists() and any(a.output_dir.iterdir()): raise FileExistsError('fresh S1 output must be empty')
         diagnostics={}
-    target=cfg['boundaries'][a.stop_after]
+    target=cfg['boundaries'][a.stop_after] if a.stop_after else a.target_step
     if runner.global_step>target: raise ValueError('checkpoint step exceeds target')
     a.output_dir.mkdir(parents=True,exist_ok=True)
     (a.output_dir/'effective_config.json').write_text(json.dumps(cfg,indent=2)+'\n')
     (a.output_dir/'experiment_inputs.json').write_text(json.dumps({'paths':{key:str(getattr(a,key).resolve()) for key in ('manifest','qc_table','canonical_domain','static_manifest','experiment_config')},'provenance':provenance},indent=2)+'\n')
-    while runner.global_step<target:
-        runner.update()
-        if runner.global_step in cfg['boundaries'].values():
-            diag=diagnostic_metrics(model,sampler)
-            for key in list(diag):
-                if key.startswith('static_baseline_'): diag['current_canonical_no_motion_'+key[len('static_baseline_'):]]=diag.pop(key)
-            diagnostics[f'step_{runner.global_step}']=diag
-            cp={'schema':'simple4d_s1_v1','provenance':provenance,'runner':runner.state_dict(),'diagnostics':diagnostics,'config':cfg,'normalization_parameters':normalization,'normalization_groups':groups}
-            torch.save(cp,a.output_dir/f'checkpoint_step_{runner.global_step}.pt'); torch.save(cp,a.output_dir/'checkpoint_last.pt')
-            (a.output_dir/'training_report.json').write_text(json.dumps({'global_step':runner.global_step,'provenance':provenance,'diagnostics':diagnostics},indent=2,allow_nan=False)+'\n')
-            with (a.output_dir/'training_metrics.csv').open('w',newline='') as f:
-                writer=csv.DictWriter(f,fieldnames=list(runner.metrics[0])); writer.writeheader(); writer.writerows(runner.metrics)
+    save_steps=set(cfg['boundaries'].values())|{15000,20000,target}
+    train_to_target(runner,model,sampler,target,save_steps,diagnostics,a.output_dir,provenance,cfg,normalization,groups)
     print(json.dumps({'step':runner.global_step,'backend':model.canonical.backend}))
 
 

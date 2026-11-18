@@ -34,9 +34,13 @@ def test_joint_update_and_resume(tmp_path):
     from cardioresp4d.experiments.simple4d_resp_v1_r0 import diagnostic_metrics
     diagnostic=diagnostic_metrics(runner.model,runner.sampler,pixel_count=4)
     assert diagnostic['diagnostic_frame_count']==3 and 'jacobian_det_p01' in diagnostic
-    checkpoint=tmp_path/'checkpoint.pt'; torch.save(runner.state_dict(),checkpoint); saved=torch.load(checkpoint,weights_only=False); runner.update(); expected=copy.deepcopy(runner.model.state_dict())
+    checkpoint=tmp_path/'checkpoint.pt'; torch.save(runner.state_dict(),checkpoint); saved=torch.load(checkpoint,weights_only=False); runner.update(); expected=copy.deepcopy(runner.model.state_dict()); expected_optimizer=copy.deepcopy(runner.optimizer.state_dict()); expected_scheduler=runner.scheduler.state_dict()
     restored=S1Runner(new(),ViewLocationBalancedSampler(observations,seed=12),observations_per_update=3,pixel_samples=4); restored.load_state_dict(saved); restored.update()
     assert all(torch.equal(value,restored.model.state_dict()[name]) for name,value in expected.items())
+    assert restored.global_step==runner.global_step and restored.scheduler.state_dict()==expected_scheduler
+    assert restored.optimizer.state_dict()['param_groups']==expected_optimizer['param_groups']
+    for key,state in expected_optimizer['state'].items():
+        assert all(torch.equal(value,restored.optimizer.state_dict()['state'][key][name]) for name,value in state.items())
 
 
 def test_resume_and_dynamic_anatomy(tmp_path):
