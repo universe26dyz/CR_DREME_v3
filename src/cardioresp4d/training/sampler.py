@@ -10,6 +10,7 @@ from .runtime_state import HARD_INVALID_REASONS, is_hard_invalid_reason
 
 _VIEWS = ("SAX", "2CH", "4CH")
 _HARD_INVALID = HARD_INVALID_REASONS
+_UNSET = object()
 _VIEW_IDS = {"SAX": 0, "2CH": 1, "4CH": 2}
 
 
@@ -109,15 +110,26 @@ class ViewLocationBalancedSampler:
         if missing: raise ValueError("view-balanced sampler lacks valid observations for " + ", ".join(missing))
         self._grouped = grouped; self._views = views; self._rng = random.Random(seed); self._update_index = 0
 
-    def sample_step(self, *, observations_per_update: int = 3) -> list[DynamicObservation]:
-        if observations_per_update < len(self._views):
-            raise ValueError("observations_per_update must include every required view")
-        base, remainder = divmod(observations_per_update, len(self._views))
-        extras = {self._views[(self._update_index + index) % len(self._views)] for index in range(remainder)}
+    def sample_step(self, *, observations_per_update=_UNSET, view_counts=None) -> list[DynamicObservation]:
+        # An omitted count retains the historical three-observation default.
+        if observations_per_update is _UNSET:
+            observations_per_update = 3 if view_counts is None else None
+        if (observations_per_update is None) == (view_counts is None):
+            raise ValueError("supply exactly one observation count or view quota")
+        if view_counts is None:
+            if observations_per_update < len(self._views):
+                raise ValueError("observations_per_update must include every required view")
+            base, remainder = divmod(observations_per_update, len(self._views))
+            extras = {self._views[(self._update_index + index) % len(self._views)] for index in range(remainder)}
+            counts = {view: base + int(view in extras) for view in self._views}
+        else:
+            if not isinstance(view_counts, dict) or set(view_counts) != set(self._views) or any(type(value) is not int or value <= 0 for value in view_counts.values()):
+                raise ValueError("view quotas must specify a positive integer for every required view")
+            counts = view_counts
         selected: list[DynamicObservation] = []
         for view in self._views:
             locations = sorted(self._grouped[view])
-            for _ in range(base + int(view in extras)):
+            for _ in range(counts[view]):
                 location = self._rng.choice(locations)
                 selected.append(self._rng.choice(self._grouped[view][location]))
         self._update_index += 1
