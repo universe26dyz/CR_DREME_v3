@@ -140,3 +140,14 @@ def test_r2_band_preference():
     for f,own,other in [(.24,(.1,.6),(.8,2.)),(1.2,(.8,2.),(.1,.6))]:
         z=torch.sin(2*math.pi*f*t).float()[:,None]
         assert spectral_shape_loss(t,z,own)<.01 and spectral_shape_loss(t,z,other)>.8
+
+def test_r2_continuation_requires_complete_matching_state():
+    from cardioresp4d.experiments.simple4d_disentangle_freq import validate_r2_continuation
+    cfg={'frequency_disentanglement':{'objective':'anticollapse_v1'}}
+    prov={'frequency':cfg['frequency_disentanglement'],'mode':'dual_band_anticollapse_fromscratch_v1','start_checkpoint':None,'initial_global_step':0,'manifest':'test'}
+    runner={k:{} for k in ('model','optimizer','scheduler','sampler','temporal_sampler','rng')}; runner.update(global_step=2000,metrics=[{}]*2000)
+    cp={'schema':'simple4d_disentangle_freq_v1','config':cfg,'provenance':prov,'runner':runner}
+    validate_r2_continuation(cp,prov,cfg)
+    with pytest.raises(ValueError): validate_r2_continuation({**cp,'runner':{**runner,'global_step':1999}},prov,cfg)
+    with pytest.raises(ValueError): validate_r2_continuation(cp,{**prov,'manifest':'other'},cfg)
+    with pytest.raises(ValueError): validate_r2_continuation({**cp,'runner':{k:v for k,v in runner.items() if k!='temporal_sampler'}},prov,cfg)

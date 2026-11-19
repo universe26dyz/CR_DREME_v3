@@ -14,7 +14,7 @@ sys.path.insert(0,str(ROOT)); sys.path.insert(0,str(ROOT/'src')); sys.path.inser
 from train_source_first import observations_from_manifest
 from cardioresp4d.experiments.simple4d_resp_v1_r0 import sha256,resolve_static_reference_spacing,diagnostic_metrics,state_digest
 from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import load_corrected_pose_map,apply_corrected_static_poses,derive_effective_external_domain
-from cardioresp4d.experiments.simple4d_disentangle_freq import DualLatentThickSlice,FrequencyRunner,latent_diagnostics,intervention_diagnostics,validate_enabled_bands,band_residual
+from cardioresp4d.experiments.simple4d_disentangle_freq import DualLatentThickSlice,FrequencyRunner,latent_diagnostics,intervention_diagnostics,validate_enabled_bands,band_residual,validate_r2_continuation
 from cardioresp4d.experiments.simple4d_core_mv import validate_s1_resume
 from cardioresp4d.training.runtime_state import set_reproducibility
 from cardioresp4d.training.sampler import ViewLocationBalancedSampler,proportional_view_counts
@@ -39,10 +39,10 @@ def main(*, sax_only=False, budget_matched=False, equal_budget=False, slice_prop
     if a.dual_band: freq={**freq,'enabled':True,'lambda_resp_freq':0.001,'lambda_card_freq':0.001,'resp_observability_mode':'observable_basis_subset'}
     cfg['frequency_disentanglement']=freq
     validate_enabled_bands(audit,freq)
-    if a.stop_after not in ('smoke','diagnostic'): raise ValueError('only smoke and 2k diagnostic permitted')
     r2=a.anticollapse
+    if a.stop_after not in (('diagnostic','mid') if r2 else ('smoke','diagnostic')): raise ValueError('unsupported diagnostic boundary')
     paired=a.stop_after=='diagnostic' and not r2
-    if r2 and (a.resume or not a.basis_audit or not a.calibration or a.stop_after!='diagnostic'): raise ValueError('R2 requires fresh 2k initialization, basis audit, and calibration')
+    if r2 and (not a.basis_audit or not a.calibration or (a.stop_after=='diagnostic' and a.resume) or (a.stop_after=='mid' and not a.resume)): raise ValueError('R2 requires basis audit and calibration, fresh 2k or a 2k checkpoint for 5k')
     if r2:
         cal=json.loads(a.calibration.read_text())
         if cal['manifest_sha256']!=sha256(a.manifest) or cal['qc_table_sha256']!=sha256(a.qc_table) or cal['locations']!=143 or sha256(Path(cal['checkpoint']))!=cal['checkpoint_sha256']: raise ValueError('calibration provenance mismatch')
@@ -105,8 +105,13 @@ def main(*, sax_only=False, budget_matched=False, equal_budget=False, slice_prop
         if any(parent_config.get(k)!=v for k,v in cfg.items() if k!='frequency_disentanglement'): raise ValueError('parent protocol mismatch')
         runner.load_state_dict(cp['runner']); diagnostics=cp['diagnostics']
         provenance.update({'common_parent_run':'architecture_control_freq0','common_parent_checkpoint':str(a.resume.resolve()),'common_parent_checkpoint_sha256':sha256(a.resume),'parent_global_step':200,'basis_audit':str(a.basis_audit.resolve()),'basis_audit_sha256':sha256(a.basis_audit),'basis_frequencies_by_location':basis['locations'],'mode':'dual_band' if a.dual_band else 'architecture_control','resp_prior_description':'observable subset of nominal 0.1-0.6 Hz; full 0.1 Hz cycle unsupported'})
+    elif r2 and a.resume:
+        cp=torch.load(a.resume,map_location='cpu',weights_only=False)
+        validate_r2_continuation(cp,provenance,cfg)
+        runner.load_state_dict(cp['runner']); diagnostics=cp['diagnostics']
+        provenance.update({'mode':'dual_band_anticollapse_fromscratch_v1','start_checkpoint':None,'initial_global_step':0,'continuation_checkpoint':str(a.resume.resolve()),'continuation_checkpoint_sha256':sha256(a.resume),'continuation_global_step':2000,'original_run_provenance':cp['provenance'],'calibration_path':str(a.calibration.resolve()),'calibration_sha256':sha256(a.calibration),'basis_audit_sha256':sha256(a.basis_audit),'basis_frequencies_by_location':basis['locations']})
     elif a.resume:
-        raise ValueError('resume is only supported for the paired 2k diagnostic')
+        raise ValueError('resume requires a supported checkpoint')
     else:
         diagnostics={}
         if r2: provenance.update({'mode':'dual_band_anticollapse_fromscratch_v1','start_checkpoint':None,'initial_global_step':0,'calibration_path':str(a.calibration.resolve()),'calibration_sha256':sha256(a.calibration),'reference_for_floor_only':cal['checkpoint'],'reference_checkpoint_sha256':cal['checkpoint_sha256'],'basis_audit_sha256':sha256(a.basis_audit),'basis_frequencies_by_location':basis['locations'],'resp_prior_description':'observable subset of nominal 0.1-0.6 Hz; full 0.1 Hz cycle unsupported'})
@@ -115,7 +120,7 @@ def main(*, sax_only=False, budget_matched=False, equal_budget=False, slice_prop
     a.output_dir.mkdir(parents=True,exist_ok=True)
     (a.output_dir/'effective_config.json').write_text(json.dumps(cfg,indent=2)+'\n')
     (a.output_dir/'experiment_inputs.json').write_text(json.dumps({'paths':{key:str(getattr(a,key).resolve()) for key in ('manifest','qc_table','canonical_domain','static_manifest','experiment_config')},'provenance':provenance},indent=2)+'\n')
-    if r2:
+    if r2 and not a.resume:
         (a.output_dir/'initialization.json').write_text(json.dumps({'global_step':0,'start_checkpoint':None,'initial_model_state_sha256':state_digest(model),'model_seed':6,'main_sampler_seed':12,'temporal_sampler_seed':13,'provenance':provenance},indent=2,allow_nan=False)+'\n')
     if paired:
         with torch.no_grad():
@@ -127,8 +132,8 @@ def main(*, sax_only=False, budget_matched=False, equal_budget=False, slice_prop
     while runner.global_step<target:
         row=runner.update()
         if row['weighted_card_freq']+row['weighted_resp_freq']+row.get('weighted_resp_energy',0.)+row.get('weighted_card_energy',0.) > 2*row['photo_raw']: raise RuntimeError('frequency terms overwhelm photometric loss')
-        if runner.global_step in (1,10,25,50,100,150,200,201,210,250,500,1000,1500,2000): print(json.dumps({'progress':row},allow_nan=False),flush=True)
-        if runner.global_step in ((200,500,1000,2000) if r2 else (500,1000,2000) if paired else cfg['boundaries'].values()):
+        if runner.global_step in (1,10,25,50,100,150,200,201,210,250,500,1000,1500,2000,2001,2010,2500,3000,3500,4000,4500,5000): print(json.dumps({'progress':row},allow_nan=False),flush=True)
+        if runner.global_step in ((200,500,1000,2000,3000,4000,5000) if r2 else (500,1000,2000) if paired else cfg['boundaries'].values()):
             diag=diagnostic_metrics(model,sampler)
             with torch.no_grad():
                 sequence=sorted(sampler._grouped['SAX'][sorted(sampler._grouped['SAX'])[0]],key=lambda o:o.timestamp_s)

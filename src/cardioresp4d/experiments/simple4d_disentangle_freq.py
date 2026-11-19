@@ -161,3 +161,17 @@ def validate_enabled_bands(audit, frequency):
             continue
         if any(v[branch+'_supported_locations'] != v['unique_locations'] for v in audit['stacks'].values()):
             raise ValueError('temporal observability gate: enabled '+branch+' band unsupported')
+
+
+def validate_r2_continuation(checkpoint, provenance, config):
+    """Accept only the matching completed R2 checkpoint and full runner state."""
+    state=checkpoint.get('runner',{})
+    required=('model','optimizer','scheduler','sampler','temporal_sampler','rng','metrics','global_step')
+    if checkpoint.get('schema')!='simple4d_disentangle_freq_v1' or state.get('global_step')!=2000 or len(state.get('metrics',[]))!=2000 or any(k not in state for k in required):
+        raise ValueError('expected a complete R2 step-2000 checkpoint')
+    if checkpoint.get('config')!=config:
+        raise ValueError('R2 checkpoint configuration mismatch')
+    old=checkpoint.get('provenance',{})
+    keys=('manifest','qc_table','canonical_domain','static_manifest','static_volume','corrected_poses','vendor_manifest','config','backend','spacing','effective_domain','view_counts','location_counts','pixel_samples_per_observation','renderer','frequency')
+    if any(old.get(k)!=provenance.get(k) for k in keys) or old.get('mode')!='dual_band_anticollapse_fromscratch_v1' or old.get('start_checkpoint') is not None or old.get('initial_global_step')!=0:
+        raise ValueError('R2 checkpoint provenance mismatch')
