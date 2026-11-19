@@ -27,7 +27,7 @@ class DualLatentThickSlice(Simple4DCoreMultiViewThickSlice):
         super().__init__(*args, **kwargs)
         self.respiratory_encoder = FrequencyDisentangledMotionCodeVAE()
 
-def band_residual(times, latent, band, eps=1e-8):
+def band_residual(times, latent, band, eps=1e-8, *, observability_mode='full_band'):
     """Centered SVD basis, frequencies spaced 1/span Hz, no saturated basis."""
     if times.ndim != 1 or latent.ndim != 2 or latent.shape[0] != times.numel() or len(times)<8:
         raise ValueError('expected at least eight aligned time points')
@@ -35,7 +35,8 @@ def band_residual(times, latent, band, eps=1e-8):
     if not bool(torch.isfinite(times).all()) or not bool((times[1:] > times[:-1]).all()):
         raise ValueError('timestamps must be finite and strictly increasing')
     t = times-times[0]; span=float(t[-1]); low,high=map(float,band)
-    if not 0 < low <= high or span < 1/low:
+    if observability_mode not in ('full_band','observable_basis_subset'): raise ValueError('unknown observability mode')
+    if not 0 < low <= high or (observability_mode=='full_band' and span < 1/low):
         raise ValueError('insufficient span for lower frequency')
     if 0.5/float(torch.median(torch.diff(times))) < high:
         raise ValueError('band exceeds median-interval Nyquist frequency')
@@ -88,7 +89,7 @@ class FrequencyRunner(S1Runner):
             means=torch.cat([self.model.encode_observation(o,sample=False)['mu'] for o in seq],dim=0)
             times=torch.tensor([o.timestamp_s for o in seq],device=means.device,dtype=torch.float64)
             resp,card=means[:,:16],means[:,16:]
-            lr=band_residual(times,resp,cfg['resp_band_hz']) if cfg['lambda_resp_freq'] else None
+            lr=band_residual(times,resp,cfg['resp_band_hz'],observability_mode=cfg.get('resp_observability_mode','full_band')) if cfg['lambda_resp_freq'] else None
             lc=band_residual(times,card,cfg['card_band_hz']) if cfg['lambda_card_freq'] else None
             loss=(cfg['lambda_resp_freq']*lr if lr is not None else 0)+(cfg['lambda_card_freq']*lc if lc is not None else 0)
             if not bool(torch.isfinite(loss)): raise RuntimeError('nonfinite frequency loss')
@@ -113,7 +114,7 @@ def latent_diagnostics(times, means):
         rank95=int(torch.searchsorted(torch.cumsum(p,0),p.new_tensor(.95)).item()+1) if float(total)>0 else 0
         entry={'mean':float(z.mean()),'std':float(z.std()),'rms':float(z.square().mean().sqrt()),'per_dimension_std':z.std(0).detach().cpu().tolist(),'pca_explained_variance':p.detach().cpu().tolist(),'rank95':rank95,'effective_rank':float(torch.exp(-(p*torch.log(p+1e-12)).sum())) if float(total)>0 else 0.,'temporal_variance':float(centered.square().mean())}
         for label,band in [('in_band_energy_ratio',own),('cross_band_energy_ratio',other)]:
-            try: entry[label]=float(1-band_residual(times,z,band))
+            try: entry[label]=float(1-band_residual(times,z,band,observability_mode='observable_basis_subset' if band==(.1,.6) else 'full_band'))
             except ValueError: entry[label]=None
         result[name]=entry
     return result
@@ -135,5 +136,8 @@ def validate_enabled_bands(audit, frequency):
         expected={'resp':[0.1,0.6],'card':[0.8,2.0]}[branch]
         if list(frequency[branch+'_band_hz']) != expected:
             raise ValueError('new frequency band requires a matching temporal audit')
+        if branch=='resp' and frequency.get('resp_observability_mode')=='observable_basis_subset':
+            if any(v['missing_timestamps'] or v['duplicate_intervals'] or v['non_monotonic_intervals'] or v['nyquist_hz']['min'] < expected[1] or v['observations_per_location']['min'] < 8 or v['span_s']['min'] <= 0 or math.ceil(expected[0]*v['span_s']['min']) > math.floor(expected[1]*v['span_s']['min']) for v in audit['stacks'].values()): raise ValueError('observable respiratory subset unsupported')
+            continue
         if any(v[branch+'_supported_locations'] != v['unique_locations'] for v in audit['stacks'].values()):
             raise ValueError('temporal observability gate: enabled '+branch+' band unsupported')

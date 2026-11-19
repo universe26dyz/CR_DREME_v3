@@ -103,3 +103,14 @@ def test_card_only_gate_and_short_record():
     z=torch.sin(2*math.pi*1.2*t).float().unsqueeze(1).requires_grad_()
     loss=band_residual(t,z,(.8,2.)); loss.backward()
     assert torch.isfinite(loss) and torch.isfinite(z.grad).all()
+
+def test_observable_resp_subset_modes_and_gradients():
+    t=torch.linspace(0,8.363,50,dtype=torch.float64)
+    span=float(t[-1]); modes=[k/span for k in range(math.ceil(.1*span),math.floor(.6*span)+1)]
+    assert len(modes)==5 and modes[0]==pytest.approx(1/span) and all(.1<=f<=.6 for f in modes)
+    z=torch.sin(2*math.pi*modes[0]*t).float().reshape(-1,1).requires_grad_()
+    loss=band_residual(t,z,(.1,.6),observability_mode='observable_basis_subset'); loss.backward()
+    assert loss<1e-8 and torch.isfinite(z.grad).all()
+    with pytest.raises(ValueError): band_residual(torch.linspace(0,1,50),torch.randn(50,1),(.1,.6),observability_mode='observable_basis_subset')
+    with pytest.raises(ValueError): band_residual(t[:7],z[:7],(.1,.6),observability_mode='observable_basis_subset')
+    with pytest.raises(ValueError): band_residual(t,z,(.1,.6),observability_mode='full_band')
