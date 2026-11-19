@@ -61,3 +61,25 @@ def soft_box(points, box, taper_mm):
     distance = box.size_mm / 2 - np.abs(np.asarray(points) - box.center_mm)
     t = np.clip(distance / taper_mm, 0, 1)
     return np.prod(0.5 - 0.5 * np.cos(np.pi * t), axis=-1)
+
+
+def soft_box_torch(points, box, taper_mm):
+    """Differentiable world-mm equivalent of soft_box for model coordinates."""
+    import torch
+    if not np.isfinite(taper_mm) or taper_mm <= 0 or taper_mm > min(box.size_mm) / 2:
+        raise ValueError('invalid taper width')
+    center = points.new_tensor(box.center_mm)
+    half = points.new_tensor(box.size_mm) / 2
+    t = ((half - (points - center).abs()) / taper_mm).clamp(0, 1)
+    return (0.5 - 0.5 * torch.cos(torch.pi * t)).prod(dim=-1)
+
+
+def observation_soft_roi(observation, box, taper_mm):
+    """Sample the shared 3D ROI at each corrected observation pixel center."""
+    import torch
+    from cardioresp4d.training.model import SourceFirstDynamicModel
+    height, width = observation.image.shape[-2:]
+    row, col = torch.meshgrid(torch.arange(height, device=observation.image.device), torch.arange(width, device=observation.image.device), indexing='ij')
+    pixels = torch.stack((col, row), dim=-1).reshape(-1, 2).to(observation.image)
+    points = SourceFirstDynamicModel._pixel_world(observation, pixels)
+    return soft_box_torch(points, box, taper_mm).reshape(height, width)
