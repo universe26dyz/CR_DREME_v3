@@ -1,6 +1,6 @@
-experiment: {name: simple4d_core_mv_thickslice_sliceproportional_v1, scope: SAX_2CH_4CH, initialization: from_scratch, control: slice_proportional_all_locations_once}
+experiment: {name: simple4d_core_mv_thickslice_sliceproportional_v1, scope: SAX_2CH_4CH, initialization: from_scratch, control: slice_proportional_fixed_budget}
 reproducibility: {model_seed: 6, sampler_seed: 12}
-data: {normalization: per_series, pixel_samples_per_observation: 10000, sampling_mode: all_locations_once}
+data: {normalization: per_series, pixel_samples_per_observation: 10000, sampling_mode: location_proportional_fixed_budget, observations_per_update: 24}
 canonical: {type: InstantNGPINR, ngp_levels: 16, ngp_features_per_level: 2, ngp_log2_hashmap_size: 19, ngp_base_resolution: 16, ngp_max_resolution: 512, ngp_mlp: [64, 64], required_backend: tcnn}
 encoder: {type: MotionCodeVAE, code_dim: 32, view_embedding: false}
 deformation: {type: DeformCodeAdaptive, hidden_dims: [256, 256, 256, 256], omega: 7, bidirectional: true, expected_reference_spacing_mm: [1.0, 1.0, 1.0]}

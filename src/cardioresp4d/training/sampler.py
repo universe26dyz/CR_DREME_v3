@@ -88,6 +88,19 @@ def assign_normalized_slice_positions(observations: list[DynamicObservation], *,
     return [replace(observation, normalized_slice_position=positions[(observation.view.upper(), observation.slice_id)]) if observation.qc_valid else observation for observation in observations]
 
 
+def proportional_view_counts(location_counts: dict[str, int], total: int) -> dict[str, int]:
+    """Allocate a fixed budget by Hamilton's largest-remainder method."""
+    if set(location_counts) != set(_VIEWS) or any(type(v) is not int or v <= 0 for v in location_counts.values()) or type(total) is not int or total < len(_VIEWS):
+        raise ValueError('invalid location counts or observation budget')
+    denominator = sum(location_counts.values())
+    counts = {view: total * location_counts[view] // denominator for view in _VIEWS}
+    remaining = total - sum(counts.values())
+    order = sorted(_VIEWS, key=lambda view: (-(total * location_counts[view] % denominator), _VIEWS.index(view)))
+    for view in order[:remaining]: counts[view] += 1
+    if any(value == 0 for value in counts.values()): raise ValueError('budget excludes a required view')
+    return counts
+
+
 class ViewLocationBalancedSampler:
     """Choose one valid frame per view after uniformly choosing a location."""
     def __init__(self, observations: list[DynamicObservation], *, seed: int = 0, required_views: tuple[str, ...] = _VIEWS) -> None:
@@ -132,13 +145,6 @@ class ViewLocationBalancedSampler:
             for _ in range(counts[view]):
                 location = self._rng.choice(locations)
                 selected.append(self._rng.choice(self._grouped[view][location]))
-        self._update_index += 1
-        return selected
-
-    def sample_all_locations_once(self) -> list[DynamicObservation]:
-        """Draw one valid frame uniformly per admitted location, in stable order."""
-        selected = [self._rng.choice(self._grouped[view][location])
-                    for view in self._views for location in sorted(self._grouped[view])]
         self._update_index += 1
         return selected
 
