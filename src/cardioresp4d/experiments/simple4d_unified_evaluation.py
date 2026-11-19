@@ -83,6 +83,12 @@ class S05PROPAdapter(S05CoreMVThickSliceAdapter):
     def __init__(self,model,checkpoint_path): ProjectAdapter.__init__(self,model,checkpoint_path,'S05PROP')
 
 
+class S05FREQAdapter(S05PROPAdapter):
+    def __init__(self,model,checkpoint_path):
+        super().__init__(model,checkpoint_path)
+        self.method_id='S05FREQ'
+
+
 class S05BMEQAdapter(S05CoreMVThickSliceAdapter):
     def __init__(self,model,checkpoint_path): ProjectAdapter.__init__(self,model,checkpoint_path,'S05BMEQ')
 
