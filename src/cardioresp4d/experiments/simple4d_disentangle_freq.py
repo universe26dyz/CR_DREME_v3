@@ -51,7 +51,20 @@ def band_residual(times, latent, band, eps=1e-8, *, observability_mode='full_ban
     centered=latent-latent.mean(dim=0,keepdim=True)
     q=u[:,:rank].to(dtype=latent.dtype)
     residual=centered-q@(q.T@centered)
-    return residual.square().sum()/(centered.square().sum()+eps)
+    numerator=residual.square().sum(); denominator=centered.square().sum()
+    if eps is None:
+        return torch.where(denominator>0,numerator/denominator.clamp_min(torch.finfo(latent.dtype).tiny),torch.ones_like(denominator))
+    return numerator/(denominator+eps)
+
+def spectral_shape_loss(times, latent, band, *, observability_mode='full_band'):
+    """Scale-invariant residual fraction; exact zero receives the maximum loss."""
+    return band_residual(times,latent,band,eps=None,observability_mode=observability_mode)
+
+def temporal_energy_penalty(latent, floor):
+    """Branch-level hinge on temporally centered latent means."""
+    if not math.isfinite(float(floor)) or floor<=0: raise ValueError('energy floor must be finite and positive')
+    variance=(latent-latent.mean(dim=0,keepdim=True)).square().mean()
+    return variance,torch.relu(1-variance/floor).square()
 
 class SameLocationSampler:
     def __init__(self, main_sampler, seed=13, min_points=8, max_points=50):
@@ -81,6 +94,8 @@ class FrequencyRunner(S1Runner):
 
     def update(self):
         metrics={'resp_band_loss':None,'card_band_loss':None,'resp_mean_rms':None,'card_mean_rms':None,'weighted_resp_freq':0.,'weighted_card_freq':0.}
+        r2=self.frequency.get('objective')=='anticollapse_v1'
+        if r2: metrics.update(resp_temporal_variance=None,card_temporal_variance=None,resp_energy_loss=None,card_energy_loss=None,weighted_resp_energy=0.,weighted_card_energy=0.)
         def before_step(optimizer, args, kwargs):
             step=self.global_step+1; cfg=self.frequency
             if step % cfg['temporal_loss_every'] or not cfg['enabled'] or (cfg['lambda_resp_freq']==0 and cfg['lambda_card_freq']==0):
@@ -89,9 +104,14 @@ class FrequencyRunner(S1Runner):
             means=torch.cat([self.model.encode_observation(o,sample=False)['mu'] for o in seq],dim=0)
             times=torch.tensor([o.timestamp_s for o in seq],device=means.device,dtype=torch.float64)
             resp,card=means[:,:16],means[:,16:]
-            lr=band_residual(times,resp,cfg['resp_band_hz'],observability_mode=cfg.get('resp_observability_mode','full_band')) if cfg['lambda_resp_freq'] else None
-            lc=band_residual(times,card,cfg['card_band_hz']) if cfg['lambda_card_freq'] else None
+            fn=spectral_shape_loss if r2 else band_residual
+            lr=fn(times,resp,cfg['resp_band_hz'],observability_mode=cfg.get('resp_observability_mode','full_band')) if cfg['lambda_resp_freq'] else None
+            lc=fn(times,card,cfg['card_band_hz']) if cfg['lambda_card_freq'] else None
             loss=(cfg['lambda_resp_freq']*lr if lr is not None else 0)+(cfg['lambda_card_freq']*lc if lc is not None else 0)
+            if r2:
+                vr,er=temporal_energy_penalty(resp,cfg['resp_variance_floor']); vc,ec=temporal_energy_penalty(card,cfg['card_variance_floor'])
+                loss=loss+cfg['lambda_resp_energy']*er+cfg['lambda_card_energy']*ec
+                metrics.update(resp_temporal_variance=float(vr.detach()),card_temporal_variance=float(vc.detach()),resp_energy_loss=float(er.detach()),card_energy_loss=float(ec.detach()),weighted_resp_energy=float((cfg['lambda_resp_energy']*er).detach()),weighted_card_energy=float((cfg['lambda_card_energy']*ec).detach()))
             if not bool(torch.isfinite(loss)): raise RuntimeError('nonfinite frequency loss')
             loss.backward()
             metrics.update(resp_band_loss=float(lr.detach()) if lr is not None else None,card_band_loss=float(lc.detach()) if lc is not None else None,resp_mean_rms=float(resp.detach().square().mean().sqrt()),card_mean_rms=float(card.detach().square().mean().sqrt()),weighted_resp_freq=float((cfg['lambda_resp_freq']*lr).detach()) if lr is not None else 0.,weighted_card_freq=float((cfg['lambda_card_freq']*lc).detach()) if lc is not None else 0.)
@@ -99,7 +119,7 @@ class FrequencyRunner(S1Runner):
         try: row=super().update()
         finally: handle.remove()
         row.update(metrics)
-        row['total_with_frequency']=row['total']+metrics['weighted_resp_freq']+metrics['weighted_card_freq'] if 'total' in row else None
+        row['total_with_frequency']=row['total']+metrics['weighted_resp_freq']+metrics['weighted_card_freq']+metrics.get('weighted_resp_energy',0.)+metrics.get('weighted_card_energy',0.) if 'total' in row else None
         return row
     def state_dict(self):
         state=super().state_dict(); state['temporal_sampler']=self.temporal.state_dict(); return state

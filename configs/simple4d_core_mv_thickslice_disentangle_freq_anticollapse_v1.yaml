@@ -1,0 +1,85 @@
+experiment:
+  name: simple4d_disentangle_freq_anticollapse_v1
+  scope: SAX_2CH_4CH
+  initialization: from_scratch
+  control: slice_proportional_fixed_budget
+reproducibility:
+  model_seed: 6
+  sampler_seed: 12
+data:
+  normalization: per_series
+  pixel_samples_per_observation: 10000
+  sampling_mode: location_proportional_fixed_budget
+  observations_per_update: 24
+canonical:
+  type: InstantNGPINR
+  ngp_levels: 16
+  ngp_features_per_level: 2
+  ngp_log2_hashmap_size: 19
+  ngp_base_resolution: 16
+  ngp_max_resolution: 512
+  ngp_mlp:
+  - 64
+  - 64
+  required_backend: tcnn
+encoder:
+  type: FrequencyDisentangledMotionCodeVAE
+  code_dim: 32
+  resp_dim: 16
+  card_dim: 16
+  view_embedding: false
+deformation:
+  type: DeformCodeAdaptive
+  hidden_dims:
+  - 256
+  - 256
+  - 256
+  - 256
+  omega: 7
+  bidirectional: true
+  expected_reference_spacing_mm:
+  - 1.0
+  - 1.0
+  - 1.0
+renderer:
+  type: upstream_like_physical_thick_slice_5point
+optimizer:
+  hash_lr: 0.01
+  template_lr: 2.0e-05
+  encoder_lr: 5.0e-05
+  forward_lr: 5.0e-05
+  inverse_lr: 5.0e-05
+  step_size: 5000
+  gamma: 0.5
+loss:
+  photometric: l1
+  kl: 0.001
+  jacobian: 0.0001
+  magnitude: 0.01
+  cycle: 0.1
+boundaries:
+  smoke: 200
+  diagnostic: 2000
+  mid: 5000
+  formal: 10000
+frequency_disentanglement:
+  enabled: true
+  resp_band_hz:
+  - 0.1
+  - 0.6
+  card_band_hz:
+  - 0.8
+  - 2.0
+  lambda_resp_freq: 0.001
+  lambda_card_freq: 0.001
+  coefficient_l1_enabled: false
+  temporal_loss_every: 1
+  temporal_batch_size: 50
+  min_temporal_points: 8
+  sampler_seed: 13
+  objective: anticollapse_v1
+  resp_observability_mode: observable_basis_subset
+  resp_variance_floor: 0.012995687127113343
+  card_variance_floor: 0.013498717546463014
+  lambda_resp_energy: 0.001
+  lambda_card_energy: 0.001

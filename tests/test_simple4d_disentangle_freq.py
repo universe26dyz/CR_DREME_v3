@@ -114,3 +114,29 @@ def test_observable_resp_subset_modes_and_gradients():
     with pytest.raises(ValueError): band_residual(torch.linspace(0,1,50),torch.randn(50,1),(.1,.6),observability_mode='observable_basis_subset')
     with pytest.raises(ValueError): band_residual(t[:7],z[:7],(.1,.6),observability_mode='observable_basis_subset')
     with pytest.raises(ValueError): band_residual(t,z,(.1,.6),observability_mode='full_band')
+
+@pytest.mark.parametrize('frequency',[.25,1.2])
+def test_r2_shape_scale_invariance(frequency):
+    from cardioresp4d.experiments.simple4d_disentangle_freq import spectral_shape_loss
+    t=torch.linspace(0,20,201,dtype=torch.float64); z=torch.sin(2*math.pi*frequency*t).float()[:,None]
+    values=[float(spectral_shape_loss(t,z*a,(.1,.6))) for a in (1.,.1,.01,10.)]
+    assert max(values)-min(values)<1e-5
+
+def test_r2_energy_floor_prevents_shrinkage_and_allows_low_rank():
+    from cardioresp4d.experiments.simple4d_disentangle_freq import spectral_shape_loss,temporal_energy_penalty
+    t=torch.linspace(0,20,201,dtype=torch.float64); z=torch.zeros(201,16); z[:,0]=torch.sin(2*math.pi*1.2*t).float()
+    floor=.001; totals=[]
+    for a in (1.,.1,.01,.001):
+        x=(z*a).requires_grad_(); shape=spectral_shape_loss(t,x,(.1,.6)); var,penalty=temporal_energy_penalty(x,floor)
+        total=.001*(shape+penalty); total.backward(); assert torch.isfinite(x.grad).all(); totals.append(float(total.detach()))
+    assert totals[-1]>=totals[0] and totals[-2]>=totals[0]
+    assert temporal_energy_penalty(z,floor)[1]==0
+    for scale in (.18,.179,.001):
+        x=(z*scale).requires_grad_(); variance,penalty=temporal_energy_penalty(x,floor); penalty.backward(); assert torch.isfinite(x.grad).all()
+
+def test_r2_band_preference():
+    from cardioresp4d.experiments.simple4d_disentangle_freq import spectral_shape_loss
+    t=torch.linspace(0,25,251,dtype=torch.float64)
+    for f,own,other in [(.24,(.1,.6),(.8,2.)),(1.2,(.8,2.),(.1,.6))]:
+        z=torch.sin(2*math.pi*f*t).float()[:,None]
+        assert spectral_shape_loss(t,z,own)<.01 and spectral_shape_loss(t,z,other)>.8
