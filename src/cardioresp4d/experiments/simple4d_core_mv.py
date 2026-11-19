@@ -68,16 +68,24 @@ def make_s1_optimizer(model):
 
 class S1Runner:
     """Joint update with upstream step-dependent encoder evaluation behavior."""
-    def __init__(self,model,sampler,*,observations_per_update=8,pixel_samples=10000,view_counts=None):
-        self.model=model; self.sampler=sampler; self.observations_per_update=observations_per_update; self.pixel_samples=pixel_samples; self.view_counts=dict(view_counts) if view_counts is not None else None
+    def __init__(self,model,sampler,*,observations_per_update=8,pixel_samples=10000,view_counts=None,sampling_mode=None):
+        self.model=model; self.sampler=sampler; self.observations_per_update=observations_per_update; self.pixel_samples=pixel_samples; self.view_counts=dict(view_counts) if view_counts is not None else None; self.sampling_mode=sampling_mode
+        if sampling_mode not in (None,'all_locations_once') or (sampling_mode and view_counts is not None): raise ValueError('invalid sampling mode')
         self.optimizer,self.scheduler=make_s1_optimizer(model); self.global_step=0; self.metrics=[]
 
     def update(self):
         from cardioresp4d.experiments.simple4d_resp_v1_r0 import sample_pixels,grad_stats
         from cardioresp4d.simple4d.losses import respiratory_loss
         self.optimizer.zero_grad(set_to_none=True)
-        observations=self.sampler.sample_step(observations_per_update=self.observations_per_update) if self.view_counts is None else self.sampler.sample_step(view_counts=self.view_counts)
-        expected=self.observations_per_update if self.view_counts is None else sum(self.view_counts.values())
+        if self.sampling_mode=='all_locations_once':
+            observations=self.sampler.sample_all_locations_once()
+            locations={(view,str(location)) for view,groups in self.sampler._grouped.items() for location in groups}
+            selected={(o.view.upper(),str(o.slice_id)) for o in observations}
+            if len(observations)!=len(locations) or selected!=locations: raise RuntimeError('all-locations sampling invariant violated')
+            expected=len(locations)
+        else:
+            observations=self.sampler.sample_step(observations_per_update=self.observations_per_update) if self.view_counts is None else self.sampler.sample_step(view_counts=self.view_counts)
+            expected=self.observations_per_update if self.view_counts is None else sum(self.view_counts.values())
         if len(observations)!=expected: raise RuntimeError('unexpected sampler batch size')
         step=self.global_step+1; sums={}
         for obs in observations:
@@ -91,6 +99,9 @@ class S1Runner:
             for key,value in loss.items(): sums[key]=sums.get(key,0.)+float(value.detach())/len(observations)
         row={'global_step':step,**sums}
         if self.view_counts is not None: row.update({'view_count_'+view:count for view,count in self.view_counts.items()})
+        if self.sampling_mode=='all_locations_once':
+            row.update({'view_count_'+view:sum(o.view.upper()==view for o in observations) for view in self.sampler._views})
+            row.update({'total_observations':len(observations),'unique_locations':len(selected)})
         for name,module in [('canonical',self.model.canonical),('encoder',self.model.respiratory_encoder),('forward',self.model.forward_deformation),('inverse',self.model.inverse_deformation)]:
             norm,rms=grad_stats(module); row[name+'_grad_norm']=norm; row[name+'_grad_rms']=rms
         if not all(row[name+'_grad_norm']>0 for name in ('canonical','encoder','forward','inverse')): raise RuntimeError('S1 owner has zero gradient')

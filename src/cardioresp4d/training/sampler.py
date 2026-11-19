@@ -135,6 +135,13 @@ class ViewLocationBalancedSampler:
         self._update_index += 1
         return selected
 
+    def sample_all_locations_once(self) -> list[DynamicObservation]:
+        """Draw one valid frame uniformly per admitted location, in stable order."""
+        selected = [self._rng.choice(self._grouped[view][location])
+                    for view in self._views for location in sorted(self._grouped[view])]
+        self._update_index += 1
+        return selected
+
     def temporal_batch(self, *, max_items: int) -> list[DynamicObservation]:
         """One differentiable same-location sequence sorted by true acquisition time."""
         if max_items <= 0:
