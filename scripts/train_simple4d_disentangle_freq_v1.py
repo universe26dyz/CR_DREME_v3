@@ -13,7 +13,7 @@ sys.path.insert(0,str(ROOT)); sys.path.insert(0,str(ROOT/'src')); sys.path.inser
 from train_source_first import observations_from_manifest
 from cardioresp4d.experiments.simple4d_resp_v1_r0 import sha256,resolve_static_reference_spacing,diagnostic_metrics
 from cardioresp4d.experiments.respiratory_s2vdreme_reference_v1 import load_corrected_pose_map,apply_corrected_static_poses,derive_effective_external_domain
-from cardioresp4d.experiments.simple4d_disentangle_freq import DualLatentThickSlice,FrequencyRunner,latent_diagnostics,intervention_diagnostics
+from cardioresp4d.experiments.simple4d_disentangle_freq import DualLatentThickSlice,FrequencyRunner,latent_diagnostics,intervention_diagnostics,validate_enabled_bands
 from cardioresp4d.experiments.simple4d_core_mv import validate_s1_resume
 from cardioresp4d.training.runtime_state import set_reproducibility
 from cardioresp4d.training.sampler import ViewLocationBalancedSampler,proportional_view_counts
@@ -24,7 +24,7 @@ def main(*, sax_only=False, budget_matched=False, equal_budget=False, slice_prop
         raise ValueError('incompatible experiment modes')
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('manifest','qc-table','canonical-domain','static-manifest','output-dir'): p.add_argument('--'+name,type=Path,required=True)
-    p.add_argument('--temporal-audit',type=Path,required=True); p.add_argument('--architecture-control',action='store_true'); p.add_argument('--experiment-config',type=Path,default=ROOT/('configs/simple4d_core_mv_thickslice_disentangle_freq_v1.yaml' if slice_proportional else 'configs/simple4d_core_mv_thickslice_equalbudget_v1.yaml' if equal_budget else 'configs/simple4d_core_mv_thickslice_budgetmatched_v1.yaml' if budget_matched else 'configs/simple4d_core_sax_thickslice_v1.yaml' if sax_only else 'configs/simple4d_core_mv_thickslice_v1.yaml')); p.add_argument('--device',default='cuda:0'); p.add_argument('--backend',choices=('tcnn','pytorch_fallback'),default='tcnn'); p.add_argument('--stop-after',choices=('smoke','diagnostic','mid','formal'),required=True); p.add_argument('--resume',type=Path)
+    p.add_argument('--temporal-audit',type=Path,required=True); modes=p.add_mutually_exclusive_group(); modes.add_argument('--architecture-control',action='store_true'); modes.add_argument('--card-only',action='store_true'); p.add_argument('--experiment-config',type=Path,default=ROOT/('configs/simple4d_core_mv_thickslice_disentangle_freq_v1.yaml' if slice_proportional else 'configs/simple4d_core_mv_thickslice_equalbudget_v1.yaml' if equal_budget else 'configs/simple4d_core_mv_thickslice_budgetmatched_v1.yaml' if budget_matched else 'configs/simple4d_core_sax_thickslice_v1.yaml' if sax_only else 'configs/simple4d_core_mv_thickslice_v1.yaml')); p.add_argument('--device',default='cuda:0'); p.add_argument('--backend',choices=('tcnn','pytorch_fallback'),default='tcnn'); p.add_argument('--stop-after',choices=('smoke','diagnostic','mid','formal'),required=True); p.add_argument('--resume',type=Path)
     a=p.parse_args(); device=torch.device(a.device)
     if device.type=='cuda' and not torch.cuda.is_available(): raise ValueError('CUDA requested but unavailable')
     cfg=yaml.safe_load(a.experiment_config.read_text()); canonical=cfg['canonical']; data=cfg['data']; deform=cfg['deformation']
@@ -34,8 +34,10 @@ def main(*, sax_only=False, budget_matched=False, equal_budget=False, slice_prop
     freq=cfg['frequency_disentanglement']; audit=json.loads(a.temporal_audit.read_text())
     if audit.get('input_sha256') != {'manifest':sha256(a.manifest),'qc_table':sha256(a.qc_table)}: raise ValueError('temporal audit inputs do not match training inputs')
     if a.architecture_control: freq={**freq,'enabled':False,'lambda_resp_freq':0.,'lambda_card_freq':0.}
+    if a.card_only: freq={**freq,'enabled':True,'lambda_resp_freq':0.,'lambda_card_freq':0.001}
     cfg['frequency_disentanglement']=freq
-    if (freq['enabled'] or a.stop_after!='smoke') and any(v['resp_supported_locations'] != v['unique_locations'] or v['card_supported_locations'] != v['unique_locations'] for v in audit['stacks'].values()): raise ValueError('temporal observability gate: complete requested bands unsupported')
+    validate_enabled_bands(audit,freq)
+    if a.stop_after!='smoke': raise ValueError('this validation task only permits the 200-step smoke')
     if a.architecture_control and a.stop_after!='smoke': raise ValueError('architecture control is limited to smoke')
     if a.output_dir.exists() and any(a.output_dir.iterdir()): raise FileExistsError('output directory must be empty')
     allowed=Path('/data2/dengyz/dataset/CR_DREME_v3/exp/simple4d_disentangle_freq_v1').resolve()
@@ -83,7 +85,9 @@ def main(*, sax_only=False, budget_matched=False, equal_budget=False, slice_prop
     (a.output_dir/'effective_config.json').write_text(json.dumps(cfg,indent=2)+'\n')
     (a.output_dir/'experiment_inputs.json').write_text(json.dumps({'paths':{key:str(getattr(a,key).resolve()) for key in ('manifest','qc_table','canonical_domain','static_manifest','experiment_config')},'provenance':provenance},indent=2)+'\n')
     while runner.global_step<target:
-        runner.update()
+        row=runner.update()
+        if row['weighted_card_freq'] > 2*row['photo_raw']: raise RuntimeError('card frequency term overwhelms photometric loss')
+        if runner.global_step in (1,10,25,50,100,150,200): print(json.dumps({'progress':row},allow_nan=False),flush=True)
         if runner.global_step in cfg['boundaries'].values():
             diag=diagnostic_metrics(model,sampler)
             with torch.no_grad():

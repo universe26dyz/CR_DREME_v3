@@ -89,3 +89,17 @@ def test_runner_resume_restores_both_samplers_optimizer_scheduler_and_rng(monkey
     buf.seek(0); restored.load_state_dict(torch.load(buf,weights_only=False)); restored.update()
     assert all(torch.equal(a,b) for a,b in zip(target,restored.model.parameters()))
     assert restored.metrics[-1]==target_row and restored.scheduler.state_dict()==runner.scheduler.state_dict()
+
+def test_card_only_gate_and_short_record():
+    from cardioresp4d.experiments.simple4d_disentangle_freq import validate_enabled_bands
+    audit={'stacks':{v:{'unique_locations':1,'resp_supported_locations':0,'card_supported_locations':1} for v in ('SAX','2CH','4CH')}}
+    cfg={'enabled':True,'lambda_resp_freq':0.,'lambda_card_freq':.001,'resp_band_hz':[.1,.6],'card_band_hz':[.8,2.]}
+    validate_enabled_bands(audit,cfg)
+    with pytest.raises(ValueError,match='resp band unsupported'):
+        validate_enabled_bands(audit,{**cfg,'lambda_resp_freq':.001})
+    with pytest.raises(ValueError,match='matching temporal audit'):
+        validate_enabled_bands(audit,{**cfg,'card_band_hz':[.7,2.]})
+    t=torch.linspace(0,8.363,50,dtype=torch.float64)
+    z=torch.sin(2*math.pi*1.2*t).float().unsqueeze(1).requires_grad_()
+    loss=band_residual(t,z,(.8,2.)); loss.backward()
+    assert torch.isfinite(loss) and torch.isfinite(z.grad).all()

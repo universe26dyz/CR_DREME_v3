@@ -79,7 +79,7 @@ class FrequencyRunner(S1Runner):
         self.temporal=SameLocationSampler(sampler,seed=frequency['sampler_seed'],min_points=frequency['min_temporal_points'],max_points=frequency['temporal_batch_size'])
 
     def update(self):
-        metrics={'resp_band_loss':None,'card_band_loss':None,'resp_mean_rms':None,'card_mean_rms':None}
+        metrics={'resp_band_loss':None,'card_band_loss':None,'resp_mean_rms':None,'card_mean_rms':None,'weighted_resp_freq':0.,'weighted_card_freq':0.}
         def before_step(optimizer, args, kwargs):
             step=self.global_step+1; cfg=self.frequency
             if step % cfg['temporal_loss_every'] or not cfg['enabled'] or (cfg['lambda_resp_freq']==0 and cfg['lambda_card_freq']==0):
@@ -88,15 +88,17 @@ class FrequencyRunner(S1Runner):
             means=torch.cat([self.model.encode_observation(o,sample=False)['mu'] for o in seq],dim=0)
             times=torch.tensor([o.timestamp_s for o in seq],device=means.device,dtype=torch.float64)
             resp,card=means[:,:16],means[:,16:]
-            lr=band_residual(times,resp,cfg['resp_band_hz']); lc=band_residual(times,card,cfg['card_band_hz'])
-            loss=cfg['lambda_resp_freq']*lr+cfg['lambda_card_freq']*lc
+            lr=band_residual(times,resp,cfg['resp_band_hz']) if cfg['lambda_resp_freq'] else None
+            lc=band_residual(times,card,cfg['card_band_hz']) if cfg['lambda_card_freq'] else None
+            loss=(cfg['lambda_resp_freq']*lr if lr is not None else 0)+(cfg['lambda_card_freq']*lc if lc is not None else 0)
             if not bool(torch.isfinite(loss)): raise RuntimeError('nonfinite frequency loss')
             loss.backward()
-            metrics.update(resp_band_loss=float(lr.detach()),card_band_loss=float(lc.detach()),resp_mean_rms=float(resp.detach().square().mean().sqrt()),card_mean_rms=float(card.detach().square().mean().sqrt()))
+            metrics.update(resp_band_loss=float(lr.detach()) if lr is not None else None,card_band_loss=float(lc.detach()) if lc is not None else None,resp_mean_rms=float(resp.detach().square().mean().sqrt()),card_mean_rms=float(card.detach().square().mean().sqrt()),weighted_resp_freq=float((cfg['lambda_resp_freq']*lr).detach()) if lr is not None else 0.,weighted_card_freq=float((cfg['lambda_card_freq']*lc).detach()) if lc is not None else 0.)
         handle=self.optimizer.register_step_pre_hook(before_step)
         try: row=super().update()
         finally: handle.remove()
         row.update(metrics)
+        row['total_with_frequency']=row['total']+metrics['weighted_resp_freq']+metrics['weighted_card_freq'] if 'total' in row else None
         return row
     def state_dict(self):
         state=super().state_dict(); state['temporal_sampler']=self.temporal.state_dict(); return state
@@ -124,3 +126,14 @@ def intervention_diagnostics(deformation, points, means):
         fields=torch.stack([deformation(points,code.unsqueeze(0))['displacement_mm'] for code in codes])
         results[name+'_dvf_temporal_rms_mm']=float((fields-fields.mean(0)).square().mean().sqrt())
     return results
+
+
+def validate_enabled_bands(audit, frequency):
+    for branch in ('resp','card'):
+        if not frequency['enabled'] or not frequency['lambda_'+branch+'_freq']:
+            continue
+        expected={'resp':[0.1,0.6],'card':[0.8,2.0]}[branch]
+        if list(frequency[branch+'_band_hz']) != expected:
+            raise ValueError('new frequency band requires a matching temporal audit')
+        if any(v[branch+'_supported_locations'] != v['unique_locations'] for v in audit['stacks'].values()):
+            raise ValueError('temporal observability gate: enabled '+branch+' band unsupported')
