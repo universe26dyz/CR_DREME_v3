@@ -167,8 +167,9 @@ def validate_r2_continuation(checkpoint, provenance, config):
     """Accept only the matching completed R2 checkpoint and full runner state."""
     state=checkpoint.get('runner',{})
     required=('model','optimizer','scheduler','sampler','temporal_sampler','rng','metrics','global_step')
-    if checkpoint.get('schema')!='simple4d_disentangle_freq_v1' or state.get('global_step')!=2000 or len(state.get('metrics',[]))!=2000 or any(k not in state for k in required):
-        raise ValueError('expected a complete R2 step-2000 checkpoint')
+    step=state.get('global_step')
+    if checkpoint.get('schema')!='simple4d_disentangle_freq_v1' or step not in (2000,3000,4000,5000) or len(state.get('metrics',[]))!=step or any(k not in state for k in required):
+        raise ValueError('expected a complete R2 checkpoint from steps 2000 through 5000')
     if checkpoint.get('config')!=config:
         raise ValueError('R2 checkpoint configuration mismatch')
     old=checkpoint.get('provenance',{})

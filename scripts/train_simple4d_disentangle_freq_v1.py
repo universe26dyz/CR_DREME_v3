@@ -40,9 +40,9 @@ def main(*, sax_only=False, budget_matched=False, equal_budget=False, slice_prop
     cfg['frequency_disentanglement']=freq
     validate_enabled_bands(audit,freq)
     r2=a.anticollapse
-    if a.stop_after not in (('diagnostic','mid') if r2 else ('smoke','diagnostic')): raise ValueError('unsupported diagnostic boundary')
+    if a.stop_after not in (('diagnostic','mid','formal') if r2 else ('smoke','diagnostic')): raise ValueError('unsupported diagnostic boundary')
     paired=a.stop_after=='diagnostic' and not r2
-    if r2 and (not a.basis_audit or not a.calibration or (a.stop_after=='diagnostic' and a.resume) or (a.stop_after=='mid' and not a.resume)): raise ValueError('R2 requires basis audit and calibration, fresh 2k or a 2k checkpoint for 5k')
+    if r2 and (not a.basis_audit or not a.calibration or (a.stop_after=='diagnostic' and a.resume) or (a.stop_after in ('mid','formal') and not a.resume)): raise ValueError('R2 continuation requires basis audit, calibration, and a complete prior checkpoint')
     if r2:
         cal=json.loads(a.calibration.read_text())
         if cal['manifest_sha256']!=sha256(a.manifest) or cal['qc_table_sha256']!=sha256(a.qc_table) or cal['locations']!=143 or sha256(Path(cal['checkpoint']))!=cal['checkpoint_sha256']: raise ValueError('calibration provenance mismatch')
@@ -108,8 +108,11 @@ def main(*, sax_only=False, budget_matched=False, equal_budget=False, slice_prop
     elif r2 and a.resume:
         cp=torch.load(a.resume,map_location='cpu',weights_only=False)
         validate_r2_continuation(cp,provenance,cfg)
+        continuation_step=cp['runner']['global_step']
+        if a.stop_after=='formal' and continuation_step!=5000: raise ValueError('10k formal R2 continuation must start from the completed 5k checkpoint')
         runner.load_state_dict(cp['runner']); diagnostics=cp['diagnostics']
-        provenance.update({'mode':'dual_band_anticollapse_fromscratch_v1','start_checkpoint':None,'initial_global_step':0,'continuation_checkpoint':str(a.resume.resolve()),'continuation_checkpoint_sha256':sha256(a.resume),'continuation_global_step':2000,'original_run_provenance':cp['provenance'],'calibration_path':str(a.calibration.resolve()),'calibration_sha256':sha256(a.calibration),'basis_audit_sha256':sha256(a.basis_audit),'basis_frequencies_by_location':basis['locations']})
+        original_provenance=cp['provenance'].get('original_run_provenance',cp['provenance'])
+        provenance.update({'mode':'dual_band_anticollapse_fromscratch_v1','start_checkpoint':None,'initial_global_step':0,'continuation_checkpoint':str(a.resume.resolve()),'continuation_checkpoint_sha256':sha256(a.resume),'continuation_global_step':continuation_step,'original_run_provenance':original_provenance,'calibration_path':str(a.calibration.resolve()),'calibration_sha256':sha256(a.calibration),'basis_audit_sha256':sha256(a.basis_audit),'basis_frequencies_by_location':basis['locations']})
     elif a.resume:
         raise ValueError('resume requires a supported checkpoint')
     else:
@@ -132,8 +135,8 @@ def main(*, sax_only=False, budget_matched=False, equal_budget=False, slice_prop
     while runner.global_step<target:
         row=runner.update()
         if row['weighted_card_freq']+row['weighted_resp_freq']+row.get('weighted_resp_energy',0.)+row.get('weighted_card_energy',0.) > 2*row['photo_raw']: raise RuntimeError('frequency terms overwhelm photometric loss')
-        if runner.global_step in (1,10,25,50,100,150,200,201,210,250,500,1000,1500,2000,2001,2010,2500,3000,3500,4000,4500,5000): print(json.dumps({'progress':row},allow_nan=False),flush=True)
-        if runner.global_step in ((200,500,1000,2000,3000,4000,5000) if r2 else (500,1000,2000) if paired else cfg['boundaries'].values()):
+        if runner.global_step in (1,10,25,50,100,150,200,201,210,250,500,1000,1500,2000,2001,2010,2500,3000,3500,4000,4500,5000,6000,7000,8000,9000,10000): print(json.dumps({'progress':row},allow_nan=False),flush=True)
+        if runner.global_step in ((200,500,1000,2000,3000,4000,5000,6000,7000,8000,9000,10000) if r2 else (500,1000,2000) if paired else cfg['boundaries'].values()):
             diag=diagnostic_metrics(model,sampler)
             with torch.no_grad():
                 sequence=sorted(sampler._grouped['SAX'][sorted(sampler._grouped['SAX'])[0]],key=lambda o:o.timestamp_s)
