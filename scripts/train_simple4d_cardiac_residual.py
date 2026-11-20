@@ -15,8 +15,8 @@ from cardioresp4d.roi.cardiac_box import CardiacBox
 
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--stop-step',type=int,required=True); p.add_argument('--resume',type=Path); p.add_argument('--device',default='cuda:0'); a=p.parse_args()
-    root=Path('/data2/dengyz/dataset/CR_DREME_v3'); exp=root/'exp/simple4d_roi_cardiac_residual_v1'; out=exp/'02_stage2_card_residual/smoke_200'; ref=json.loads((exp/'01_stage1_base/base_checkpoint_reference.json').read_text()); roi=json.loads((exp/'00_roi_audit/candidate_160/selected_box.json').read_text()); cp=Path(ref['checkpoint']); digest=hashlib.sha256()
+    p=argparse.ArgumentParser(); p.add_argument('--stop-step',type=int,required=True); p.add_argument('--resume',type=Path); p.add_argument('--output-dir',type=Path); p.add_argument('--device',default='cuda:0'); a=p.parse_args()
+    root=Path('/data2/dengyz/dataset/CR_DREME_v3'); exp=root/'exp/simple4d_roi_cardiac_residual_v1'; out=a.output_dir or exp/'02_stage2_card_residual/continuation_5000'; ref=json.loads((exp/'01_stage1_base/base_checkpoint_reference.json').read_text()); roi=json.loads((exp/'00_roi_audit/candidate_160/selected_box.json').read_text()); cp=Path(ref['checkpoint']); digest=hashlib.sha256()
     with cp.open('rb') as f:
         for block in iter(lambda:f.read(16*1024*1024),b''): digest.update(block)
     if digest.hexdigest()!=ref['sha256']: raise ValueError('base checkpoint hash mismatch')
@@ -28,7 +28,7 @@ def main():
     model=StagedCardiacResidual(base,CardiacBox(roi['center_mm'],roi['size_mm']),taper_mm=roi['taper_mm']).to(device); runner=CardiacRunner(model,ViewLocationBalancedSampler(obs,seed=12));
     settings={'base_checkpoint_sha256':ref['sha256'],'roi_center_mm':roi['center_mm'],'roi_size_mm':roi['size_mm'],'taper_mm':roi['taper_mm'],'cardiac_code_dim':16,'hidden_dims':[128,128,128],'lr':5e-5,'lambda_roi':1.,'global_fraction':.5,'pixel_samples':10000,'regularizer_samples':256,'base_global_step':2000,'view_counts':{'SAX':8,'2CH':9,'4CH':7}}
     if a.resume:
-        saved=torch.load(a.resume,map_location=device,weights_only=False)
+        saved=torch.load(a.resume,map_location='cpu',weights_only=False)
         if saved['settings']!=settings: raise ValueError('resume settings mismatch')
         runner.load_state_dict(saved['runner'])
     else:
@@ -36,7 +36,7 @@ def main():
         out.mkdir(parents=True,exist_ok=True); (out/'settings.json').write_text(json.dumps(settings,indent=2)+'\n')
     while runner.step<a.stop_step:
         row=runner.update();print(json.dumps(row),flush=True)
-        if runner.step%10==0 or runner.step==a.stop_step:
+        if runner.step in (2000,5000) or runner.step==a.stop_step:
             torch.save({'settings':settings,'runner':runner.state_dict()},out/f'checkpoint_step_{runner.step}.pt')
     print('finished',runner.step,flush=True)
 if __name__=='__main__': main()
